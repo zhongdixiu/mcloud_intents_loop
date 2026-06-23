@@ -1,0 +1,21 @@
+[project]
+name = "mcloud-intent-router"
+version = "0.1.0"
+description = "AgentScope-based intent routing agent for mCloud skills."
+requires-python = ">=3.11"
+dependencies = [
+    "agentscope>=2.0.2,<2.1",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
