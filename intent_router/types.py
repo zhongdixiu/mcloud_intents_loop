@@ -40,7 +40,7 @@ class SkillCard(BaseModel):
 
 class SkillRouteDecision(BaseModel):
     status: Literal["route", "clarify", "no_match"]
-    candidate_skill_ids: list[str] = Field(default_factory=list)
+    skill_id: str | None = None
     confidence: float = 0.0
     reason: str = ""
     question: str | None = None
@@ -60,6 +60,7 @@ class IntentDecision(BaseModel):
 
 class EvaluationDecision(BaseModel):
     verdict: Literal["accept", "reject", "clarify"]
+    reject_scope: Literal["skill_mismatch", "intent_mismatch"] | None = None
     confidence: float = 0.0
     reason: str = ""
     question: str | None = None

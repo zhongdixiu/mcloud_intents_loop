@@ -23,7 +23,10 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "route":
-        asyncio.run(_route(args.query, args.skills, args.resume_token))
+        try:
+            asyncio.run(_route(args.query, args.skills, args.resume_token))
+        except ValueError as exc:
+            parser.error(str(exc))
     elif args.command == "eval":
         asyncio.run(_eval(Path(args.cases), args.skills))
 
