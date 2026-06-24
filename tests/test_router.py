@@ -6,6 +6,8 @@ from intent_router.types import EvaluationDecision, IntentDecision, SkillRouteDe
 
 
 async def test_router_returns_matched_result() -> None:
+    """：一级 skill、二级 intent、参数、Evaluator accept 后返回 matched；
+    同时验证 evaluator prompt 带了可用 skills、schema 和 loop state。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -38,8 +40,22 @@ async def test_router_returns_matched_result() -> None:
     assert result.code == "012"
     assert result.params["metadataList"] == ["猫"]
 
+    evaluator_prompt = json.loads(model.calls[2][1])
+    assert "available_skills" in evaluator_prompt
+    assert any(
+        skill["id"] == "mcloud_search_skill"
+        for skill in evaluator_prompt["available_skills"]
+    )
+    assert "tools_schema" in evaluator_prompt["skill"]
+    assert evaluator_prompt["loop_state"] == {
+        "visited_skills": ["mcloud_search_skill"],
+        "rejected_skill_ids": [],
+        "rejected_intents": {},
+    }
+
 
 async def test_router_retries_after_skill_no_match() -> None:
+    """选中的 skill 内部返回 no_match 后，会把该 skill 排除并重新选择其他 skill。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -76,7 +92,40 @@ async def test_router_retries_after_skill_no_match() -> None:
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 2
 
 
+async def test_evaluator_accept_ignores_confidence_gate() -> None:
+    """ Evaluator 只要输出 accept 就直接通过，不再因为 confidence 低转澄清。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["合同"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="accept",
+                confidence=0.4,
+                clarity_reason="搜索范围不明确",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("搜索合同文件")
+
+    assert result.status == "matched"
+    assert result.intent == "搜综合"
+    assert result.confidence == 0.8
+
+
 async def test_router_retries_after_skill_mismatch_evaluation() -> None:
+    """Evaluator 判断 skill_mismatch 后，记录 rejected skill，并重新走一级 skill 路由。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -94,6 +143,8 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
             EvaluationDecision(
                 verdict="reject",
                 reject_scope="skill_mismatch",
+                skill_check="fail",
+                confidence=0.8,
                 reason="搜索资源应选择云盘搜索",
             ),
             SkillRouteDecision(
@@ -112,8 +163,9 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
+    trace: list[dict] = []
 
-    result = await router.route("搜索合同文件")
+    result = await router.route("搜索合同文件", trace=trace)
 
     assert result.status == "matched"
     assert result.skill is not None
@@ -123,9 +175,47 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
 
     second_router_prompt = json.loads(model.calls[3][1])
     assert second_router_prompt["rejected_skill_ids"] == ["file_skill"]
+    assert any(
+        event.get("event") == "retry" and event.get("scope") == "skill_mismatch"
+        for event in trace
+    )
+    assert trace[-1]["event"] == "result"
+
+
+async def test_skill_reject_records_rejected_skill_even_with_low_confidence() -> None:
+    """ 即使 evaluator confidence 低，只要 verdict=reject + skill_mismatch，也按明确拒绝处理，写入 rejected skill。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(status="route", skill_id="file_skill", confidence=0.9),
+            IntentDecision(
+                status="matched",
+                intent="文件",
+                code="021",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="skill_mismatch",
+                skill_check="unclear",
+                confidence=0.4,
+                reason="可能应该搜索",
+                clarity_reason="搜索和入口表达都可能成立",
+            ),
+            SkillRouteDecision(status="no_match", reason="no remaining skill"),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("搜索合同文件")
+
+    assert result.status == "no_match"
+    second_router_prompt = json.loads(model.calls[3][1])
+    assert second_router_prompt["rejected_skill_ids"] == ["file_skill"]
 
 
 async def test_router_retries_same_skill_after_intent_mismatch() -> None:
+    """ Evaluator 判断 intent_mismatch 后，锁定当前 skill，只重新选择二级 intent，不重新 route skill。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -135,7 +225,7 @@ async def test_router_retries_same_skill_after_intent_mismatch() -> None:
             ),
             IntentDecision(
                 status="matched",
-                intent="AI美颜修图",
+                intent="AI 修图",
                 code="021",
                 params={},
                 confidence=0.8,
@@ -143,12 +233,10 @@ async def test_router_retries_same_skill_after_intent_mismatch() -> None:
             EvaluationDecision(
                 verdict="reject",
                 reject_scope="intent_mismatch",
+                skill_check="pass",
+                intent_check="fail",
+                confidence=0.8,
                 reason="具体修图操作应使用 AI改图",
-            ),
-            SkillRouteDecision(
-                status="route",
-                skill_id="image_skill",
-                confidence=0.9,
             ),
             IntentDecision(
                 status="matched",
@@ -170,13 +258,229 @@ async def test_router_retries_same_skill_after_intent_mismatch() -> None:
     assert result.intent == "AI改图"
     assert result.code == "037"
     assert result.visited_skills == ["image_skill"]
+    assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
 
-    second_intent_prompt = model.calls[4][1]
-    assert "AI美颜修图" in second_intent_prompt
+    second_intent_prompt = model.calls[3][1]
+    assert "AI 修图" in second_intent_prompt
     assert "具体修图操作应使用 AI改图" in second_intent_prompt
 
 
+async def test_intent_reject_records_rejected_intent_even_with_low_confidence() -> None:
+    """即使 confidence 低，intent_mismatch 也会写入 rejected intent，下一轮 intent prompt 能看到该负反馈。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(status="route", skill_id="image_skill", confidence=0.9),
+            IntentDecision(
+                status="matched",
+                intent="AI 修图",
+                code="021",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="intent_mismatch",
+                intent_check="unclear",
+                confidence=0.4,
+                reason="可能需要具体改图",
+                clarity_reason="用户是否要入口不确定",
+            ),
+            IntentDecision(
+                status="matched",
+                intent="AI改图",
+                code="037",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("帮我修一下这张图")
+
+    assert result.status == "matched"
+    second_intent_prompt = json.loads(model.calls[3][1])
+    assert second_intent_prompt["rejected_intents"] == [
+        {
+            "intent": "AI 修图",
+            "reason": "可能需要具体改图",
+            "scope": "intent_mismatch",
+        },
+    ]
+
+
+async def test_router_retries_after_param_mismatch() -> None:
+    """ Evaluator 判断 param_mismatch 后，锁定 skill / intent / code，只进入参数修正流程。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
+                confidence=0.8,
+                reason="用户未明确 mp3 后缀，suffixList 存在过度补全",
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦", "歌"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("帮我找周杰伦的歌")
+
+    assert result.status == "matched"
+    assert result.intent == "搜音频"
+    assert "suffixList" not in result.params
+    assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
+
+    param_repair_prompt = json.loads(model.calls[3][1])
+    assert param_repair_prompt["locked_intent"] == "搜音频"
+    assert param_repair_prompt["locked_code"] == "015"
+    assert param_repair_prompt["param_rejections"] == [
+        {
+            "intent": "搜音频",
+            "reason": "用户未明确 mp3 后缀，suffixList 存在过度补全",
+            "scope": "param_mismatch",
+        },
+    ]
+
+
+async def test_param_reject_records_param_rejection_even_with_low_confidence() -> None:
+    """ 即使 confidence 低，param_mismatch 也会记录参数拒绝原因，并传给参数修正 prompt。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                params_check="unclear",
+                confidence=0.4,
+                reason="可能过度补全 mp3",
+                clarity_reason="用户没有明确文件后缀",
+            ),
+            IntentDecision(status="no_match", reason="cannot repair params"),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("帮我找周杰伦的歌")
+
+    assert result.status == "no_match"
+    param_repair_prompt = json.loads(model.calls[3][1])
+    assert param_repair_prompt["param_rejections"] == [
+        {
+            "intent": "搜音频",
+            "reason": "可能过度补全 mp3",
+            "scope": "param_mismatch",
+        },
+    ]
+
+
+async def test_router_reject_without_scope_returns_stable_no_match() -> None:
+    """ Evaluator 输出 reject 但没有 reject_scope 时，视为无效评估，不猜测错误层级，并进入稳定失败路径。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["合同"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reason="invalid evaluator output",
+            ),
+            SkillRouteDecision(status="no_match", reason="no remaining skill"),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("搜索合同文件")
+
+    assert result.status == "no_match"
+    assert result.reason == "no remaining skill"
+    assert [call[2] for call in model.calls].count(SkillRouteDecision) == 2
+
+
+async def test_router_can_use_separate_evaluator_client() -> None:
+    """支持主识别模型和 evaluator 模型分开配置；router / intent 用主模型，evaluation 用 evaluator 模型。"""
+    route_model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["合同"]},
+                confidence=0.8,
+            ),
+        ],
+    )
+    evaluator_model = FakeStructuredClient(
+        [
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=route_model,
+        evaluator_client=evaluator_model,
+    )
+
+    result = await router.route("搜索合同文件")
+
+    assert result.status == "matched"
+    assert [call[2] for call in route_model.calls] == [
+        SkillRouteDecision,
+        IntentDecision,
+    ]
+    assert [call[2] for call in evaluator_model.calls] == [EvaluationDecision]
+
+
 async def test_router_returns_no_match_for_unsupported_capability() -> None:
+    """ 一级路由判断能力不支持时，直接返回 no_match。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -194,6 +498,7 @@ async def test_router_returns_no_match_for_unsupported_capability() -> None:
 
 
 async def test_router_returns_clarification_and_resumes() -> None:
+    """一级路由返回 clarify 时生成 resume_token；用户补充后能带 token 继续识别并返回 matched。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -236,6 +541,7 @@ async def test_router_returns_clarification_and_resumes() -> None:
 
 
 async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
+    """ intent 输出结构不合法参数时，进入参数修正；修正失败后返回 no_match，不重新误伤 skill。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -250,7 +556,7 @@ async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
                 params={"suffixList": ["jpg"]},
                 confidence=0.8,
             ),
-            SkillRouteDecision(status="no_match", reason="no remaining skill"),
+            IntentDecision(status="no_match", reason="cannot repair params"),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
@@ -258,7 +564,9 @@ async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
     result = await router.route("找猫照片")
 
     assert result.status == "no_match"
+    assert result.reason == "cannot repair params"
     assert "mcloud_search_skill" in result.visited_skills
+    assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
 
 
 async def test_router_returns_clarification_for_overlapping_baby_intents() -> None:
@@ -289,10 +597,9 @@ async def test_router_returns_clarification_for_overlapping_baby_intents() -> No
     assert result.resume_token
 
     intent_system_prompt = model.calls[1][0]
-    intent_user_prompt = model.calls[1][1]
     assert "竞争意图检查" in intent_system_prompt
     assert "输入来源" in intent_system_prompt
-    assert "二级意图选择通用原则" in intent_user_prompt
+    assert "具体操作类能力优先于入口类能力" in intent_system_prompt
 
 
 async def test_router_resumes_baby_clarification_to_time_machine() -> None:
@@ -460,7 +767,7 @@ async def test_router_distinguishes_entry_and_specific_edit_operation() -> None:
             ),
             IntentDecision(
                 status="matched",
-                intent="AI美颜修图",
+                intent="AI 修图",
                 code="021",
                 params={},
                 confidence=0.8,
@@ -487,7 +794,7 @@ async def test_router_distinguishes_entry_and_specific_edit_operation() -> None:
     edit = await router.route("把这张图背景换成海边")
 
     assert entry.status == "matched"
-    assert entry.intent == "AI美颜修图"
+    assert entry.intent == "AI 修图"
     assert edit.status == "matched"
     assert edit.intent == "AI改图"
 

@@ -188,11 +188,10 @@ def _parse_params(raw_params: Any) -> dict[str, ParamSchema]:
 
 
 def _extract_allowed_values(desc: str) -> list[str]:
-    marker_index = desc.find("可选值")
-    if marker_index < 0:
-        marker_index = desc.find("限定")
-    if marker_index < 0:
+    markers = ("可选值", "限定", "仅包括", "仅包含", "只包括", "只包含", "可为", "取值为")
+    marker_positions = [desc.find(marker) for marker in markers if desc.find(marker) >= 0]
+    if not marker_positions:
         return []
-    tail = desc[marker_index:]
+    tail = desc[min(marker_positions) :]
     values = re.findall(r'["“]([^"”]+)["”]', tail)
     return [value for value in values if value]

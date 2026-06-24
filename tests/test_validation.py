@@ -1,8 +1,12 @@
 import pytest
 
 from intent_router.skills import SkillRegistry
-from intent_router.types import IntentDecision
-from intent_router.validation import ValidationError, validate_intent_decision
+from intent_router.types import EvaluationDecision, IntentDecision
+from intent_router.validation import (
+    ValidationError,
+    validate_evaluation_decision,
+    validate_intent_decision,
+)
 
 
 def test_validate_rejects_unknown_intent() -> None:
@@ -59,3 +63,34 @@ def test_validate_rejects_activity_outside_enum() -> None:
 
     with pytest.raises(ValidationError):
         validate_intent_decision(skill, decision)
+
+
+def test_validate_evaluation_rejects_missing_scope() -> None:
+    decision = EvaluationDecision(verdict="reject", skill_check="fail")
+
+    with pytest.raises(ValidationError):
+        validate_evaluation_decision(decision)
+
+
+def test_validate_evaluation_allows_unclear_checks_with_scope() -> None:
+    decision = EvaluationDecision(
+        verdict="reject",
+        reject_scope="param_mismatch",
+        skill_check="pass",
+        intent_check="unclear",
+        params_check="fail",
+    )
+
+    assert validate_evaluation_decision(decision) is decision
+
+
+def test_validate_evaluation_accepts_layered_param_mismatch() -> None:
+    decision = EvaluationDecision(
+        verdict="reject",
+        reject_scope="param_mismatch",
+        skill_check="pass",
+        intent_check="pass",
+        params_check="fail",
+    )
+
+    assert validate_evaluation_decision(decision) is decision

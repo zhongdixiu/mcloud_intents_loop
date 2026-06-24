@@ -26,6 +26,7 @@ class SkillDefinition(BaseModel):
     description: str
     path: Path
     special_rules: str = ""
+    
     tools_schema_text: str = ""
     raw_markdown: str
     intents: dict[str, IntentSchema]
@@ -60,9 +61,15 @@ class IntentDecision(BaseModel):
 
 class EvaluationDecision(BaseModel):
     verdict: Literal["accept", "reject", "clarify"]
-    reject_scope: Literal["skill_mismatch", "intent_mismatch"] | None = None
+    reject_scope: (
+        Literal["skill_mismatch", "intent_mismatch", "param_mismatch"] | None
+    ) = None
+    skill_check: Literal["pass", "fail", "unclear"] | None = None
+    intent_check: Literal["pass", "fail", "unclear"] | None = None
+    params_check: Literal["pass", "fail", "unclear"] | None = None
     confidence: float = 0.0
     reason: str = ""
+    clarity_reason: str | None = None
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
 

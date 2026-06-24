@@ -4,9 +4,12 @@ from intent_router.skills import SkillRegistry
 def test_load_current_flat_skills() -> None:
     registry = SkillRegistry.from_path("skills")
 
-    assert len(registry) == 12
+    assert len(registry) == 15
     cards = {card.id: card for card in registry.cards()}
     assert "mcloud_search_skill" in cards
+    assert "mail_skill" in cards
+    assert "mcloud_person_skill" in cards
+    assert "todo_skill" in cards
     assert "搜图片" in cards["mcloud_search_skill"].intents
 
     search_skill = registry.get("mcloud_search_skill")

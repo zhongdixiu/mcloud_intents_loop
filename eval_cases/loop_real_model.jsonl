@@ -1,0 +1,12 @@
+{"id":"search_contract_file","query":"搜索合同文件","expected":{"status":"matched","skill_id":"mcloud_search_skill","intent":"搜综合","code":"018"}}
+{"id":"open_image_entry","query":"打开我的图片入口","expected":{"status":"matched","skill_id":"file_skill","intent":"图片","code":"021"}}
+{"id":"edit_image_background","query":"把这张图背景换成海边","expected":{"status":"matched","skill_id":"image_skill","intent":"AI改图","code":"037"}}
+{"id":"open_ai_edit_entry","query":"打开AI修图","expected":{"status":"matched","skill_id":"image_skill","intent":"AI 修图","code":"021"}}
+{"id":"clear_photo_quality","query":"让这张照片更清晰","expected":{"status":"matched","skill_id":"image_skill","intent":"画质修复","code":"009"}}
+{"id":"baby_parents_prediction","query":"用父母双方照片预测宝宝样子","expected":{"status":"matched","skill_id":"image_skill","intent":"宝宝长相预测","code":"030"}}
+{"id":"baby_photo_time_machine","query":"用我家宝宝现在的照片看看长大样子","expected":{"status":"matched","skill_id":"image_skill","intent":"宝宝时光机","code":"029"}}
+{"id":"jay_song_no_suffix","query":"帮我找周杰伦的歌","expected":{"status":"matched","skill_id":"mcloud_search_skill","intent":"搜音频","code":"015","absent_params":["suffixList"]}}
+{"id":"activity_1_yuan_member","query":"找1元购会员活动","expected":{"status":"matched","skill_id":"activity_search_skill","intent":"搜活动","code":"020","params":{"metadataList":["立省29！1元购会员"]}}}
+{"id":"mail_mark_read","query":"把张三的未读邮件标记为已读","expected":{"status":"matched","skill_id":"mail_skill","intent":"邮件整理","code":"040005","params":{"actionList":["标记已读"]}}}
+{"id":"upload_phone_photo","query":"上传手机照片","expected":{"status":"matched","skill_id":"file_skill","intent":"文件上传","code":"021"}}
+{"id":"deleted_file_recovery","query":"找回误删的文件","expected":{"status":"matched","skill_id":"file_skill","intent":"回收站","code":"021"}}

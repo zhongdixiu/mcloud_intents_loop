@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .types import IntentDecision, SkillDefinition
+from .types import EvaluationDecision, IntentDecision, SkillDefinition
 
 
 class ValidationError(ValueError):
@@ -41,6 +41,36 @@ def validate_intent_decision(
         _validate_allowed_values(param_name, value, param_schema.allowed_values)
 
     return decision
+
+
+def validate_evaluation_decision(
+    evaluation: EvaluationDecision,
+) -> EvaluationDecision:
+    if evaluation.verdict == "clarify":
+        return evaluation
+
+    if evaluation.verdict == "accept":
+        if evaluation.reject_scope:
+            raise ValidationError("accepted evaluation must not include reject_scope")
+        if "fail" in {
+            evaluation.skill_check,
+            evaluation.intent_check,
+            evaluation.params_check,
+        }:
+            raise ValidationError("accepted evaluation must not include failed checks")
+        return evaluation
+
+    if not evaluation.reject_scope:
+        raise ValidationError("rejected evaluation misses reject_scope")
+
+    if evaluation.reject_scope in {
+        "skill_mismatch",
+        "intent_mismatch",
+        "param_mismatch",
+    }:
+        return evaluation
+
+    raise ValidationError(f"unsupported reject_scope: {evaluation.reject_scope}")
 
 
 def _validate_allowed_values(

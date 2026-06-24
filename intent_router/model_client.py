@@ -39,9 +39,14 @@ class AgentScopeStructuredClient:
         self.model = model
 
     @classmethod
-    def from_env(cls) -> "AgentScopeStructuredClient":
-        provider = os.getenv("AGENTSCOPE_MODEL_PROVIDER", "dashscope").lower()
-        model_name = os.getenv("AGENTSCOPE_MODEL_NAME", "qwen-plus")
+    def from_env(
+        cls,
+        *,
+        provider_env: str = "AGENTSCOPE_MODEL_PROVIDER",
+        model_env: str = "AGENTSCOPE_MODEL_NAME",
+    ) -> "AgentScopeStructuredClient":
+        provider = os.getenv(provider_env, "dashscope").lower()
+        model_name = os.getenv(model_env, "qwen-plus")
 
         if provider == "dashscope":
             from agentscope.credential import DashScopeCredential
@@ -68,6 +73,18 @@ class AgentScopeStructuredClient:
             return cls(model)
 
         raise ValueError(f"Unsupported AGENTSCOPE_MODEL_PROVIDER: {provider}")
+
+    @classmethod
+    def evaluator_from_env_if_configured(cls) -> "AgentScopeStructuredClient | None":
+        if not (
+            os.getenv("AGENTSCOPE_EVALUATOR_MODEL_PROVIDER")
+            or os.getenv("AGENTSCOPE_EVALUATOR_MODEL_NAME")
+        ):
+            return None
+        return cls.from_env(
+            provider_env="AGENTSCOPE_EVALUATOR_MODEL_PROVIDER",
+            model_env="AGENTSCOPE_EVALUATOR_MODEL_NAME",
+        )
 
     async def structured(
         self,

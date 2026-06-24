@@ -33,6 +33,14 @@ export AGENTSCOPE_MODEL_NAME=gpt-4.1
 export OPENAI_API_KEY=...
 ```
 
+Evaluator can reuse the same model by default. To run the evaluator with a
+separate model, set:
+
+```bash
+export AGENTSCOPE_EVALUATOR_MODEL_PROVIDER=dashscope
+export AGENTSCOPE_EVALUATOR_MODEL_NAME=qwen-plus
+```
+
 ## SDK
 
 ```python
@@ -68,4 +76,3 @@ The test suite uses a fake structured model client, so it does not require a rea
 ```bash
 python -m pytest
 ```
-
