@@ -321,6 +321,8 @@ DialogueRouteSummary(
 
 上下文语义归一节点输出 `resolved_query`。后续 skill 路由、intent 选择、参数修正和 evaluator 都围绕同一个 `resolved_query` 判断，不再直接注入 `dialogue_history`，避免不同节点各自解释历史。
 
+历史 clarify 的 `question/options` 用于描述上一轮正在澄清的语义维度，不是封闭枚举。当前输入可以选择其中一个方向、补充 options 之外但仍在同一澄清维度内的新方向，也可以开启新的请求。若本轮被归一为 `answer_to_previous`，`resolved_query` 必须是可独立路由的完整请求，不能只输出“图片”“蓝色”“最近”等短回答片段。
+
 历史 matched `assistant_result` 代表历史意图决策语义，可用于理解“它/这个/这些/上一个/第一封/第二个/确认/改一下”等表达。但它不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。意图识别模块不伪造 `image/content/file/mail_id/file_id` 等执行载体参数；如果当前 skill/intent/code 已经明确，仅因执行阶段需要资源选择或补全时不应输出 clarify。历史 `no_match` 只注入状态，不注入失败原因。
 
 不跨轮注入 `rejected_skills`、`rejected_intents`、`param_rejections`、`locked_*` 和原始 trace，避免单次纠错状态污染新的用户表达。
@@ -676,6 +678,7 @@ params_check == "fail"
 - 当前输入有明确新动作或新目标时，不机械继承历史。
 - 历史只用于理解省略、延续、修正、改口、指代和对历史问题的回应。
 - 承接历史时必须保留历史判别性主体；不能只继承泛化对象类型而丢弃具体主体。当前输入可能是新请求、替换主体或追加限定条件且证据不足时，输出 clarify。
+- clarify 的 `question/options` 是语义参考，不是封闭枚举；能明确回答澄清时归一为完整请求，不能只输出当前短回答片段。
 
 输入：
 

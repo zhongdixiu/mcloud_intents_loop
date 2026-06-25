@@ -861,6 +861,90 @@ async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> N
     assert "dialogue_history" not in second_router_prompt
 
 
+async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["合同"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+            ContextualizedRequest(
+                status="clarify",
+                relation_to_history="ambiguous",
+                used_history_turns=[0],
+                question="“蓝色”是指搜索蓝色的图片，还是蓝色的合同文件？",
+                options=[
+                    {"label": "搜蓝色的图片", "value": "搜蓝色的图片"},
+                    {"label": "搜蓝色的合同文件", "value": "搜蓝色的合同文件"},
+                ],
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="搜蓝色的图片",
+                relation_to_history="answer_to_previous",
+                used_history_turns=[1],
+                reason="当前输入是在回答上一轮澄清的对象类型维度",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["蓝色"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("搜合同文件")
+    second = await agent.send("蓝色")
+    third = await agent.send("图片")
+
+    assert first.status == "matched"
+    assert first.resolved_query == "搜合同文件"
+    assert second.status == "clarify"
+    assert second.resolved_query == "蓝色"
+    assert second.context_relation == "ambiguous"
+    assert third.status == "matched"
+    assert third.intent == "搜图片"
+    assert third.params == {"metadataList": ["蓝色"]}
+    assert third.resolved_query == "搜蓝色的图片"
+    assert third.context_relation == "answer_to_previous"
+
+    third_context_prompt = json.loads(model.calls[4][1])
+    clarify_result = third_context_prompt["dialogue_history"][-1]["assistant_result"]
+    assert clarify_result["status"] == "clarify"
+    assert clarify_result["question"] == (
+        "“蓝色”是指搜索蓝色的图片，还是蓝色的合同文件？"
+    )
+    assert clarify_result["options"] == [
+        {"label": "搜蓝色的图片", "value": "搜蓝色的图片"},
+        {"label": "搜蓝色的合同文件", "value": "搜蓝色的合同文件"},
+    ]
+    assert clarify_result["resolved_query"] == "蓝色"
+    assert clarify_result["context_relation"] == "ambiguous"
+
+    third_router_prompt = json.loads(model.calls[5][1])
+    assert third_router_prompt["resolved_query"] == "搜蓝色的图片"
+    assert "dialogue_history" not in third_router_prompt
+
+
 async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
     model = FakeStructuredClient(
         [
@@ -909,6 +993,9 @@ async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
     assert "判别性主体" in system_prompt
     assert "核心主体、动作、对象类型和限定条件" in system_prompt
     assert "新请求、替换历史主体、或在历史主体上追加限定条件" in system_prompt
+    assert "不是封闭枚举" in system_prompt
+    assert "answer_to_previous" in system_prompt
+    assert "不能只输出当前短回答片段" in system_prompt
 
 
 async def test_dialogue_history_does_not_inject_no_match_reason() -> None:

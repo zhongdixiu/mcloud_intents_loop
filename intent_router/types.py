@@ -112,6 +112,8 @@ class DialogueRouteSummary(BaseModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
     reason: str | None = None
+    resolved_query: str | None = None
+    context_relation: str | None = None
 
 
 class DialogueTurn(BaseModel):

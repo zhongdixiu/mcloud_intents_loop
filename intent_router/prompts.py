@@ -19,9 +19,12 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 7. 判断当前输入与历史的关系时，先区分核心主体、动作、对象类型和限定条件；颜色、时间、地点、范围、格式、数量、排序等通常是限定条件，不应单独替换历史核心主体。
 8. 若当前输入可能是新请求、替换历史主体、或在历史主体上追加限定条件，且语义证据不足以唯一确定，输出 status=clarify，并用 options 覆盖这些可能方向。
 9. 若判断为在历史主体上追加限定条件，resolved_query 必须同时包含历史核心主体和新增限定条件；若判断为替换历史主体，resolved_query 不应残留被替换的历史主体。
-10. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
-11. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
-12. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
+10. 历史 clarify 的 question/options 是理解澄清维度的语义参考，不是封闭枚举；当前输入可以选择其中方向、补充其他有效方向，或开启新请求。
+11. 若 current_user_query 是对历史 clarify 的回答，relation_to_history 可为 answer_to_previous；此时 resolved_query 必须补全为可独立路由的完整自然语言请求，不能只输出当前短回答片段。
+12. 若当前输入明确表达 options 之外的新方向，但仍在同一澄清维度内，应按用户新方向归一；若表达新的动作、新对象或新目标，应视为 new_request，不要强行贴合历史 options。
+13. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
+14. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
+15. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
 """
 
 CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
@@ -31,6 +34,7 @@ CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
 4. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；只有 resolved_query 或明确上下文中已有真实占位符时才抽取。
 5. 若 skill/intent/code 已明确，不要因为执行阶段才需要的资源选择或真实句柄缺失而输出 clarify。
 6. 若 resolved_query 来自历史承接，它必须保留历史判别性主体；只保留泛化文件类型而丢弃具体主体应视为错误继承历史语义。
+7. 若 context_relation 为 answer_to_previous、continuation 或 revision，resolved_query 必须包含完成路由所需的动作、对象类型、主体和关键限定条件；只输出“图片/文件/蓝色/最近/第一个”等片段属于上下文归一错误。
 """
 
 EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
@@ -292,6 +296,11 @@ def _dialogue_history_payload(dialogue_history: DialogueHistory | None) -> list[
             }
         else:
             assistant_result = {"status": result.status}
+        if result.status in {"matched", "clarify"}:
+            if result.resolved_query:
+                assistant_result["resolved_query"] = result.resolved_query
+            if result.context_relation:
+                assistant_result["context_relation"] = result.context_relation
         payload.append(
             {
                 "user_query": turn.user_query,

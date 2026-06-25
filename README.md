@@ -97,14 +97,19 @@ first injects the latest 5 turns into a contextualizer prompt: user query plus
 the final route result. The contextualizer produces `resolved_query`, and skill
 routing, intent selection, parameter repair, and evaluation all use that unified
 request. Later prompts keep `current_user_query` only for audit context and do
-not receive `dialogue_history` directly. Business execution results, loop
-rejection state, and historical no-match reasons are not injected as dialogue
-semantics. Each turn prints the resolved query, final route result,
+not receive `dialogue_history` directly. Clarification options are semantic
+anchors rather than closed enums: a follow-up can select an option, provide a
+new valid direction, or start a new request. If a turn is resolved as an answer
+to a previous clarification, `resolved_query` must be a complete routeable
+request rather than a short fragment such as "image" or "blue". Business
+execution results, loop rejection state, and historical no-match reasons are not
+injected as dialogue semantics. Each turn prints the resolved query, final route result,
 `loop_count`, and `correction_scopes`. If one turn reaches the maximum loop
 count without a stable decision, the router returns a guided `clarify` result
 with `termination_reason="loop_exhausted"` instead of treating it as `no_match`.
 Shortcuts are available in the prompt:
 
+- empty input: ignored, continue waiting for the next query
 - `:q`, `:quit`, `exit`, `quit`: end the dialogue
 - `:h`, `:help`: show help
 - `:history`: show dialogue history

@@ -66,4 +66,6 @@ def summarize_route_result(result: RouteResult) -> DialogueRouteSummary:
         question=result.question,
         options=result.options,
         reason=result.reason,
+        resolved_query=result.resolved_query,
+        context_relation=result.context_relation,
     )

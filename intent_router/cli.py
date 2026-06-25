@@ -73,8 +73,12 @@ async def _chat(skills: str, trace_enabled: bool) -> None:
             print("\n对话结束。")
             break
 
+        if not query:
+            print("请输入 query，或输入 :q 结束。")
+            continue
+
         command = query.lower()
-        if not query or command in {"exit", "quit", ":q", ":quit"}:
+        if command in {"exit", "quit", ":q", ":quit"}:
             print("对话结束。")
             break
         if command in {":h", ":help", "help"}:
@@ -100,6 +104,7 @@ def _print_chat_help() -> None:
     print(
         "意图识别交互模式\n"
         "输入自然语言 query 后回车，系统会结合本轮输入和历史对话输出意图决策。\n"
+        "空行会被忽略，不会结束对话。\n"
         "快捷命令：:q / :quit / exit / quit 结束；:h 查看帮助；"
         ":history 查看历史；:clear 清空历史。\n",
     )
