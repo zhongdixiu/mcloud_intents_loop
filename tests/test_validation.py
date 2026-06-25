@@ -72,7 +72,7 @@ def test_validate_evaluation_rejects_missing_scope() -> None:
         validate_evaluation_decision(decision)
 
 
-def test_validate_evaluation_allows_unclear_checks_with_scope() -> None:
+def test_validate_evaluation_rejects_unclear_checks_with_scope() -> None:
     decision = EvaluationDecision(
         verdict="reject",
         reject_scope="param_mismatch",
@@ -81,7 +81,8 @@ def test_validate_evaluation_allows_unclear_checks_with_scope() -> None:
         params_check="fail",
     )
 
-    assert validate_evaluation_decision(decision) is decision
+    with pytest.raises(ValidationError):
+        validate_evaluation_decision(decision)
 
 
 def test_validate_evaluation_accepts_layered_param_mismatch() -> None:

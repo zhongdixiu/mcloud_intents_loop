@@ -317,9 +317,11 @@ DialogueRouteSummary(
 )
 ```
 
-注入模型 prompt 时，当前输入字段为 `current_user_query`；历史中的 `DialogueTurn.result` 会映射为 `dialogue_history[].assistant_result`，表示这是历史意图识别 Agent 的输出，而不是用户原话。
+历史只注入上下文语义归一节点。注入该节点时，当前输入字段为 `current_user_query`；历史中的 `DialogueTurn.result` 会裁剪后映射为 `dialogue_history[].assistant_result`，表示这是历史意图识别 Agent 的输出，而不是用户原话。
 
-历史 matched `assistant_result` 代表历史意图决策语义，可用于理解“它/这个/这些/上一个/第一封/第二个/确认/改一下”等表达。但它不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。意图识别模块不伪造 `image/content/file/mail_id/file_id` 等执行载体参数；如果当前 skill/intent/code 已经明确，仅因执行阶段需要资源选择或补全时不应输出 clarify。
+上下文语义归一节点输出 `resolved_query`。后续 skill 路由、intent 选择、参数修正和 evaluator 都围绕同一个 `resolved_query` 判断，不再直接注入 `dialogue_history`，避免不同节点各自解释历史。
+
+历史 matched `assistant_result` 代表历史意图决策语义，可用于理解“它/这个/这些/上一个/第一封/第二个/确认/改一下”等表达。但它不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。意图识别模块不伪造 `image/content/file/mail_id/file_id` 等执行载体参数；如果当前 skill/intent/code 已经明确，仅因执行阶段需要资源选择或补全时不应输出 clarify。历史 `no_match` 只注入状态，不注入失败原因。
 
 不跨轮注入 `rejected_skills`、`rejected_intents`、`param_rejections`、`locked_*` 和原始 trace，避免单次纠错状态污染新的用户表达。
 
@@ -665,13 +667,43 @@ params_check == "fail"
 
 ## 8. Prompt 设计
 
-### 8.1 一级路由 Prompt
+### 8.1 上下文语义归一 Prompt
+
+职责：
+
+- 将 `current_user_query` 与最近对话历史归一为完整自然语言请求 `resolved_query`。
+- 不输出 skill、intent、code 或 params。
+- 当前输入有明确新动作或新目标时，不机械继承历史。
+- 历史只用于理解省略、延续、修正、改口、指代和对历史问题的回应。
+
+输入：
+
+```json
+{
+  "current_user_query": "...",
+  "dialogue_history": []
+}
+```
+
+输出：
+
+```json
+{
+  "status": "resolved",
+  "resolved_query": "...",
+  "relation_to_history": "new_request|continuation|revision|answer_to_previous|ambiguous",
+  "used_history_turns": [],
+  "reason": ""
+}
+```
+
+### 8.2 一级路由 Prompt
 
 职责：
 
 - 从 `SkillCard` 中选择一个最可能 skill。
 - 只能返回一个 skill。
-- 不得选择 `rejected_skill_ids`。
+- 不得选择 `current_loop_rejected_skill_ids`。
 - 无能力支持时返回 `no_match`。
 - 多个 skill 都可满足且用户补充会改变选择时返回 `clarify`。
 
@@ -679,13 +711,15 @@ params_check == "fail"
 
 ```json
 {
-  "query": "...",
+  "resolved_query": "...",
+  "current_user_query": "...",
+  "contextualized_request": {},
   "available_skills": [],
-  "rejected_skill_ids": []
+  "current_loop_rejected_skill_ids": []
 }
 ```
 
-### 8.2 二级 Intent Prompt
+### 8.3 二级 Intent Prompt
 
 职责：
 
@@ -698,7 +732,9 @@ params_check == "fail"
 
 ```json
 {
-  "query": "...",
+  "resolved_query": "...",
+  "current_user_query": "...",
+  "contextualized_request": {},
   "skill_id": "...",
   "skill_markdown": "...",
   "rejected_intents": [],

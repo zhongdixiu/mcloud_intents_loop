@@ -2,21 +2,30 @@ from __future__ import annotations
 
 import json
 
-from .types import DialogueHistory, SkillCard, SkillDefinition
+from .types import ContextualizedRequest, DialogueHistory, SkillCard, SkillDefinition
 
 
 DIALOGUE_HISTORY_LIMIT = 5
 
-DIALOGUE_HISTORY_RULES = """对话历史使用规则：
-1. current_user_query 是本轮用户原始输入，也是本轮最高优先级输入。
-2. dialogue_history 只用于理解省略、指代、确认、修改和用户改口；每轮历史中 user_query 是历史用户输入，assistant_result 是历史意图识别结果。
-3. 当 current_user_query 含“它/这个/这些/刚刚/刚才/上一个/搜到的”等指代表达时，从 dialogue_history 倒序查找最近兼容的 assistant_result.status=matched 作为历史意图语义。
-4. current_user_query 中的动作词决定本轮 skill/intent/code；历史 matched result 只提供被操作对象、筛选条件或上下文语义。
-5. 历史 matched result 不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
-6. 若 skill/intent/code 已明确，不要因为执行阶段才需要的资源选择或真实句柄缺失而输出 clarify。
-7. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；只有当前输入或历史结果中已有明确真实占位符时才抽取。
-8. 普通语义参数可以从 current_user_query 或兼容的历史 assistant_result 中继承，例如搜索条件、邮件筛选条件、待办内容、编号等。
-9. current_user_query 明确改口或提出新需求时，以 current_user_query 为准，不要机械继承历史。
+CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下文语义归一节点。
+你的任务是把 current_user_query 和 dialogue_history 归一成本轮完整语义请求 resolved_query。
+必须遵守：
+1. 不输出 skill_id、intent、code 或 params，只输出用户本轮真实想表达的完整自然语言请求。
+2. current_user_query 优先，但不要孤立理解；dialogue_history 只用于理解省略、延续、修正、改口、指代和对历史问题的回应。
+3. 不要假设上一轮是 clarify 时本轮一定是在回答；只有当前输入与历史语义兼容且需要历史才能完整理解时，才承接历史。
+4. 当前输入若包含明确的新动作、新对象或新目标，应视为 new_request，不要机械继承历史。
+5. 若承接历史，resolved_query 必须补全成不依赖历史也能理解的完整请求。
+6. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
+7. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
+8. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
+"""
+
+CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
+1. resolved_query 是本轮已经归一后的完整语义请求，skill/intent/code/params/evaluator 都必须围绕它判断。
+2. current_user_query 只用于审计原始输入，不要绕过 resolved_query 重新解释整段历史。
+3. context_relation 和 context_reason 只解释 resolved_query 如何得到，不是业务执行结果。
+4. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；只有 resolved_query 或明确上下文中已有真实占位符时才抽取。
+5. 若 skill/intent/code 已明确，不要因为执行阶段才需要的资源选择或真实句柄缺失而输出 clarify。
 """
 
 EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
@@ -33,9 +42,10 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 3. status=route 时只能返回一个 skill_id，必须是当前最优匹配 skill。
 4. 若没有任何 skill 支持用户需求，输出 no_match，不要用 clarify 兜底。
 5. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
-6. 不要选择未提供的 skill id，不要选择 rejected_skill_ids。
-7. 遵守以下对话历史使用规则。
-{dialogue_history_rules}
+6. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
+7. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
+8. 遵守以下上下文语义使用规则。
+{contextualized_request_rules}
 """
 
 INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图选择节点。
@@ -51,8 +61,8 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图�
 8. 若 rejected_intents 中已有被拒绝的 intent，除非用户澄清明确要求它，否则不要重复选择。
 9. 若该 skill 不支持用户请求，输出 no_match。
 10. 明确不具备的能力不要用 clarify 兜底。
-11. 遵守以下对话历史使用规则。
-{dialogue_history_rules}
+11. 遵守以下上下文语义使用规则。
+{contextualized_request_rules}
 """
 
 PARAM_REPAIR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的参数修正节点。
@@ -63,8 +73,8 @@ PARAM_REPAIR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的参数�
 3. 只抽取用户明确出现或可直接确定的信息，禁止常识补全。
 4. 若此前参数被拒绝，必须避免重复同类错误。
 5. 若用户信息不足且缺失信息会影响关键参数，输出 clarify。
-6. 遵守以下对话历史使用规则。
-{dialogue_history_rules}
+6. 遵守以下上下文语义使用规则。
+{contextualized_request_rules}
 """
 
 EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的结果评估节点。
@@ -82,54 +92,75 @@ EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的结果评�
 10. verdict=reject 时，只要你能判断错误层级，就必须填写 reject_scope。
 11. 若无法判断错误层级，应输出 clarify，而不是 reject。
 12. 不要输出推荐 skill_id/intent/code。
-13. 遵守以下对话历史和评估规则。
-{dialogue_history_rules}
+13. 遵守以下上下文语义和评估规则。
+{contextualized_request_rules}
 {evaluator_extra_rules}
 """
 
 ROUTER_SYSTEM_PROMPT = ROUTER_SYSTEM_PROMPT.format(
-    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+    contextualized_request_rules=CONTEXTUALIZED_REQUEST_RULES,
 )
 INTENT_SYSTEM_PROMPT = INTENT_SYSTEM_PROMPT.format(
-    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+    contextualized_request_rules=CONTEXTUALIZED_REQUEST_RULES,
 )
 PARAM_REPAIR_SYSTEM_PROMPT = PARAM_REPAIR_SYSTEM_PROMPT.format(
-    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+    contextualized_request_rules=CONTEXTUALIZED_REQUEST_RULES,
 )
 EVALUATOR_SYSTEM_PROMPT = EVALUATOR_SYSTEM_PROMPT.format(
-    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+    contextualized_request_rules=CONTEXTUALIZED_REQUEST_RULES,
     evaluator_extra_rules=EVALUATOR_EXTRA_RULES,
 )
 
 
-def build_router_prompt(
+def build_contextualizer_prompt(
     query: str,
-    cards: list[SkillCard],
-    rejected: list[str],
     dialogue_history: DialogueHistory | None = None,
 ) -> str:
     return json.dumps(
         {
             "current_user_query": query,
             "dialogue_history": _dialogue_history_payload(dialogue_history),
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_router_prompt(
+    resolved_query: str,
+    cards: list[SkillCard],
+    rejected: list[str],
+    contextualized_request: ContextualizedRequest | None = None,
+    current_user_query: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "resolved_query": resolved_query,
+            "current_user_query": current_user_query or resolved_query,
+            "contextualized_request": _contextualized_request_payload(
+                contextualized_request,
+            ),
             "available_skills": [card.model_dump() for card in cards],
-            "rejected_skill_ids": rejected,
+            "current_loop_rejected_skill_ids": rejected,
         },
         ensure_ascii=False,
     )
 
 
 def build_intent_prompt(
-    query: str,
+    resolved_query: str,
     skill: SkillDefinition,
     rejected_intents: list[dict] | None = None,
     param_rejections: list[dict] | None = None,
-    dialogue_history: DialogueHistory | None = None,
+    contextualized_request: ContextualizedRequest | None = None,
+    current_user_query: str | None = None,
 ) -> str:
     return json.dumps(
         {
-            "current_user_query": query,
-            "dialogue_history": _dialogue_history_payload(dialogue_history),
+            "resolved_query": resolved_query,
+            "current_user_query": current_user_query or resolved_query,
+            "contextualized_request": _contextualized_request_payload(
+                contextualized_request,
+            ),
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "rejected_intents": rejected_intents or [],
@@ -140,17 +171,21 @@ def build_intent_prompt(
 
 
 def build_param_repair_prompt(
-    query: str,
+    resolved_query: str,
     skill: SkillDefinition,
     locked_intent: str,
     locked_code: str,
     param_rejections: list[dict] | None = None,
-    dialogue_history: DialogueHistory | None = None,
+    contextualized_request: ContextualizedRequest | None = None,
+    current_user_query: str | None = None,
 ) -> str:
     return json.dumps(
         {
-            "current_user_query": query,
-            "dialogue_history": _dialogue_history_payload(dialogue_history),
+            "resolved_query": resolved_query,
+            "current_user_query": current_user_query or resolved_query,
+            "contextualized_request": _contextualized_request_payload(
+                contextualized_request,
+            ),
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "locked_intent": locked_intent,
@@ -163,19 +198,20 @@ def build_param_repair_prompt(
 
 
 def build_evaluator_prompt(
-    query: str,
+    resolved_query: str,
     available_skills: list[SkillCard],
     skill: SkillDefinition,
     candidate: dict,
-    rejected_skill_ids: list[str] | None = None,
-    rejected_intents: dict[str, list[dict[str, str]]] | None = None,
-    visited_skills: list[str] | None = None,
-    dialogue_history: DialogueHistory | None = None,
+    contextualized_request: ContextualizedRequest | None = None,
+    current_user_query: str | None = None,
 ) -> str:
     return json.dumps(
         {
-            "current_user_query": query,
-            "dialogue_history": _dialogue_history_payload(dialogue_history),
+            "resolved_query": resolved_query,
+            "current_user_query": current_user_query or resolved_query,
+            "contextualized_request": _contextualized_request_payload(
+                contextualized_request,
+            ),
             "available_skills": [card.model_dump() for card in available_skills],
             "skill": {
                 "id": skill.id,
@@ -188,11 +224,6 @@ def build_evaluator_prompt(
                 },
             },
             "candidate": candidate,
-            "loop_state": {
-                "visited_skills": visited_skills or [],
-                "rejected_skill_ids": rejected_skill_ids or [],
-                "rejected_intents": rejected_intents or {},
-            },
         },
         ensure_ascii=False,
     )
@@ -201,10 +232,48 @@ def build_evaluator_prompt(
 def _dialogue_history_payload(dialogue_history: DialogueHistory | None) -> list[dict]:
     if dialogue_history is None:
         return []
-    return [
-        {
-            "user_query": turn.user_query,
-            "assistant_result": turn.result.model_dump(mode="json"),
+    payload = []
+    for turn in dialogue_history.turns[-DIALOGUE_HISTORY_LIMIT:]:
+        result = turn.result
+        if result.status == "matched":
+            assistant_result = {
+                "status": result.status,
+                "skill_id": result.skill_id,
+                "skill_name": result.skill_name,
+                "intent": result.intent,
+                "code": result.code,
+                "params": result.params,
+            }
+        elif result.status == "clarify":
+            assistant_result = {
+                "status": result.status,
+                "question": result.question,
+                "options": result.options,
+            }
+        else:
+            assistant_result = {"status": result.status}
+        payload.append(
+            {
+                "user_query": turn.user_query,
+                "assistant_result": assistant_result,
+            },
+        )
+    return payload
+
+
+def _contextualized_request_payload(
+    contextualized_request: ContextualizedRequest | None,
+) -> dict:
+    if contextualized_request is None:
+        return {
+            "status": "resolved",
+            "relation_to_history": "new_request",
+            "used_history_turns": [],
+            "reason": "",
         }
-        for turn in dialogue_history.turns[-DIALOGUE_HISTORY_LIMIT:]
-    ]
+    return {
+        "status": contextualized_request.status,
+        "relation_to_history": contextualized_request.relation_to_history,
+        "used_history_turns": contextualized_request.used_history_turns,
+        "reason": contextualized_request.reason,
+    }

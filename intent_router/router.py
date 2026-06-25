@@ -6,10 +6,12 @@ from typing import Any
 
 from .model_client import AgentScopeStructuredClient, StructuredModelClient
 from .prompts import (
+    CONTEXTUALIZER_SYSTEM_PROMPT,
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     PARAM_REPAIR_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
+    build_contextualizer_prompt,
     build_evaluator_prompt,
     build_intent_prompt,
     build_param_repair_prompt,
@@ -17,6 +19,7 @@ from .prompts import (
 )
 from .skills import SkillRegistry
 from .types import (
+    ContextualizedRequest,
     DialogueHistory,
     EvaluationDecision,
     IntentDecision,
@@ -97,6 +100,29 @@ class IntentRouter:
         )
         visited: list[str] = state.setdefault("visited_skills", [])
         context = context or {}
+        contextualized_request = await self._contextualize(query, history)
+        _trace(
+            trace,
+            "contextualize",
+            current_user_query=query,
+            status=contextualized_request.status,
+            resolved_query=contextualized_request.resolved_query,
+            relation_to_history=contextualized_request.relation_to_history,
+            used_history_turns=list(contextualized_request.used_history_turns),
+            reason=contextualized_request.reason,
+        )
+        state["resolved_query"] = contextualized_request.resolved_query or query
+        state["context_relation"] = contextualized_request.relation_to_history
+        if contextualized_request.status == "clarify":
+            return _traced_result(
+                trace,
+                self._clarify(
+                    contextualized_request.question,
+                    contextualized_request.options,
+                    state,
+                ),
+            )
+        resolved_query = contextualized_request.resolved_query or query
 
         for _ in range(self.max_attempts):
             attempt = _ + 1
@@ -132,10 +158,11 @@ class IntentRouter:
                 )
             else:
                 route_decision = await self._select_skills(
-                    query,
+                    resolved_query,
                     rejected,
                     context,
-                    history,
+                    contextualized_request,
+                    query,
                 )
                 _trace(
                     trace,
@@ -160,6 +187,8 @@ class IntentRouter:
                             status="no_match",
                             reason=route_decision.reason or "No matching skill",
                             visited_skills=visited,
+                            resolved_query=state.get("resolved_query"),
+                            context_relation=state.get("context_relation"),
                         ),
                     )
 
@@ -172,6 +201,8 @@ class IntentRouter:
                             status="no_match",
                             reason="Router did not return a usable skill",
                             visited_skills=visited,
+                            resolved_query=state.get("resolved_query"),
+                            context_relation=state.get("context_relation"),
                         ),
                     )
                 state["locked_skill_id"] = skill_id
@@ -185,12 +216,13 @@ class IntentRouter:
             locked_code = state.get("locked_code")
             if retry_scope == "retry_params" and locked_intent and locked_code:
                 intent_decision = await self._repair_params(
-                    query,
+                    resolved_query,
                     skill_id,
                     locked_intent,
                     locked_code,
                     param_rejections.get(_param_rejection_key(skill_id, locked_intent), []),
-                    history,
+                    contextualized_request,
+                    query,
                 )
                 _trace(
                     trace,
@@ -203,11 +235,12 @@ class IntentRouter:
                 )
             else:
                 intent_decision = await self._select_intent(
-                    query,
+                    resolved_query,
                     skill_id,
                     rejected_intents.get(skill_id, []),
                     _skill_param_rejections(param_rejections, skill_id),
-                    history,
+                    contextualized_request,
+                    query,
                 )
                 _trace(
                     trace,
@@ -247,12 +280,14 @@ class IntentRouter:
                     continue
                 return _traced_result(
                     trace,
-                    RouteResult(
-                        status="no_match",
-                        reason=intent_decision.reason or "No matching intent",
-                        visited_skills=visited,
-                    ),
-                )
+                        RouteResult(
+                            status="no_match",
+                            reason=intent_decision.reason or "No matching intent",
+                            visited_skills=visited,
+                            resolved_query=state.get("resolved_query"),
+                            context_relation=state.get("context_relation"),
+                        ),
+                    )
 
             if retry_scope == "retry_params":
                 try:
@@ -315,11 +350,12 @@ class IntentRouter:
                 continue
 
             raw_evaluation = await self._evaluate(
-                query,
+                resolved_query,
                 skill_id,
                 validated,
                 state,
-                history,
+                contextualized_request,
+                query,
             )
             _trace(
                 trace,
@@ -371,6 +407,8 @@ class IntentRouter:
                 status="no_match",
                 reason="Exceeded maximum routing attempts",
                 visited_skills=visited,
+                resolved_query=state.get("resolved_query"),
+                context_relation=state.get("context_relation"),
             ),
         )
 
@@ -402,6 +440,8 @@ class IntentRouter:
                 params=validated.params,
                 confidence=min(route_confidence, validated.confidence),
                 visited_skills=state.get("visited_skills", []),
+                resolved_query=state.get("resolved_query"),
+                context_relation=state.get("context_relation"),
             )
 
         if not evaluation.reject_scope:
@@ -493,16 +533,18 @@ class IntentRouter:
 
     async def _select_skills(
         self,
-        query: str,
+        resolved_query: str,
         rejected: list[str],
         context: dict[str, Any],
-        dialogue_history: DialogueHistory,
+        contextualized_request: ContextualizedRequest,
+        current_user_query: str,
     ) -> SkillRouteDecision:
         prompt = build_router_prompt(
-            query,
+            resolved_query,
             self.registry.cards(),
             rejected,
-            dialogue_history,
+            contextualized_request,
+            current_user_query,
         )
         if context:
             prompt = json.dumps(
@@ -517,70 +559,90 @@ class IntentRouter:
 
     async def _select_intent(
         self,
-        query: str,
+        resolved_query: str,
         skill_id: str,
         rejected_intents: list[dict[str, str]],
         param_rejections: list[dict[str, str]] | None = None,
-        dialogue_history: DialogueHistory | None = None,
+        contextualized_request: ContextualizedRequest | None = None,
+        current_user_query: str | None = None,
     ) -> IntentDecision:
         skill = self.registry.get(skill_id)
         return await self.model_client.structured(
             system_prompt=INTENT_SYSTEM_PROMPT,
             user_prompt=build_intent_prompt(
-                query,
+                resolved_query,
                 skill,
                 rejected_intents,
                 param_rejections,
-                dialogue_history,
+                contextualized_request,
+                current_user_query,
             ),
             response_model=IntentDecision,
         )
 
     async def _repair_params(
         self,
-        query: str,
+        resolved_query: str,
         skill_id: str,
         locked_intent: str,
         locked_code: str,
         param_rejections: list[dict[str, str]],
-        dialogue_history: DialogueHistory | None = None,
+        contextualized_request: ContextualizedRequest | None = None,
+        current_user_query: str | None = None,
     ) -> IntentDecision:
         skill = self.registry.get(skill_id)
         return await self.model_client.structured(
             system_prompt=PARAM_REPAIR_SYSTEM_PROMPT,
             user_prompt=build_param_repair_prompt(
-                query,
+                resolved_query,
                 skill,
                 locked_intent,
                 locked_code,
                 param_rejections,
-                dialogue_history,
+                contextualized_request,
+                current_user_query,
             ),
             response_model=IntentDecision,
         )
 
     async def _evaluate(
         self,
-        query: str,
+        resolved_query: str,
         skill_id: str,
         decision: IntentDecision,
         state: dict[str, Any],
-        dialogue_history: DialogueHistory,
+        contextualized_request: ContextualizedRequest,
+        current_user_query: str,
     ) -> EvaluationDecision:
         skill = self.registry.get(skill_id)
         return await self.evaluator_client.structured(
             system_prompt=EVALUATOR_SYSTEM_PROMPT,
             user_prompt=build_evaluator_prompt(
-                query,
+                resolved_query,
                 self.registry.cards(),
                 skill,
                 decision.model_dump(),
-                rejected_skill_ids=state.get("rejected_skills", []),
-                rejected_intents=state.get("rejected_intents", {}),
-                visited_skills=state.get("visited_skills", []),
-                dialogue_history=dialogue_history,
+                contextualized_request=contextualized_request,
+                current_user_query=current_user_query,
             ),
             response_model=EvaluationDecision,
+        )
+
+    async def _contextualize(
+        self,
+        query: str,
+        dialogue_history: DialogueHistory,
+    ) -> ContextualizedRequest:
+        if not dialogue_history.turns:
+            return ContextualizedRequest(
+                status="resolved",
+                resolved_query=query,
+                relation_to_history="new_request",
+            )
+        return await self.model_client.structured(
+            system_prompt=CONTEXTUALIZER_SYSTEM_PROMPT,
+            user_prompt=build_contextualizer_prompt(query, dialogue_history),
+            response_model=ContextualizedRequest,
         )
 
     def _clarify(
@@ -594,6 +656,8 @@ class IntentRouter:
             question=question or "请补充更多信息，以便确定要使用的功能。",
             options=options,
             visited_skills=state.get("visited_skills", []),
+            resolved_query=state.get("resolved_query"),
+            context_relation=state.get("context_relation"),
         )
 
 

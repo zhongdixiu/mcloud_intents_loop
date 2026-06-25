@@ -63,11 +63,30 @@ def validate_evaluation_decision(
     if not evaluation.reject_scope:
         raise ValidationError("rejected evaluation misses reject_scope")
 
-    if evaluation.reject_scope in {
-        "skill_mismatch",
-        "intent_mismatch",
-        "param_mismatch",
-    }:
+    if evaluation.reject_scope == "skill_mismatch":
+        if evaluation.skill_check != "fail":
+            raise ValidationError(
+                "skill_mismatch requires skill_check='fail'",
+            )
+        return evaluation
+
+    if evaluation.reject_scope == "intent_mismatch":
+        if evaluation.skill_check != "pass" or evaluation.intent_check != "fail":
+            raise ValidationError(
+                "intent_mismatch requires skill_check='pass' and intent_check='fail'",
+            )
+        return evaluation
+
+    if evaluation.reject_scope == "param_mismatch":
+        if (
+            evaluation.skill_check != "pass"
+            or evaluation.intent_check != "pass"
+            or evaluation.params_check != "fail"
+        ):
+            raise ValidationError(
+                "param_mismatch requires skill_check='pass', "
+                "intent_check='pass', and params_check='fail'",
+            )
         return evaluation
 
     raise ValidationError(f"unsupported reject_scope: {evaluation.reject_scope}")

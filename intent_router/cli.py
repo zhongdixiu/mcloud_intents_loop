@@ -108,6 +108,11 @@ def _print_chat_help() -> None:
 def _print_chat_result(query: str, result: RouteResult) -> None:
     data = result.model_dump(mode="json")
     skill = data.get("skill") or {}
+    if data.get("resolved_query"):
+        print("上下文语义")
+        print(f"  resolved_query: {data.get('resolved_query')}")
+        if data.get("context_relation"):
+            print(f"  relation: {data.get('context_relation')}")
     print("意图决策")
     print(f"  status: {data.get('status')}")
     if skill:

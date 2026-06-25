@@ -4,6 +4,7 @@ from intent_router.dialogue import IntentDialogueAgent
 from intent_router.model_client import FakeStructuredClient
 from intent_router.router import IntentRouter
 from intent_router.types import (
+    ContextualizedRequest,
     DialogueHistory,
     DialogueRouteSummary,
     DialogueTurn,
@@ -15,7 +16,7 @@ from intent_router.types import (
 
 async def test_router_returns_matched_result() -> None:
     """：一级 skill、二级 intent、参数、Evaluator accept 后返回 matched；
-    同时验证 evaluator prompt 带了可用 skills、schema 和 loop state。"""
+    同时验证 evaluator prompt 带了可用 skills 和 schema，但不注入 loop state。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -55,12 +56,9 @@ async def test_router_returns_matched_result() -> None:
         for skill in evaluator_prompt["available_skills"]
     )
     assert "tools_schema" in evaluator_prompt["skill"]
-    assert evaluator_prompt["loop_state"] == {
-        "visited_skills": ["mcloud_search_skill"],
-        "rejected_skill_ids": [],
-        "rejected_intents": {},
-    }
-    assert evaluator_prompt["dialogue_history"] == []
+    assert "loop_state" not in evaluator_prompt
+    assert "dialogue_history" not in evaluator_prompt
+    assert evaluator_prompt["resolved_query"] == "帮我找上个月北京拍的猫照片"
     assert evaluator_prompt["current_user_query"] == "帮我找上个月北京拍的猫照片"
 
 
@@ -188,7 +186,7 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
     assert result.correction_scopes == ["skill_mismatch"]
 
     second_router_prompt = json.loads(model.calls[3][1])
-    assert second_router_prompt["rejected_skill_ids"] == ["file_skill"]
+    assert second_router_prompt["current_loop_rejected_skill_ids"] == ["file_skill"]
     assert any(
         event.get("event") == "retry" and event.get("scope") == "skill_mismatch"
         for event in trace
@@ -211,7 +209,7 @@ async def test_skill_reject_records_rejected_skill_even_with_low_confidence() ->
             EvaluationDecision(
                 verdict="reject",
                 reject_scope="skill_mismatch",
-                skill_check="unclear",
+                skill_check="fail",
                 confidence=0.4,
                 reason="可能应该搜索",
                 clarity_reason="搜索和入口表达都可能成立",
@@ -225,7 +223,7 @@ async def test_skill_reject_records_rejected_skill_even_with_low_confidence() ->
 
     assert result.status == "no_match"
     second_router_prompt = json.loads(model.calls[3][1])
-    assert second_router_prompt["rejected_skill_ids"] == ["file_skill"]
+    assert second_router_prompt["current_loop_rejected_skill_ids"] == ["file_skill"]
 
 
 async def test_router_retries_same_skill_after_intent_mismatch() -> None:
@@ -296,7 +294,8 @@ async def test_intent_reject_records_rejected_intent_even_with_low_confidence() 
             EvaluationDecision(
                 verdict="reject",
                 reject_scope="intent_mismatch",
-                intent_check="unclear",
+                skill_check="pass",
+                intent_check="fail",
                 confidence=0.4,
                 reason="可能需要具体改图",
                 clarity_reason="用户是否要入口不确定",
@@ -387,6 +386,13 @@ async def test_router_retries_after_param_mismatch() -> None:
 async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
     model = FakeStructuredClient(
         [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="只找最近的猫图片",
+                relation_to_history="continuation",
+                used_history_turns=[1, 2, 3, 4, 5],
+                reason="当前输入需要继承历史搜索对象",
+            ),
             SkillRouteDecision(
                 status="route",
                 skill_id="mcloud_search_skill",
@@ -430,21 +436,29 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
     result = await router.route("只找最近的", dialogue_history=history)
 
     assert result.status == "matched"
-    for call in model.calls:
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assert contextualizer_prompt["current_user_query"] == "只找最近的"
+    assert len(contextualizer_prompt["dialogue_history"]) == 5
+    assert contextualizer_prompt["dialogue_history"][0]["user_query"] == "历史第1轮"
+    assert contextualizer_prompt["dialogue_history"][-1]["user_query"] == "历史第5轮"
+    assert (
+        contextualizer_prompt["dialogue_history"][0]["assistant_result"]["status"]
+        == "matched"
+    )
+    assert "metadata" not in contextualizer_prompt["dialogue_history"][0]
+    assert "agent_result" not in contextualizer_prompt["dialogue_history"][0]
+    assert "user_feedback" not in contextualizer_prompt["dialogue_history"][0]
+    assert "result" not in contextualizer_prompt["dialogue_history"][0]
+
+    for call in model.calls[1:]:
         prompt = json.loads(call[1])
         assert prompt["current_user_query"] == "只找最近的"
-        assert len(prompt["dialogue_history"]) == 5
-        assert prompt["dialogue_history"][0]["user_query"] == "历史第1轮"
-        assert prompt["dialogue_history"][-1]["user_query"] == "历史第5轮"
-        assert prompt["dialogue_history"][0]["assistant_result"]["status"] == "matched"
-        assert "metadata" not in prompt["dialogue_history"][0]
-        assert "agent_result" not in prompt["dialogue_history"][0]
-        assert "user_feedback" not in prompt["dialogue_history"][0]
-        assert "result" not in prompt["dialogue_history"][0]
+        assert prompt["resolved_query"] == "只找最近的猫图片"
+        assert "dialogue_history" not in prompt
         assert "last_matched_turn" not in prompt
         assert "decision_query" not in prompt
 
-    assert "assistant_result 是历史意图识别结果" in model.calls[0][0]
+    assert "上下文语义归一节点" in model.calls[0][0]
     assert "不要伪造 image/content/file" in model.calls[1][0]
     assert "执行载体缺失不算 param_mismatch" in model.calls[-1][0]
 
@@ -468,7 +482,9 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
             EvaluationDecision(
                 verdict="reject",
                 reject_scope="param_mismatch",
-                params_check="unclear",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
                 confidence=0.4,
                 reason="可能过度补全 mp3",
                 clarity_reason="用户没有明确文件后缀",
@@ -592,6 +608,12 @@ async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
                     {"label": "打开入口", "value": "open"},
                 ],
             ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="打开文件入口",
+                relation_to_history="new_request",
+                reason="当前输入已能独立表达入口诉求",
+            ),
             SkillRouteDecision(
                 status="route",
                 skill_id="file_skill",
@@ -621,13 +643,15 @@ async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
     assert second.skill is not None
     assert second.skill.id == "file_skill"
     assert second.intent == "文件"
-    second_router_prompt = json.loads(model.calls[1][1])
-    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
+    second_context_prompt = json.loads(model.calls[1][1])
+    assert second_context_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
         "clarify"
     )
-    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["question"] == (
+    assert second_context_prompt["dialogue_history"][0]["assistant_result"]["question"] == (
         "你想搜索资源还是打开入口？"
     )
+    second_router_prompt = json.loads(model.calls[2][1])
+    assert second_router_prompt["resolved_query"] == "打开文件入口"
 
 
 async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() -> None:
@@ -647,6 +671,13 @@ async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() 
                 confidence=0.8,
             ),
             EvaluationDecision(verdict="accept", confidence=0.8),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="给蓝色天空图片配上文字",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前输入中的它指向上一轮搜索图片语义",
+            ),
             SkillRouteDecision(
                 status="route",
                 skill_id="image_skill",
@@ -676,16 +707,111 @@ async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() 
     assert second.code == "036006"
     assert second.params == {}
     assert second.loop_count == 1
-    second_router_prompt = json.loads(model.calls[3][1])
-    assert second_router_prompt["dialogue_history"][0]["user_query"] == (
+    second_context_prompt = json.loads(model.calls[3][1])
+    assert second_context_prompt["dialogue_history"][0]["user_query"] == (
         "帮我找蓝色天空的图片"
     )
-    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["intent"] == (
+    assert second_context_prompt["dialogue_history"][0]["assistant_result"]["intent"] == (
         "搜图片"
     )
-    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["params"] == {
+    assert second_context_prompt["dialogue_history"][0]["assistant_result"]["params"] == {
         "metadataList": ["蓝色天空"],
     }
+    second_router_prompt = json.loads(model.calls[4][1])
+    assert second_router_prompt["resolved_query"] == "给蓝色天空图片配上文字"
+
+
+async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="clarify",
+                question="您是想搜索包含“蓝色天空”文字的文档，还是图片？",
+                options=[
+                    {"label": "搜文档", "value": "搜文档"},
+                    {"label": "搜图片", "value": "搜图片"},
+                ],
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="搜索包含蓝色天空文字的图片",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前短输入与上一轮搜索歧义兼容，归一为完整搜索图片请求",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["蓝色天空", "文字"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("搜 蓝色天空文字")
+    second = await agent.send("蓝图片")
+
+    assert first.status == "clarify"
+    assert second.status == "matched"
+    assert second.skill is not None
+    assert second.skill.id == "mcloud_search_skill"
+    assert second.intent == "搜图片"
+    assert second.resolved_query == "搜索包含蓝色天空文字的图片"
+    assert second.context_relation == "continuation"
+
+    second_router_prompt = json.loads(model.calls[3][1])
+    assert second_router_prompt["resolved_query"] == "搜索包含蓝色天空文字的图片"
+    assert "dialogue_history" not in second_router_prompt
+
+
+async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="重新搜索图片",
+                relation_to_history="new_request",
+            ),
+            SkillRouteDecision(status="no_match", reason="no supported skill"),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="蓝图片",
+                result=DialogueRouteSummary(
+                    status="no_match",
+                    reason=(
+                        "云盘搜索技能（mcloud_search_skill）和文件管理技能"
+                        "均已被拒绝（rejected_skill_ids）"
+                    ),
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("重新搜图片", dialogue_history=history)
+
+    assert result.status == "no_match"
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    assert assistant_result == {"status": "no_match"}
+    assert "rejected_skill_ids" not in model.calls[0][1]
 
 
 async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
@@ -765,6 +891,13 @@ async def test_dialogue_agent_uses_baby_clarification_for_time_machine() -> None
                     {"label": "父母双方照片", "value": "parents_photo"},
                 ],
             ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="基于已出生宝宝照片预测宝宝未来的样子",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前输入补充了上一轮缺失的照片类型",
+            ),
             SkillRouteDecision(
                 status="route",
                 skill_id="image_skill",
@@ -792,8 +925,8 @@ async def test_dialogue_agent_uses_baby_clarification_for_time_machine() -> None
     assert second.skill.id == "image_skill"
     assert second.intent == "宝宝时光机"
     assert second.code == "029"
-    second_router_prompt = json.loads(model.calls[2][1])
-    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
+    second_context_prompt = json.loads(model.calls[2][1])
+    assert second_context_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
         "clarify"
     )
 
@@ -813,6 +946,13 @@ async def test_dialogue_agent_uses_baby_clarification_for_appearance_prediction(
                     {"label": "已出生宝宝照片", "value": "baby_photo"},
                     {"label": "父母双方照片", "value": "parents_photo"},
                 ],
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="基于父母双方照片预测宝宝未来的样子",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前输入补充了上一轮缺失的照片类型",
             ),
             SkillRouteDecision(
                 status="route",

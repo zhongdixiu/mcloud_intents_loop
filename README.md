@@ -93,13 +93,14 @@ python -m intent_router chat --skills skills
 ```
 
 The `chat` command keeps dialogue history in the terminal process. The router
-injects the latest 5 turns as intent-decision context only: user query plus the
-final route result. In model prompts, the current input is named
-`current_user_query`, and historical route results are injected as
-`dialogue_history[].assistant_result`. It does not inject business execution
-results or treat historical search results as real file/image/mail handles.
-Each turn prints the user query, final route result, `loop_count`, and
-`correction_scopes`.
+first injects the latest 5 turns into a contextualizer prompt: user query plus
+the final route result. The contextualizer produces `resolved_query`, and skill
+routing, intent selection, parameter repair, and evaluation all use that unified
+request. Later prompts keep `current_user_query` only for audit context and do
+not receive `dialogue_history` directly. Business execution results, loop
+rejection state, and historical no-match reasons are not injected as dialogue
+semantics. Each turn prints the resolved query, final route result,
+`loop_count`, and `correction_scopes`.
 Shortcuts are available in the prompt:
 
 - `:q`, `:quit`, `exit`, `quit`: end the dialogue

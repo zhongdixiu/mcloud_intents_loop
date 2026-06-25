@@ -74,6 +74,22 @@ class EvaluationDecision(BaseModel):
     options: list[dict[str, str]] = Field(default_factory=list)
 
 
+class ContextualizedRequest(BaseModel):
+    status: Literal["resolved", "clarify"]
+    resolved_query: str | None = None
+    relation_to_history: Literal[
+        "new_request",
+        "continuation",
+        "revision",
+        "answer_to_previous",
+        "ambiguous",
+    ] = "new_request"
+    used_history_turns: list[int] = Field(default_factory=list)
+    reason: str = ""
+    question: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+
+
 class SkillRef(BaseModel):
     id: str
     name: str
@@ -115,3 +131,5 @@ class RouteResult(BaseModel):
     visited_skills: list[str] = Field(default_factory=list)
     loop_count: int = 1
     correction_scopes: list[str] = Field(default_factory=list)
+    resolved_query: str | None = None
+    context_relation: str | None = None
