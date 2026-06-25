@@ -10,6 +10,7 @@ from intent_router.types import (
     DialogueTurn,
     EvaluationDecision,
     IntentDecision,
+    LoopExhaustedClarification,
     SkillRouteDecision,
 )
 
@@ -507,6 +508,88 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
     ]
 
 
+async def test_max_attempts_reject_returns_guided_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
+                reason="用户未明确 mp3 后缀",
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
+                reason="仍然过度补全 mp3 后缀",
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
+                reason="仍然无法确认文件后缀",
+            ),
+            LoopExhaustedClarification(
+                question="您想按哪些关键词或文件类型搜索这首歌？",
+                options=[
+                    {"label": "只按关键词搜索", "value": "只按关键词搜索"},
+                    {"label": "指定音频格式", "value": "指定音频格式"},
+                ],
+                reason="多次卡在搜索条件是否包含文件格式",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("帮我找周杰伦的歌")
+
+    assert result.status == "clarify"
+    assert result.question == "您想按哪些关键词或文件类型搜索这首歌？"
+    assert result.termination_reason == "loop_exhausted"
+    assert result.reason == "多次卡在搜索条件是否包含文件格式"
+    assert result.loop_count == 3
+    assert result.correction_scopes == ["param_mismatch"]
+    assert model.calls[-1][2] is LoopExhaustedClarification
+
+    clarifier_prompt = json.loads(model.calls[-1][1])
+    assert clarifier_prompt["resolved_query"] == "帮我找周杰伦的歌"
+    assert len(clarifier_prompt["attempts"]) == 3
+    assert clarifier_prompt["attempts"][-1]["reject_scope"] == "param_mismatch"
+    assert clarifier_prompt["attempts"][-1]["reject_reason"] == "仍然无法确认文件后缀"
+
+
 async def test_router_reject_without_scope_returns_stable_no_match() -> None:
     """ Evaluator 输出 reject 但没有 reject_scope 时，视为无效评估，不猜测错误层级，并进入稳定失败路径。"""
     model = FakeStructuredClient(
@@ -778,6 +861,56 @@ async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> N
     assert "dialogue_history" not in second_router_prompt
 
 
+async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="clarify",
+                relation_to_history="ambiguous",
+                used_history_turns=[0],
+                reason="无法判断蓝色是在替换历史关键词还是追加筛选合同文件",
+                question="您是要重新搜索蓝色相关内容，还是搜索蓝色合同文件？",
+                options=[
+                    {"label": "重新搜索蓝色相关内容", "value": "new_blue_search"},
+                    {"label": "搜索蓝色合同文件", "value": "blue_contract_files"},
+                ],
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜合同文件",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜综合",
+                    code="018",
+                    params={"metadataList": ["合同", "文件"]},
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("搜蓝色", dialogue_history=history)
+
+    assert result.status == "clarify"
+    assert result.context_relation == "ambiguous"
+    assert "蓝色合同文件" in (result.question or "")
+    assert [call[2] for call in model.calls] == [ContextualizedRequest]
+
+    system_prompt = model.calls[0][0]
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    assert contextualizer_prompt["current_user_query"] == "搜蓝色"
+    assert assistant_result["params"] == {"metadataList": ["合同", "文件"]}
+    assert "判别性主体" in system_prompt
+    assert "核心主体、动作、对象类型和限定条件" in system_prompt
+    assert "新请求、替换历史主体、或在历史主体上追加限定条件" in system_prompt
+
+
 async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
     model = FakeStructuredClient(
         [
@@ -812,6 +945,69 @@ async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
     assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
     assert assistant_result == {"status": "no_match"}
     assert "rejected_skill_ids" not in model.calls[0][1]
+
+
+async def test_dialogue_history_does_not_inject_loop_exhausted_internal_state() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="只按关键词搜索周杰伦的歌",
+                relation_to_history="answer_to_previous",
+                used_history_turns=[0],
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦", "歌"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="帮我找周杰伦的歌",
+                result=DialogueRouteSummary(
+                    status="clarify",
+                    question="您想按哪些关键词或文件类型搜索这首歌？",
+                    options=[
+                        {"label": "只按关键词搜索", "value": "只按关键词搜索"},
+                        {"label": "指定音频格式", "value": "指定音频格式"},
+                    ],
+                    reason="多次卡在搜索条件是否包含文件格式",
+                ),
+                metadata={
+                    "termination_reason": "loop_exhausted",
+                    "rejections": [{"scope": "param_mismatch"}],
+                },
+            ),
+        ],
+    )
+
+    result = await router.route("只按关键词", dialogue_history=history)
+
+    assert result.status == "matched"
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    assert assistant_result == {
+        "status": "clarify",
+        "question": "您想按哪些关键词或文件类型搜索这首歌？",
+        "options": [
+            {"label": "只按关键词搜索", "value": "只按关键词搜索"},
+            {"label": "指定音频格式", "value": "指定音频格式"},
+        ],
+    }
+    assert "loop_exhausted" not in model.calls[0][1]
+    assert "param_mismatch" not in model.calls[0][1]
 
 
 async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:

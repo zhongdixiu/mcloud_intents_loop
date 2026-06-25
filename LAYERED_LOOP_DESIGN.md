@@ -115,7 +115,7 @@ await agent.send(query)
 ```text
 matched   成功识别到 skill + intent + code + params
 clarify   需要用户补充信息
-no_match  无可用能力或重试失败
+no_match  确认无可用能力
 ```
 
 ### 3.2 SkillRegistry
@@ -567,7 +567,7 @@ params 必须符合该 intent schema
 ```text
 1. 记录 invalid_param_repair
 2. 继续 retry_params
-3. 超过 max_attempts 后 no_match
+3. 超过 max_attempts 后生成引导式 clarify
 ```
 
 ## 7. Evaluator 一致性校验
@@ -675,6 +675,7 @@ params_check == "fail"
 - 不输出 skill、intent、code 或 params。
 - 当前输入有明确新动作或新目标时，不机械继承历史。
 - 历史只用于理解省略、延续、修正、改口、指代和对历史问题的回应。
+- 承接历史时必须保留历史判别性主体；不能只继承泛化对象类型而丢弃具体主体。当前输入可能是新请求、替换主体或追加限定条件且证据不足时，输出 clarify。
 
 输入：
 
@@ -845,8 +846,9 @@ intent/code 正确但 params 非法
 ### 9.6 超过最大尝试次数
 
 ```text
-Return no_match
-reason = "Exceeded maximum routing attempts"
+Return clarify
+termination_reason = "loop_exhausted"
+question/options 由 loop_exhausted_clarifier 根据本轮失败轨迹生成
 ```
 
 ## 10. 当前方案优势

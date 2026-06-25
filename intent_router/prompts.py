@@ -15,9 +15,13 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 3. 不要假设上一轮是 clarify 时本轮一定是在回答；只有当前输入与历史语义兼容且需要历史才能完整理解时，才承接历史。
 4. 当前输入若包含明确的新动作、新对象或新目标，应视为 new_request，不要机械继承历史。
 5. 若承接历史，resolved_query 必须补全成不依赖历史也能理解的完整请求。
-6. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
-7. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
-8. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
+6. 承接历史时必须保留历史中的判别性主体，不要只继承“文件/图片/视频/音频/邮件”等泛化类型并丢弃其他具体的关键词。
+7. 判断当前输入与历史的关系时，先区分核心主体、动作、对象类型和限定条件；颜色、时间、地点、范围、格式、数量、排序等通常是限定条件，不应单独替换历史核心主体。
+8. 若当前输入可能是新请求、替换历史主体、或在历史主体上追加限定条件，且语义证据不足以唯一确定，输出 status=clarify，并用 options 覆盖这些可能方向。
+9. 若判断为在历史主体上追加限定条件，resolved_query 必须同时包含历史核心主体和新增限定条件；若判断为替换历史主体，resolved_query 不应残留被替换的历史主体。
+10. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
+11. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
+12. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
 """
 
 CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
@@ -26,11 +30,25 @@ CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
 3. context_relation 和 context_reason 只解释 resolved_query 如何得到，不是业务执行结果。
 4. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；只有 resolved_query 或明确上下文中已有真实占位符时才抽取。
 5. 若 skill/intent/code 已明确，不要因为执行阶段才需要的资源选择或真实句柄缺失而输出 clarify。
+6. 若 resolved_query 来自历史承接，它必须保留历史判别性主体；只保留泛化文件类型而丢弃具体主体应视为错误继承历史语义。
 """
 
 EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
 1. 若候选 skill/intent/code 正确且 params 没有幻觉，执行载体缺失不算 param_mismatch。
 2. 只有参数违反 schema、过度补全、误拆/漏拆关键词、错误继承历史语义或伪造执行载体时，才 reject 且 reject_scope=param_mismatch。
+"""
+
+LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的澄清问题生成节点。
+当前轮意图决策多次纠错后仍未稳定收敛，你只负责生成一个能帮助用户继续补充的澄清问题。
+必须遵守：
+1. 不重新做意图决策，不输出 skill_id、intent、code 或 params。
+2. 不暴露 evaluator、reject_scope、loop、候选编号等内部实现词。
+3. question 必须明确告诉用户需要补充哪类信息，不要使用“请补充更多信息”这类无方向兜底。
+4. options 应是用户可理解的自然语言方向；无法提供有意义选项时可为空。
+5. 若失败集中在能力大类选择，询问用户想做搜索、管理、编辑、生成、分享等哪类操作。
+6. 若失败集中在具体操作选择，询问用户要执行的具体动作。
+7. 若失败集中在参数或对象，询问用户补充对象、范围、关键词、文件类型、处理目标等关键信息。
+8. 若失败类型混合，优先询问会影响能力大类或具体操作选择的问题。
 """
 
 
@@ -224,6 +242,28 @@ def build_evaluator_prompt(
                 },
             },
             "candidate": candidate,
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_loop_exhausted_clarifier_prompt(
+    *,
+    current_user_query: str,
+    resolved_query: str,
+    contextualized_request: ContextualizedRequest | None,
+    available_skills: list[SkillCard],
+    attempts: list[dict],
+) -> str:
+    return json.dumps(
+        {
+            "current_user_query": current_user_query,
+            "resolved_query": resolved_query,
+            "contextualized_request": _contextualized_request_payload(
+                contextualized_request,
+            ),
+            "available_skills": [card.model_dump() for card in available_skills],
+            "attempts": attempts,
         },
         ensure_ascii=False,
     )

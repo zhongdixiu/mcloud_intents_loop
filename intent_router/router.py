@@ -9,11 +9,13 @@ from .prompts import (
     CONTEXTUALIZER_SYSTEM_PROMPT,
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
+    LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
     PARAM_REPAIR_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     build_contextualizer_prompt,
     build_evaluator_prompt,
     build_intent_prompt,
+    build_loop_exhausted_clarifier_prompt,
     build_param_repair_prompt,
     build_router_prompt,
 )
@@ -23,6 +25,7 @@ from .types import (
     DialogueHistory,
     EvaluationDecision,
     IntentDecision,
+    LoopExhaustedClarification,
     RouteResult,
     SkillRef,
     SkillRouteDecision,
@@ -401,16 +404,14 @@ class IntentRouter:
                 return _traced_result(trace, result)
             continue
 
-        return _traced_result(
-            trace,
-            RouteResult(
-                status="no_match",
-                reason="Exceeded maximum routing attempts",
-                visited_skills=visited,
-                resolved_query=state.get("resolved_query"),
-                context_relation=state.get("context_relation"),
-            ),
+        result = await self._clarify_loop_exhausted(
+            current_user_query=query,
+            resolved_query=resolved_query,
+            contextualized_request=contextualized_request,
+            state=state,
+            trace=trace,
         )
+        return _traced_result(trace, result)
 
     def _apply_evaluation_result(
         self,
@@ -645,6 +646,44 @@ class IntentRouter:
             response_model=ContextualizedRequest,
         )
 
+    async def _clarify_loop_exhausted(
+        self,
+        *,
+        current_user_query: str,
+        resolved_query: str,
+        contextualized_request: ContextualizedRequest,
+        state: dict[str, Any],
+        trace: list[dict[str, Any]],
+    ) -> RouteResult:
+        attempts = _loop_exhausted_attempts(trace, self.registry)
+        clarification = await self.model_client.structured(
+            system_prompt=LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
+            user_prompt=build_loop_exhausted_clarifier_prompt(
+                current_user_query=current_user_query,
+                resolved_query=resolved_query,
+                contextualized_request=contextualized_request,
+                available_skills=self.registry.cards(),
+                attempts=attempts,
+            ),
+            response_model=LoopExhaustedClarification,
+        )
+        _trace(
+            trace,
+            "loop_exhausted_clarify",
+            attempts=attempts,
+            clarification=clarification.model_dump(mode="json"),
+        )
+        return RouteResult(
+            status="clarify",
+            question=clarification.question,
+            options=clarification.options,
+            reason=clarification.reason,
+            visited_skills=state.get("visited_skills", []),
+            resolved_query=state.get("resolved_query"),
+            context_relation=state.get("context_relation"),
+            termination_reason="loop_exhausted",
+        )
+
     def _clarify(
         self,
         question: str | None,
@@ -675,6 +714,69 @@ def _new_state(query: str) -> dict[str, Any]:
         "retry_scope": "reroute_skill",
         "rejections": [],
     }
+
+
+def _loop_exhausted_attempts(
+    trace: list[dict[str, Any]],
+    registry: SkillRegistry,
+) -> list[dict[str, Any]]:
+    attempts: dict[int, dict[str, Any]] = {}
+    for event in trace:
+        attempt = int(event.get("attempt") or 0)
+        if not attempt:
+            continue
+        item = attempts.setdefault(attempt, {"attempt": attempt})
+        event_name = event.get("event")
+
+        if event_name == "skill_route":
+            decision = event.get("decision") or {}
+            skill_id = decision.get("skill_id")
+            if skill_id:
+                item["skill_id"] = skill_id
+                item["skill_name"] = (
+                    registry.get(skill_id).name if registry.has(skill_id) else skill_id
+                )
+            item["skill_route_status"] = decision.get("status")
+            if decision.get("reason"):
+                item["skill_route_reason"] = decision.get("reason")
+
+        elif event_name == "locked_skill":
+            skill_id = event.get("skill_id")
+            if skill_id:
+                item["skill_id"] = skill_id
+                item["skill_name"] = (
+                    registry.get(skill_id).name if registry.has(skill_id) else skill_id
+                )
+
+        elif event_name in {"intent_select", "param_repair"}:
+            decision = event.get("decision") or {}
+            item["intent_status"] = decision.get("status")
+            item["intent"] = decision.get("intent")
+            item["code"] = decision.get("code")
+            item["params"] = decision.get("params") or {}
+            if decision.get("reason"):
+                item["intent_reason"] = decision.get("reason")
+
+        elif event_name == "evaluation":
+            evaluation = event.get("evaluation") or {}
+            item["evaluator_verdict"] = evaluation.get("verdict")
+            item["reject_scope"] = evaluation.get("reject_scope")
+            if evaluation.get("reason"):
+                item["reject_reason"] = evaluation.get("reason")
+
+        elif event_name == "validation_error":
+            item["reject_scope"] = event.get("correction_scope")
+            item["reject_reason"] = event.get("reason")
+
+        elif event_name == "invalid_param_repair":
+            item["reject_scope"] = "param_mismatch"
+            item["reject_reason"] = event.get("reason")
+
+        elif event_name == "evaluation_invalid":
+            item["reject_scope"] = "invalid_evaluation"
+            item["reject_reason"] = event.get("reason")
+
+    return [attempts[key] for key in sorted(attempts)]
 
 
 def _normalize_dialogue_history(

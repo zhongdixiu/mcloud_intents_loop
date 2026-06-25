@@ -90,6 +90,12 @@ class ContextualizedRequest(BaseModel):
     options: list[dict[str, str]] = Field(default_factory=list)
 
 
+class LoopExhaustedClarification(BaseModel):
+    question: str
+    options: list[dict[str, str]] = Field(default_factory=list)
+    reason: str = ""
+
+
 class SkillRef(BaseModel):
     id: str
     name: str
@@ -133,3 +139,4 @@ class RouteResult(BaseModel):
     correction_scopes: list[str] = Field(default_factory=list)
     resolved_query: str | None = None
     context_relation: str | None = None
+    termination_reason: str | None = None

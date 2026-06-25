@@ -6,6 +6,7 @@ from .types import (
     DialogueHistory,
     DialogueRouteSummary,
     DialogueTurn,
+    LoopExhaustedClarification,
     RouteResult,
 )
 
@@ -16,6 +17,7 @@ __all__ = [
     "DialogueTurn",
     "IntentDialogueAgent",
     "IntentRouter",
+    "LoopExhaustedClarification",
     "RouteResult",
     "SkillRegistry",
 ]

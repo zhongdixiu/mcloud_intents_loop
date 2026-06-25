@@ -134,6 +134,8 @@ def _print_chat_result(query: str, result: RouteResult) -> None:
     print("Loop")
     print(f"  loop_count: {data.get('loop_count')}")
     print(f"  correction_scopes: {data.get('correction_scopes') or []}")
+    if data.get("termination_reason"):
+        print(f"  termination_reason: {data.get('termination_reason')}")
     print()
 
 

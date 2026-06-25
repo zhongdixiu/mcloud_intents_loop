@@ -100,7 +100,9 @@ request. Later prompts keep `current_user_query` only for audit context and do
 not receive `dialogue_history` directly. Business execution results, loop
 rejection state, and historical no-match reasons are not injected as dialogue
 semantics. Each turn prints the resolved query, final route result,
-`loop_count`, and `correction_scopes`.
+`loop_count`, and `correction_scopes`. If one turn reaches the maximum loop
+count without a stable decision, the router returns a guided `clarify` result
+with `termination_reason="loop_exhausted"` instead of treating it as `no_match`.
 Shortcuts are available in the prompt:
 
 - `:q`, `:quit`, `exit`, `quit`: end the dialogue
