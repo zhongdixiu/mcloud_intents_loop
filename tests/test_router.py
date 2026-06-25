@@ -225,7 +225,7 @@ async def test_skill_reject_records_rejected_skill_even_with_low_confidence() ->
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.reason == "no remaining skill"
     assert result.visited_skills == ["file_skill"]
     assert result.loop_count == 2
@@ -507,7 +507,7 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.reason == "cannot repair params"
     param_repair_prompt = json.loads(model.calls[3][1])
     assert param_repair_prompt["param_rejections"] == [
@@ -689,7 +689,7 @@ async def test_router_returns_dialogue_fallback_for_unsupported_capability() -> 
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.params == {}
     assert result.confidence == 0.0
     assert result.reason == "现有 skills 不支持文生视频"
@@ -711,7 +711,7 @@ async def test_router_returns_dialogue_fallback_for_small_talk() -> None:
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.reason == "普通寒暄，不需要业务 skill"
 
 
@@ -731,7 +731,7 @@ async def test_router_treats_public_news_search_as_dialogue_fallback() -> None:
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.reason == "公共互联网资讯查询，不是云盘资源搜索"
 
     router_prompt = json.loads(model.calls[0][1])
@@ -740,7 +740,67 @@ async def test_router_treats_public_news_search_as_dialogue_fallback() -> None:
     assert "互联网资讯" in model.calls[0][0]
 
 
-async def test_dialogue_agent_injects_0000_as_non_tool_history() -> None:
+async def test_router_prompt_separates_answer_targets_from_resource_targets() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="推荐建议属于普通对话",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("推荐几部刘德华的电影和歌曲")
+
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "000"
+
+    system_prompt = model.calls[0][0]
+    assert "先判断用户目标是“获得语言答案/信息服务”还是“查找资源载体本身”" in system_prompt
+    assert "推荐建议" in system_prompt
+    assert "资源载体" in system_prompt
+    assert "不要求用户显式说“云盘里”" in system_prompt
+
+
+async def test_router_routes_resource_target_search_to_mcloud_search() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜影视",
+                code="014",
+                params={"metadataList": ["刘德华"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("搜索刘德华的电影")
+
+    assert result.status == "matched"
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.intent == "搜影视"
+    assert result.code == "014"
+
+    router_system_prompt = model.calls[0][0]
+    assert "搜索/查找/帮我找/找一下 + 资源载体" in router_system_prompt
+    intent_prompt = json.loads(model.calls[1][1])
+    assert "资源目标 vs 答案目标" in intent_prompt["skill_markdown"]
+    assert "默认理解为云盘资源检索" in intent_prompt["skill_markdown"]
+
+
+async def test_dialogue_agent_injects_000_as_non_tool_history() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -776,7 +836,7 @@ async def test_dialogue_agent_injects_0000_as_non_tool_history() -> None:
     assert first.status == "matched"
     assert first.skill is None
     assert first.intent == "普通对话"
-    assert first.code == "0000"
+    assert first.code == "000"
     assert second.status == "matched"
     assert second.intent == "搜图片"
 
@@ -785,7 +845,7 @@ async def test_dialogue_agent_injects_0000_as_non_tool_history() -> None:
     assert assistant_result["status"] == "matched"
     assert assistant_result["skill_id"] is None
     assert assistant_result["intent"] == "普通对话"
-    assert assistant_result["code"] == "0000"
+    assert assistant_result["code"] == "000"
 
 
 async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
@@ -911,6 +971,220 @@ async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() 
     }
     second_router_prompt = json.loads(model.calls[4][1])
     assert second_router_prompt["resolved_query"] == "给蓝色天空图片配上文字"
+
+
+async def test_dialogue_agent_continues_ordinary_recommendation_context() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="推荐建议属于普通对话",
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="推荐刘德华的电影",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前短输入替换对象类型，沿用上一轮推荐任务和主体",
+            ),
+            SkillRouteDecision(
+                status="no_match",
+                reason="推荐建议属于普通对话",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("推荐刘德华的歌曲")
+    second = await agent.send("有没有电影")
+
+    assert first.status == "matched"
+    assert first.skill is None
+    assert first.intent == "普通对话"
+    assert first.code == "000"
+    assert second.status == "matched"
+    assert second.skill is None
+    assert second.intent == "普通对话"
+    assert second.code == "000"
+    assert second.resolved_query == "推荐刘德华的电影"
+    assert second.context_relation == "continuation"
+
+    contextualizer_system_prompt = model.calls[1][0]
+    contextualizer_prompt = json.loads(model.calls[1][1])
+    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    assert assistant_result["status"] == "matched"
+    assert assistant_result["code"] == "000"
+    assert "任务框架" in contextualizer_system_prompt
+    assert "继承历史主动作和核心主体" in contextualizer_system_prompt
+    assert "code=000" in contextualizer_system_prompt
+    assert "可用于承接推荐、问答、解释等答案型语义" in contextualizer_system_prompt
+
+
+async def test_dialogue_agent_switches_from_search_history_to_image_generation() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["谢娜"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="生成一些近期的谢娜图片，素材来源是之前保存的图片",
+                relation_to_history="revision",
+                used_history_turns=[0],
+                reason="当前输入明确切换主动作为生成，历史只补充谢娜图片主体和素材来源",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="image_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="文生图",
+                code="002",
+                params={"keywords": "近期的谢娜图片"},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("搜索谢娜的图片")
+    second = await agent.send("再帮我生成一些近期的，这些都是之前保存的")
+
+    assert first.status == "matched"
+    assert first.skill is not None
+    assert first.skill.id == "mcloud_search_skill"
+    assert first.intent == "搜图片"
+    assert second.status == "matched"
+    assert second.skill is not None
+    assert second.skill.id == "image_skill"
+    assert second.intent == "文生图"
+    assert second.code == "002"
+    assert second.resolved_query == "生成一些近期的谢娜图片，素材来源是之前保存的图片"
+    assert second.context_relation == "revision"
+
+    contextualizer_system_prompt = model.calls[3][0]
+    assert "当前动作优先" in contextualizer_system_prompt
+    assert "不应因历史是搜索而归一为继续搜索" in contextualizer_system_prompt
+    router_system_prompt = model.calls[4][0]
+    assert "生成、创作、编辑、处理、配文、识别、翻译、鉴伪、修复图片" in router_system_prompt
+    second_router_prompt = json.loads(model.calls[4][1])
+    assert second_router_prompt["resolved_query"] == (
+        "生成一些近期的谢娜图片，素材来源是之前保存的图片"
+    )
+    image_intent_prompt = json.loads(model.calls[5][1])
+    assert "保存的/之前的/近期的/这些" in image_intent_prompt["skill_markdown"]
+    assert "输出\"文生图\"工具" in image_intent_prompt["skill_markdown"]
+
+
+async def test_dialogue_agent_keeps_search_refinement_when_action_is_still_search() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["谢娜"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="查找近期保存的谢娜图片",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前输入仍是搜索细化，只补充时间和保存来源限定",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["谢娜"], "timeList": ["近期"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("搜索谢娜的图片")
+    second = await agent.send("只找近期保存的")
+
+    assert first.status == "matched"
+    assert second.status == "matched"
+    assert second.skill is not None
+    assert second.skill.id == "mcloud_search_skill"
+    assert second.intent == "搜图片"
+    assert second.resolved_query == "查找近期保存的谢娜图片"
+
+
+async def test_dialogue_agent_current_search_action_overrides_ordinary_history() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="推荐建议属于普通对话",
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="搜索刘德华的电影资源",
+                relation_to_history="revision",
+                used_history_turns=[0],
+                reason="当前输入明确切换为搜索动作，历史只补充刘德华主体",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜影视",
+                code="014",
+                params={"metadataList": ["刘德华"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("推荐刘德华的歌曲")
+    second = await agent.send("搜索他的电影资源")
+
+    assert first.status == "matched"
+    assert first.intent == "普通对话"
+    assert second.status == "matched"
+    assert second.skill is not None
+    assert second.skill.id == "mcloud_search_skill"
+    assert second.intent == "搜影视"
+    assert second.resolved_query == "搜索刘德华的电影资源"
 
 
 async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> None:
@@ -1139,7 +1413,7 @@ async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     contextualizer_prompt = json.loads(model.calls[0][1])
     assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
     assert assistant_result == {"status": "no_match"}
@@ -1235,7 +1509,7 @@ async def test_router_rejects_invalid_candidate_and_returns_dialogue_fallback() 
     assert result.status == "matched"
     assert result.skill is None
     assert result.intent == "普通对话"
-    assert result.code == "0000"
+    assert result.code == "000"
     assert result.reason == "cannot repair params"
     assert "mcloud_search_skill" in result.visited_skills
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1

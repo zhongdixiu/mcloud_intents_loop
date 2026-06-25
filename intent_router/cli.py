@@ -8,6 +8,7 @@ from pathlib import Path
 from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
 from .types import RouteResult
+from .xlsx_eval import evaluate_xlsx_cases
 
 
 def main() -> None:
@@ -28,6 +29,15 @@ def main() -> None:
     eval_parser.add_argument("--skills", default="skills")
     eval_parser.add_argument("--trace", action="store_true")
 
+    eval_xlsx_parser = subparsers.add_parser("eval-xlsx")
+    eval_xlsx_parser.add_argument("--cases", required=True)
+    eval_xlsx_parser.add_argument("--skills", default="skills")
+    eval_xlsx_parser.add_argument(
+        "--output",
+        help="结果 Excel 文件路径，默认保存到用例文件同目录的 *_测试结果.xlsx",
+    )
+    eval_xlsx_parser.add_argument("--trace", action="store_true")
+
     args = parser.parse_args()
     if args.command == "route":
         try:
@@ -38,6 +48,9 @@ def main() -> None:
         asyncio.run(_chat(args.skills, args.trace))
     elif args.command == "eval":
         asyncio.run(_eval(Path(args.cases), args.skills, args.trace))
+    elif args.command == "eval-xlsx":
+        output = Path(args.output) if args.output else None
+        asyncio.run(_eval_xlsx(Path(args.cases), args.skills, output, args.trace))
 
 
 async def _route(
@@ -209,6 +222,51 @@ async def _eval(cases_path: Path, skills: str, trace_enabled: bool) -> None:
             },
             ensure_ascii=False,
         ),
+    )
+
+
+async def _eval_xlsx(
+    cases_path: Path,
+    skills: str,
+    output_path: Path | None,
+    trace_enabled: bool,
+) -> None:
+    print("开始执行 Excel 多轮意图评测...")
+    print(f"用例文件: {cases_path}")
+    summary = await evaluate_xlsx_cases(
+        cases_path,
+        skills_path=skills,
+        output_path=output_path,
+        trace_enabled=trace_enabled,
+        progress_callback=_print_eval_xlsx_progress,
+    )
+    print(f"结果文件: {summary.get('output_path')}")
+    print(json.dumps(summary, ensure_ascii=False))
+
+
+def _print_eval_xlsx_progress(
+    processed: int,
+    total: int,
+    record: dict,
+    passed: int,
+) -> None:
+    status = "OK" if record.get("matched") else "FAIL"
+    accuracy = passed / processed if processed else 0.0
+    print(
+        "[{processed}/{total}] row={row} {status} "
+        "expected={expected} predicted={predicted} "
+        "loop={loop} elapsed_ms={elapsed} acc={accuracy:.2%}".format(
+            processed=processed,
+            total=total,
+            row=record.get("row_index"),
+            status=status,
+            expected=record.get("expected_code"),
+            predicted=record.get("predicted_code"),
+            loop=record.get("loop_count"),
+            elapsed=record.get("elapsed_ms"),
+            accuracy=accuracy,
+        ),
+        flush=True,
     )
 
 

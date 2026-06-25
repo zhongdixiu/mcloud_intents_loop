@@ -106,7 +106,7 @@ execution results, loop rejection state, and historical no-match reasons are not
 injected as dialogue semantics. When no skill can execute the request, or when
 the user asks for small talk, public knowledge, current news, internet
 information, policies, markets, or other open-ended LLM dialogue, the router
-returns the fallback intent `普通对话` with `code="0000"` and `skill=null`.
+returns the fallback intent `普通对话` with `code="000"` and `skill=null`.
 Each turn prints the resolved query, final route result, `loop_count`, and
 `correction_scopes`. If one turn reaches the maximum loop count without a stable
 decision, the router returns a guided `clarify` result with

@@ -729,7 +729,7 @@ def _fallback_dialogue_result(
         status="matched",
         skill=None,
         intent="普通对话",
-        code="0000",
+        code="000",
         params={},
         confidence=0.0,
         reason=reason,

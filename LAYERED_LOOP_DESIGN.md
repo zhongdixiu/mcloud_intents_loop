@@ -207,7 +207,7 @@ class SkillRouteDecision(BaseModel):
 
 - `route`：选择一个 skill。
 - `clarify`：一级能力边界不清，需要用户澄清。
-- `no_match`：没有 skill 支持该需求；对外 RouteResult 映射为普通对话兜底意图 `code=0000`。
+- `no_match`：没有 skill 支持该需求；对外 RouteResult 映射为普通对话兜底意图 `code=000`。
 
 ### 4.2 IntentDecision
 
@@ -229,7 +229,7 @@ class IntentDecision(BaseModel):
 
 - `matched`：识别到具体 intent/code/params。
 - `clarify`：同 skill 内多个 intent 难以区分。
-- `no_match`：当前 skill 无法承接用户请求；若无法继续 reroute，对外 RouteResult 映射为普通对话兜底意图 `code=0000`。
+- `no_match`：当前 skill 无法承接用户请求；若无法继续 reroute，对外 RouteResult 映射为普通对话兜底意图 `code=000`。
 
 ### 4.3 EvaluationDecision
 
@@ -802,7 +802,7 @@ params_check == "fail"
 
 ```text
 SkillRouteDecision.status = no_match
-=> Return matched / 普通对话 / code=0000 / skill=null
+=> Return matched / 普通对话 / code=000 / skill=null
 ```
 
 ### 9.2 一级路由需要澄清
@@ -824,7 +824,7 @@ SkillRouteDecision.status = clarify
 如果当前是 locked retry 路径：
 
 ```text
-Return matched / 普通对话 / code=0000 / skill=null
+Return matched / 普通对话 / code=000 / skill=null
 ```
 
 ### 9.4 本地 intent 校验失败
