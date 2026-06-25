@@ -17,6 +17,7 @@ from .prompts import (
 )
 from .skills import SkillRegistry
 from .types import (
+    DialogueHistory,
     EvaluationDecision,
     IntentDecision,
     RouteResult,
@@ -72,29 +73,19 @@ class IntentRouter:
         self,
         query: str,
         *,
-        resume_token: str | None = None,
+        dialogue_history: DialogueHistory | dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
         trace: list[dict[str, Any]] | None = None,
     ) -> RouteResult:
-        state = _decode_state(resume_token) if resume_token else _new_state(query)
+        trace = [] if trace is None else trace
+        state = _new_state(query)
+        history = _normalize_dialogue_history(dialogue_history)
         _trace(
             trace,
             "route_start",
             query=query,
-            resume_token_present=resume_token is not None,
+            dialogue_turns=len(history.turns),
         )
-        if resume_token:
-            state.setdefault("clarifications", []).append(query)
-            state["rejected_skills"] = []
-            state["rejected_intents"] = {}
-            state["param_rejections"] = {}
-            state["locked_skill_id"] = None
-            state["locked_skill_confidence"] = None
-            state["locked_intent"] = None
-            state["locked_code"] = None
-            state["retry_scope"] = "reroute_skill"
-
-        augmented_query = _augment_query(state)
         rejected: list[str] = state.setdefault("rejected_skills", [])
         rejected_intents: dict[str, list[dict[str, str]]] = state.setdefault(
             "rejected_intents",
@@ -141,9 +132,10 @@ class IntentRouter:
                 )
             else:
                 route_decision = await self._select_skills(
-                    augmented_query,
+                    query,
                     rejected,
                     context,
+                    history,
                 )
                 _trace(
                     trace,
@@ -193,11 +185,12 @@ class IntentRouter:
             locked_code = state.get("locked_code")
             if retry_scope == "retry_params" and locked_intent and locked_code:
                 intent_decision = await self._repair_params(
-                    augmented_query,
+                    query,
                     skill_id,
                     locked_intent,
                     locked_code,
                     param_rejections.get(_param_rejection_key(skill_id, locked_intent), []),
+                    history,
                 )
                 _trace(
                     trace,
@@ -210,10 +203,11 @@ class IntentRouter:
                 )
             else:
                 intent_decision = await self._select_intent(
-                    augmented_query,
+                    query,
                     skill_id,
                     rejected_intents.get(skill_id, []),
                     _skill_param_rejections(param_rejections, skill_id),
+                    history,
                 )
                 _trace(
                     trace,
@@ -321,10 +315,11 @@ class IntentRouter:
                 continue
 
             raw_evaluation = await self._evaluate(
-                augmented_query,
+                query,
                 skill_id,
                 validated,
                 state,
+                history,
             )
             _trace(
                 trace,
@@ -501,8 +496,14 @@ class IntentRouter:
         query: str,
         rejected: list[str],
         context: dict[str, Any],
+        dialogue_history: DialogueHistory,
     ) -> SkillRouteDecision:
-        prompt = build_router_prompt(query, self.registry.cards(), rejected)
+        prompt = build_router_prompt(
+            query,
+            self.registry.cards(),
+            rejected,
+            dialogue_history,
+        )
         if context:
             prompt = json.dumps(
                 {"routing_input": json.loads(prompt), "context": context},
@@ -520,6 +521,7 @@ class IntentRouter:
         skill_id: str,
         rejected_intents: list[dict[str, str]],
         param_rejections: list[dict[str, str]] | None = None,
+        dialogue_history: DialogueHistory | None = None,
     ) -> IntentDecision:
         skill = self.registry.get(skill_id)
         return await self.model_client.structured(
@@ -529,6 +531,7 @@ class IntentRouter:
                 skill,
                 rejected_intents,
                 param_rejections,
+                dialogue_history,
             ),
             response_model=IntentDecision,
         )
@@ -540,6 +543,7 @@ class IntentRouter:
         locked_intent: str,
         locked_code: str,
         param_rejections: list[dict[str, str]],
+        dialogue_history: DialogueHistory | None = None,
     ) -> IntentDecision:
         skill = self.registry.get(skill_id)
         return await self.model_client.structured(
@@ -550,6 +554,7 @@ class IntentRouter:
                 locked_intent,
                 locked_code,
                 param_rejections,
+                dialogue_history,
             ),
             response_model=IntentDecision,
         )
@@ -560,6 +565,7 @@ class IntentRouter:
         skill_id: str,
         decision: IntentDecision,
         state: dict[str, Any],
+        dialogue_history: DialogueHistory,
     ) -> EvaluationDecision:
         skill = self.registry.get(skill_id)
         return await self.evaluator_client.structured(
@@ -572,6 +578,7 @@ class IntentRouter:
                 rejected_skill_ids=state.get("rejected_skills", []),
                 rejected_intents=state.get("rejected_intents", {}),
                 visited_skills=state.get("visited_skills", []),
+                dialogue_history=dialogue_history,
             ),
             response_model=EvaluationDecision,
         )
@@ -586,7 +593,6 @@ class IntentRouter:
             status="clarify",
             question=question or "请补充更多信息，以便确定要使用的功能。",
             options=options,
-            resume_token=_encode_state(state),
             visited_skills=state.get("visited_skills", []),
         )
 
@@ -594,7 +600,6 @@ class IntentRouter:
 def _new_state(query: str) -> dict[str, Any]:
     return {
         "original_query": query,
-        "clarifications": [],
         "visited_skills": [],
         "rejected_skills": [],
         "rejected_intents": {},
@@ -608,27 +613,14 @@ def _new_state(query: str) -> dict[str, Any]:
     }
 
 
-def _augment_query(state: dict[str, Any]) -> str:
-    query = state["original_query"]
-    clarifications = state.get("clarifications") or []
-    if not clarifications:
-        return query
-    joined = "\n".join(f"- {item}" for item in clarifications)
-    return f"{query}\n用户澄清:\n{joined}"
-
-
-def _encode_state(state: dict[str, Any]) -> str:
-    return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-
-
-def _decode_state(token: str) -> dict[str, Any]:
-    try:
-        state = json.loads(token)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Invalid resume token: expected JSON state") from exc
-    if not isinstance(state, dict):
-        raise ValueError("Invalid resume token: expected JSON state")
-    return state
+def _normalize_dialogue_history(
+    dialogue_history: DialogueHistory | dict[str, Any] | None,
+) -> DialogueHistory:
+    if dialogue_history is None:
+        return DialogueHistory()
+    if isinstance(dialogue_history, DialogueHistory):
+        return dialogue_history
+    return DialogueHistory.model_validate(dialogue_history)
 
 
 def _trace(
@@ -645,8 +637,41 @@ def _traced_result(
     trace: list[dict[str, Any]] | None,
     result: RouteResult,
 ) -> RouteResult:
+    _attach_loop_stats(trace, result)
     _trace(trace, "result", result=result.model_dump(mode="json"))
     return result
+
+
+def _attach_loop_stats(
+    trace: list[dict[str, Any]] | None,
+    result: RouteResult,
+) -> None:
+    if trace is None:
+        return
+    attempts = [
+        int(event.get("attempt") or 0)
+        for event in trace
+        if event.get("event") == "attempt_start"
+    ]
+    result.loop_count = max(attempts, default=1)
+    result.correction_scopes = _correction_scopes(trace)
+
+
+def _correction_scopes(trace: list[dict[str, Any]]) -> list[str]:
+    scopes: list[str] = []
+    for event in trace:
+        scope = None
+        if event.get("event") == "retry":
+            scope = event.get("scope")
+        elif event.get("event") == "validation_error":
+            scope = event.get("correction_scope")
+        elif event.get("event") == "evaluation_invalid":
+            scope = "invalid_evaluation"
+        elif event.get("event") == "invalid_param_repair":
+            scope = "invalid_param_repair"
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes
 
 
 def _apply_retry_scope(

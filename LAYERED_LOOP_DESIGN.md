@@ -101,7 +101,13 @@ flowchart LR
 核心入口：
 
 ```python
-await router.route(query, resume_token=None, context=None)
+await router.route(query, dialogue_history=None, context=None)
+```
+
+多轮对话式使用由外层 `IntentDialogueAgent` 承接：
+
+```python
+await agent.send(query)
 ```
 
 返回状态包括：
@@ -262,7 +268,6 @@ class EvaluationDecision(BaseModel):
 ```python
 {
     "original_query": "...",
-    "clarifications": [],
 
     "visited_skills": [],
     "rejected_skills": [],
@@ -281,7 +286,44 @@ class EvaluationDecision(BaseModel):
 }
 ```
 
-### 5.1 rejected_skills
+### 5.1 多轮对话历史
+
+`IntentRouter` 只维护单次 route 内部 loop state。跨轮对话历史由外层 `IntentDialogueAgent` 或业务应用保存，并以 `DialogueHistory` 注入每轮 route。模型 prompt 默认只注入最近 5 轮历史，避免过长历史稀释 `current_user_query`。
+
+历史只包含用户输入和最终意图决策摘要：
+
+```python
+DialogueTurn(
+    user_query="...",
+    result=DialogueRouteSummary(...),
+    metadata={},  # 仅用于本地调试，不注入模型 prompt
+)
+```
+
+`DialogueRouteSummary` 内容为：
+
+```python
+DialogueRouteSummary(
+    status="matched|clarify|no_match",
+    skill_id="...",
+    skill_name="...",
+    intent="...",
+    code="...",
+    params={},
+    confidence=0.0,
+    question=None,
+    options=[],
+    reason=None,
+)
+```
+
+注入模型 prompt 时，当前输入字段为 `current_user_query`；历史中的 `DialogueTurn.result` 会映射为 `dialogue_history[].assistant_result`，表示这是历史意图识别 Agent 的输出，而不是用户原话。
+
+历史 matched `assistant_result` 代表历史意图决策语义，可用于理解“它/这个/这些/上一个/第一封/第二个/确认/改一下”等表达。但它不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。意图识别模块不伪造 `image/content/file/mail_id/file_id` 等执行载体参数；如果当前 skill/intent/code 已经明确，仅因执行阶段需要资源选择或补全时不应输出 clarify。
+
+不跨轮注入 `rejected_skills`、`rejected_intents`、`param_rejections`、`locked_*` 和原始 trace，避免单次纠错状态污染新的用户表达。
+
+### 5.2 rejected_skills
 
 仅当 evaluator 明确判断：
 
@@ -296,7 +338,7 @@ reject_scope=skill_mismatch
 
 - 下一轮一级路由不得再选择这些 skill。
 
-### 5.2 rejected_intents
+### 5.3 rejected_intents
 
 仅当 evaluator 明确判断：
 
@@ -313,7 +355,7 @@ reject_scope=intent_mismatch
 - 当前 skill 正确，但该 intent 不合适。
 - 下一轮二级 intent 选择时避免重复选择该 intent。
 
-### 5.3 param_rejections
+### 5.4 param_rejections
 
 仅当 evaluator 明确判断：
 
@@ -332,7 +374,7 @@ reject_scope=param_mismatch
 - 不影响 intent 选择。
 - 不把当前 intent 写入 `rejected_intents`，避免误伤正确 intent。
 
-### 5.4 locked_skill_id
+### 5.5 locked_skill_id
 
 当 evaluator 判断 skill 通过时，锁定当前 skill。
 
@@ -341,7 +383,7 @@ reject_scope=param_mismatch
 - intent 错误后，只重跑二级 intent。
 - 参数错误后，只重修 params。
 
-### 5.5 locked_intent / locked_code
+### 5.6 locked_intent / locked_code
 
 当 evaluator 判断 skill 和 intent 都通过，只是参数错误时，锁定 intent/code。
 
@@ -350,7 +392,7 @@ reject_scope=param_mismatch
 - 参数修正阶段禁止改 intent/code。
 - 只允许修正 params。
 
-### 5.6 retry_scope
+### 5.7 retry_scope
 
 控制下一轮执行范围。
 
@@ -727,7 +769,7 @@ SkillRouteDecision.status = no_match
 
 ```text
 SkillRouteDecision.status = clarify
-=> Return clarify + resume_token
+=> Return clarify + question/options
 ```
 
 ### 9.3 二级 intent 无结果
@@ -848,7 +890,7 @@ retry_scope
 当前测试已覆盖：
 
 ```text
-26 passed
+30 passed
 ```
 
 主要测试场景：
@@ -861,8 +903,9 @@ retry_scope
 - 参数修正不能改 intent/code。
 - evaluator 输出不一致时不会直接采纳。
 - 支持独立 evaluator_client。
-- clarify + resume_token。
-- invalid resume_token。
+- clarify 输出与对话历史注入。
+- IntentDialogueAgent 多轮历史保存。
+- loop_count / correction_scopes 统计。
 - skill 加载和 allowed values 校验。
 - evaluator 分层校验。
 

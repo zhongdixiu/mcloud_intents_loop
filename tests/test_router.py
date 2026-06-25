@@ -1,8 +1,16 @@
 import json
 
+from intent_router.dialogue import IntentDialogueAgent
 from intent_router.model_client import FakeStructuredClient
 from intent_router.router import IntentRouter
-from intent_router.types import EvaluationDecision, IntentDecision, SkillRouteDecision
+from intent_router.types import (
+    DialogueHistory,
+    DialogueRouteSummary,
+    DialogueTurn,
+    EvaluationDecision,
+    IntentDecision,
+    SkillRouteDecision,
+)
 
 
 async def test_router_returns_matched_result() -> None:
@@ -52,6 +60,8 @@ async def test_router_returns_matched_result() -> None:
         "rejected_skill_ids": [],
         "rejected_intents": {},
     }
+    assert evaluator_prompt["dialogue_history"] == []
+    assert evaluator_prompt["current_user_query"] == "帮我找上个月北京拍的猫照片"
 
 
 async def test_router_retries_after_skill_no_match() -> None:
@@ -88,6 +98,8 @@ async def test_router_retries_after_skill_no_match() -> None:
     assert result.skill.id == "mcloud_search_skill"
     assert result.intent == "搜综合"
     assert result.visited_skills == ["file_skill", "mcloud_search_skill"]
+    assert result.loop_count == 2
+    assert result.correction_scopes == ["skill_no_match"]
     assert model.calls[0][2] is SkillRouteDecision
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 2
 
@@ -172,6 +184,8 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
     assert result.skill.id == "mcloud_search_skill"
     assert result.intent == "搜综合"
     assert result.visited_skills == ["file_skill", "mcloud_search_skill"]
+    assert result.loop_count == 2
+    assert result.correction_scopes == ["skill_mismatch"]
 
     second_router_prompt = json.loads(model.calls[3][1])
     assert second_router_prompt["rejected_skill_ids"] == ["file_skill"]
@@ -258,6 +272,8 @@ async def test_router_retries_same_skill_after_intent_mismatch() -> None:
     assert result.intent == "AI改图"
     assert result.code == "037"
     assert result.visited_skills == ["image_skill"]
+    assert result.loop_count == 2
+    assert result.correction_scopes == ["intent_mismatch"]
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
 
     second_intent_prompt = model.calls[3][1]
@@ -352,6 +368,8 @@ async def test_router_retries_after_param_mismatch() -> None:
     assert result.status == "matched"
     assert result.intent == "搜音频"
     assert "suffixList" not in result.params
+    assert result.loop_count == 2
+    assert result.correction_scopes == ["param_mismatch"]
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
 
     param_repair_prompt = json.loads(model.calls[3][1])
@@ -364,6 +382,71 @@ async def test_router_retries_after_param_mismatch() -> None:
             "scope": "param_mismatch",
         },
     ]
+
+
+async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"suffixList": ["jpg"]},
+                confidence=0.8,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["猫"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query=f"历史第{index}轮",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    intent="搜图片",
+                    code="012",
+                    params={"metadataList": [f"历史{index}"]},
+                ),
+                metadata={"internal": index},
+            )
+            for index in range(6)
+        ],
+    )
+
+    result = await router.route("只找最近的", dialogue_history=history)
+
+    assert result.status == "matched"
+    for call in model.calls:
+        prompt = json.loads(call[1])
+        assert prompt["current_user_query"] == "只找最近的"
+        assert len(prompt["dialogue_history"]) == 5
+        assert prompt["dialogue_history"][0]["user_query"] == "历史第1轮"
+        assert prompt["dialogue_history"][-1]["user_query"] == "历史第5轮"
+        assert prompt["dialogue_history"][0]["assistant_result"]["status"] == "matched"
+        assert "metadata" not in prompt["dialogue_history"][0]
+        assert "agent_result" not in prompt["dialogue_history"][0]
+        assert "user_feedback" not in prompt["dialogue_history"][0]
+        assert "result" not in prompt["dialogue_history"][0]
+        assert "last_matched_turn" not in prompt
+        assert "decision_query" not in prompt
+
+    assert "assistant_result 是历史意图识别结果" in model.calls[0][0]
+    assert "不要伪造 image/content/file" in model.calls[1][0]
+    assert "执行载体缺失不算 param_mismatch" in model.calls[-1][0]
 
 
 async def test_param_reject_records_param_rejection_even_with_low_confidence() -> None:
@@ -497,8 +580,8 @@ async def test_router_returns_no_match_for_unsupported_capability() -> None:
     assert result.reason == "现有 skills 不支持文生视频"
 
 
-async def test_router_returns_clarification_and_resumes() -> None:
-    """一级路由返回 clarify 时生成 resume_token；用户补充后能带 token 继续识别并返回 matched。"""
+async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
+    """一级路由返回 clarify 后，外层对话 Agent 将历史注入下一轮 route。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -525,19 +608,84 @@ async def test_router_returns_clarification_and_resumes() -> None:
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
 
-    first = await router.route("帮我找一下")
+    first = await agent.send("帮我找一下")
     assert first.status == "clarify"
-    assert first.resume_token
-    state = json.loads(first.resume_token)
-    assert state["original_query"] == "帮我找一下"
-    assert state["clarifications"] == []
+    assert len(agent.history.turns) == 1
+    assert agent.history.turns[0].user_query == "帮我找一下"
+    assert agent.history.turns[0].result.question == "你想搜索资源还是打开入口？"
 
-    second = await router.route("打开文件入口", resume_token=first.resume_token)
+    second = await agent.send("打开文件入口")
     assert second.status == "matched"
     assert second.skill is not None
     assert second.skill.id == "file_skill"
     assert second.intent == "文件"
+    second_router_prompt = json.loads(model.calls[1][1])
+    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
+        "clarify"
+    )
+    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["question"] == (
+        "你想搜索资源还是打开入口？"
+    )
+
+
+async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() -> None:
+    """搜索结果后的继续处理应由历史意图语义承接，不因缺少真实图片句柄而澄清。"""
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["蓝色天空"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+            SkillRouteDecision(
+                status="route",
+                skill_id="image_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="AI相机拍照问答",
+                code="036006",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("帮我找蓝色天空的图片")
+    second = await agent.send("帮我给它配上文字")
+
+    assert first.status == "matched"
+    assert second.status == "matched"
+    assert second.skill is not None
+    assert second.skill.id == "image_skill"
+    assert second.intent == "AI相机拍照问答"
+    assert second.code == "036006"
+    assert second.params == {}
+    assert second.loop_count == 1
+    second_router_prompt = json.loads(model.calls[3][1])
+    assert second_router_prompt["dialogue_history"][0]["user_query"] == (
+        "帮我找蓝色天空的图片"
+    )
+    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["intent"] == (
+        "搜图片"
+    )
+    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["params"] == {
+        "metadataList": ["蓝色天空"],
+    }
 
 
 async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
@@ -594,7 +742,6 @@ async def test_router_returns_clarification_for_overlapping_baby_intents() -> No
 
     assert result.status == "clarify"
     assert result.question == "你想基于哪类照片预测宝宝样子？"
-    assert result.resume_token
 
     intent_system_prompt = model.calls[1][0]
     assert "竞争意图检查" in intent_system_prompt
@@ -602,7 +749,7 @@ async def test_router_returns_clarification_for_overlapping_baby_intents() -> No
     assert "具体操作类能力优先于入口类能力" in intent_system_prompt
 
 
-async def test_router_resumes_baby_clarification_to_time_machine() -> None:
+async def test_dialogue_agent_uses_baby_clarification_for_time_machine() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -634,18 +781,24 @@ async def test_router_resumes_baby_clarification_to_time_machine() -> None:
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
 
-    first = await router.route("我宝宝未来的样子")
-    second = await router.route("我有已出生宝宝照片", resume_token=first.resume_token)
+    first = await agent.send("我宝宝未来的样子")
+    second = await agent.send("我有已出生宝宝照片")
 
+    assert first.status == "clarify"
     assert second.status == "matched"
     assert second.skill is not None
     assert second.skill.id == "image_skill"
     assert second.intent == "宝宝时光机"
     assert second.code == "029"
+    second_router_prompt = json.loads(model.calls[2][1])
+    assert second_router_prompt["dialogue_history"][0]["assistant_result"]["status"] == (
+        "clarify"
+    )
 
 
-async def test_router_resumes_baby_clarification_to_appearance_prediction() -> None:
+async def test_dialogue_agent_uses_baby_clarification_for_appearance_prediction() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -677,10 +830,12 @@ async def test_router_resumes_baby_clarification_to_appearance_prediction() -> N
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
 
-    first = await router.route("我宝宝未来的样子")
-    second = await router.route("用父母双方照片预测", resume_token=first.resume_token)
+    first = await agent.send("我宝宝未来的样子")
+    second = await agent.send("用父母双方照片预测")
 
+    assert first.status == "clarify"
     assert second.status == "matched"
     assert second.skill is not None
     assert second.skill.id == "image_skill"
@@ -799,19 +954,8 @@ async def test_router_distinguishes_entry_and_specific_edit_operation() -> None:
     assert edit.intent == "AI改图"
 
 
-async def test_router_rejects_invalid_resume_token() -> None:
-    router = IntentRouter.from_config("skills", model_client=FakeStructuredClient([]))
-
-    try:
-        await router.route("继续", resume_token="not-json")
-    except ValueError as exc:
-        assert str(exc) == "Invalid resume token: expected JSON state"
-    else:
-        raise AssertionError("Expected invalid resume token to raise ValueError")
-
-
 if __name__ == "__main__":
-    test_router_returns_clarification_and_resumes()
+    test_dialogue_agent_returns_clarification_and_uses_history()
     test_router_retries_after_skill_no_match()
     test_router_retries_same_skill_after_intent_mismatch()
     test_router_rejects_invalid_candidate_and_returns_no_match()

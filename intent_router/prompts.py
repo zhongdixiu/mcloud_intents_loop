@@ -2,7 +2,27 @@ from __future__ import annotations
 
 import json
 
-from .types import SkillCard, SkillDefinition
+from .types import DialogueHistory, SkillCard, SkillDefinition
+
+
+DIALOGUE_HISTORY_LIMIT = 5
+
+DIALOGUE_HISTORY_RULES = """对话历史使用规则：
+1. current_user_query 是本轮用户原始输入，也是本轮最高优先级输入。
+2. dialogue_history 只用于理解省略、指代、确认、修改和用户改口；每轮历史中 user_query 是历史用户输入，assistant_result 是历史意图识别结果。
+3. 当 current_user_query 含“它/这个/这些/刚刚/刚才/上一个/搜到的”等指代表达时，从 dialogue_history 倒序查找最近兼容的 assistant_result.status=matched 作为历史意图语义。
+4. current_user_query 中的动作词决定本轮 skill/intent/code；历史 matched result 只提供被操作对象、筛选条件或上下文语义。
+5. 历史 matched result 不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
+6. 若 skill/intent/code 已明确，不要因为执行阶段才需要的资源选择或真实句柄缺失而输出 clarify。
+7. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；只有当前输入或历史结果中已有明确真实占位符时才抽取。
+8. 普通语义参数可以从 current_user_query 或兼容的历史 assistant_result 中继承，例如搜索条件、邮件筛选条件、待办内容、编号等。
+9. current_user_query 明确改口或提出新需求时，以 current_user_query 为准，不要机械继承历史。
+"""
+
+EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
+1. 若候选 skill/intent/code 正确且 params 没有幻觉，执行载体缺失不算 param_mismatch。
+2. 只有参数违反 schema、过度补全、误拆/漏拆关键词、错误继承历史语义或伪造执行载体时，才 reject 且 reject_scope=param_mismatch。
+"""
 
 
 ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由节点。
@@ -14,6 +34,8 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 4. 若没有任何 skill 支持用户需求，输出 no_match，不要用 clarify 兜底。
 5. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
 6. 不要选择未提供的 skill id，不要选择 rejected_skill_ids。
+7. 遵守以下对话历史使用规则。
+{dialogue_history_rules}
 """
 
 INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图选择节点。
@@ -29,6 +51,8 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图�
 8. 若 rejected_intents 中已有被拒绝的 intent，除非用户澄清明确要求它，否则不要重复选择。
 9. 若该 skill 不支持用户请求，输出 no_match。
 10. 明确不具备的能力不要用 clarify 兜底。
+11. 遵守以下对话历史使用规则。
+{dialogue_history_rules}
 """
 
 PARAM_REPAIR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的参数修正节点。
@@ -39,6 +63,8 @@ PARAM_REPAIR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的参数�
 3. 只抽取用户明确出现或可直接确定的信息，禁止常识补全。
 4. 若此前参数被拒绝，必须避免重复同类错误。
 5. 若用户信息不足且缺失信息会影响关键参数，输出 clarify。
+6. 遵守以下对话历史使用规则。
+{dialogue_history_rules}
 """
 
 EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的结果评估节点。
@@ -56,17 +82,36 @@ EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的结果评�
 10. verdict=reject 时，只要你能判断错误层级，就必须填写 reject_scope。
 11. 若无法判断错误层级，应输出 clarify，而不是 reject。
 12. 不要输出推荐 skill_id/intent/code。
+13. 遵守以下对话历史和评估规则。
+{dialogue_history_rules}
+{evaluator_extra_rules}
 """
+
+ROUTER_SYSTEM_PROMPT = ROUTER_SYSTEM_PROMPT.format(
+    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+)
+INTENT_SYSTEM_PROMPT = INTENT_SYSTEM_PROMPT.format(
+    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+)
+PARAM_REPAIR_SYSTEM_PROMPT = PARAM_REPAIR_SYSTEM_PROMPT.format(
+    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+)
+EVALUATOR_SYSTEM_PROMPT = EVALUATOR_SYSTEM_PROMPT.format(
+    dialogue_history_rules=DIALOGUE_HISTORY_RULES,
+    evaluator_extra_rules=EVALUATOR_EXTRA_RULES,
+)
 
 
 def build_router_prompt(
     query: str,
     cards: list[SkillCard],
     rejected: list[str],
+    dialogue_history: DialogueHistory | None = None,
 ) -> str:
     return json.dumps(
         {
-            "query": query,
+            "current_user_query": query,
+            "dialogue_history": _dialogue_history_payload(dialogue_history),
             "available_skills": [card.model_dump() for card in cards],
             "rejected_skill_ids": rejected,
         },
@@ -79,10 +124,12 @@ def build_intent_prompt(
     skill: SkillDefinition,
     rejected_intents: list[dict] | None = None,
     param_rejections: list[dict] | None = None,
+    dialogue_history: DialogueHistory | None = None,
 ) -> str:
     return json.dumps(
         {
-            "query": query,
+            "current_user_query": query,
+            "dialogue_history": _dialogue_history_payload(dialogue_history),
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "rejected_intents": rejected_intents or [],
@@ -98,10 +145,12 @@ def build_param_repair_prompt(
     locked_intent: str,
     locked_code: str,
     param_rejections: list[dict] | None = None,
+    dialogue_history: DialogueHistory | None = None,
 ) -> str:
     return json.dumps(
         {
-            "query": query,
+            "current_user_query": query,
+            "dialogue_history": _dialogue_history_payload(dialogue_history),
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "locked_intent": locked_intent,
@@ -121,10 +170,12 @@ def build_evaluator_prompt(
     rejected_skill_ids: list[str] | None = None,
     rejected_intents: dict[str, list[dict[str, str]]] | None = None,
     visited_skills: list[str] | None = None,
+    dialogue_history: DialogueHistory | None = None,
 ) -> str:
     return json.dumps(
         {
-            "query": query,
+            "current_user_query": query,
+            "dialogue_history": _dialogue_history_payload(dialogue_history),
             "available_skills": [card.model_dump() for card in available_skills],
             "skill": {
                 "id": skill.id,
@@ -145,3 +196,15 @@ def build_evaluator_prompt(
         },
         ensure_ascii=False,
     )
+
+
+def _dialogue_history_payload(dialogue_history: DialogueHistory | None) -> list[dict]:
+    if dialogue_history is None:
+        return []
+    return [
+        {
+            "user_query": turn.user_query,
+            "assistant_result": turn.result.model_dump(mode="json"),
+        }
+        for turn in dialogue_history.turns[-DIALOGUE_HISTORY_LIMIT:]
+    ]

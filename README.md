@@ -43,6 +43,8 @@ export AGENTSCOPE_EVALUATOR_MODEL_NAME=qwen-plus
 
 ## SDK
 
+Single-turn routing:
+
 ```python
 import asyncio
 from intent_router import IntentRouter
@@ -57,17 +59,53 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Multi-turn dialogue routing:
+
+```python
+import asyncio
+from intent_router import IntentDialogueAgent
+
+
+async def main() -> None:
+    agent = IntentDialogueAgent.from_config(skills_path="skills")
+    first = await agent.send("帮我找一下")
+    print(first.model_dump_json(ensure_ascii=False, indent=2))
+
+    second = await agent.send("打开文件入口")
+    print(second.model_dump_json(ensure_ascii=False, indent=2))
+
+
+asyncio.run(main())
+```
+
 ## CLI
+
+Single-turn routing:
 
 ```bash
 python -m intent_router route "帮我找上个月北京拍的猫照片" --skills skills
 ```
 
-If the result status is `clarify`, pass the returned `resume_token` with the user's clarification:
+Interactive multi-turn routing:
 
 ```bash
-python -m intent_router route "搜索云盘里的照片" --resume-token "..." --skills skills
+python -m intent_router chat --skills skills
 ```
+
+The `chat` command keeps dialogue history in the terminal process. The router
+injects the latest 5 turns as intent-decision context only: user query plus the
+final route result. In model prompts, the current input is named
+`current_user_query`, and historical route results are injected as
+`dialogue_history[].assistant_result`. It does not inject business execution
+results or treat historical search results as real file/image/mail handles.
+Each turn prints the user query, final route result, `loop_count`, and
+`correction_scopes`.
+Shortcuts are available in the prompt:
+
+- `:q`, `:quit`, `exit`, `quit`: end the dialogue
+- `:h`, `:help`: show help
+- `:history`: show dialogue history
+- `:clear`: clear dialogue history
 
 ## Tests
 

@@ -5,7 +5,9 @@ import asyncio
 import json
 from pathlib import Path
 
+from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
+from .types import RouteResult
 
 
 def main() -> None:
@@ -15,8 +17,11 @@ def main() -> None:
     route_parser = subparsers.add_parser("route")
     route_parser.add_argument("query")
     route_parser.add_argument("--skills", default="skills")
-    route_parser.add_argument("--resume-token")
     route_parser.add_argument("--trace", action="store_true")
+
+    chat_parser = subparsers.add_parser("chat")
+    chat_parser.add_argument("--skills", default="skills")
+    chat_parser.add_argument("--trace", action="store_true")
 
     eval_parser = subparsers.add_parser("eval")
     eval_parser.add_argument("--cases", required=True)
@@ -26,9 +31,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "route":
         try:
-            asyncio.run(_route(args.query, args.skills, args.resume_token, args.trace))
+            asyncio.run(_route(args.query, args.skills, args.trace))
         except ValueError as exc:
             parser.error(str(exc))
+    elif args.command == "chat":
+        asyncio.run(_chat(args.skills, args.trace))
     elif args.command == "eval":
         asyncio.run(_eval(Path(args.cases), args.skills, args.trace))
 
@@ -36,12 +43,11 @@ def main() -> None:
 async def _route(
     query: str,
     skills: str,
-    resume_token: str | None,
     trace_enabled: bool,
 ) -> None:
     router = IntentRouter.from_config(skills_path=skills)
     trace: list[dict] | None = [] if trace_enabled else None
-    result = await router.route(query, resume_token=resume_token, trace=trace)
+    result = await router.route(query, trace=trace)
     if trace_enabled:
         print(
             json.dumps(
@@ -55,6 +61,89 @@ async def _route(
         )
         return
     print(result.model_dump_json(ensure_ascii=False, indent=2))
+
+
+async def _chat(skills: str, trace_enabled: bool) -> None:
+    agent = IntentDialogueAgent.from_config(skills_path=skills)
+    _print_chat_help()
+    while True:
+        try:
+            query = input("query> ").strip()
+        except EOFError:
+            print("\n对话结束。")
+            break
+
+        command = query.lower()
+        if not query or command in {"exit", "quit", ":q", ":quit"}:
+            print("对话结束。")
+            break
+        if command in {":h", ":help", "help"}:
+            _print_chat_help()
+            continue
+        if command in {":history", ":hist"}:
+            _print_chat_history(agent)
+            continue
+        if command in {":clear", ":reset"}:
+            agent.history.turns.clear()
+            print("已清空对话历史。")
+            continue
+
+        trace: list[dict] | None = [] if trace_enabled else None
+        result = await agent.send(query, trace=trace)
+        _print_chat_result(query, result)
+        if trace_enabled:
+            print("Trace:")
+            print(json.dumps(trace, ensure_ascii=False, indent=2))
+
+
+def _print_chat_help() -> None:
+    print(
+        "意图识别交互模式\n"
+        "输入自然语言 query 后回车，系统会结合本轮输入和历史对话输出意图决策。\n"
+        "快捷命令：:q / :quit / exit / quit 结束；:h 查看帮助；"
+        ":history 查看历史；:clear 清空历史。\n",
+    )
+
+
+def _print_chat_result(query: str, result: RouteResult) -> None:
+    data = result.model_dump(mode="json")
+    skill = data.get("skill") or {}
+    print("意图决策")
+    print(f"  status: {data.get('status')}")
+    if skill:
+        print(f"  skill: {skill.get('name')} ({skill.get('id')})")
+    if data.get("intent"):
+        print(f"  intent: {data.get('intent')}")
+    if data.get("code"):
+        print(f"  code: {data.get('code')}")
+    if data.get("params"):
+        params = json.dumps(data.get("params"), ensure_ascii=False)
+        print(f"  params: {params}")
+    if data.get("question"):
+        print(f"  question: {data.get('question')}")
+    if data.get("options"):
+        options = json.dumps(data.get("options"), ensure_ascii=False)
+        print(f"  options: {options}")
+    if data.get("reason"):
+        print(f"  reason: {data.get('reason')}")
+    print("Loop")
+    print(f"  loop_count: {data.get('loop_count')}")
+    print(f"  correction_scopes: {data.get('correction_scopes') or []}")
+    print()
+
+
+def _print_chat_history(agent: IntentDialogueAgent) -> None:
+    if not agent.history.turns:
+        print("暂无对话历史。")
+        return
+    print("对话历史")
+    for index, turn in enumerate(agent.history.turns, start=1):
+        result = turn.result
+        target = result.intent or result.question or result.reason or "-"
+        print(f"  {index}. query: {turn.user_query}")
+        print(f"     result: {result.status} / {target}")
+        if result.skill_id:
+            print(f"     skill: {result.skill_name} ({result.skill_id})")
 
 
 async def _eval(cases_path: Path, skills: str, trace_enabled: bool) -> None:
