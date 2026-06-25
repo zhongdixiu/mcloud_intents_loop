@@ -196,7 +196,7 @@ async def test_router_retries_after_skill_mismatch_evaluation() -> None:
 
 
 async def test_skill_reject_records_rejected_skill_even_with_low_confidence() -> None:
-    """ 即使 evaluator confidence 低，只要 verdict=reject + skill_mismatch，也按明确拒绝处理，写入 rejected skill。"""
+    """ 即使 evaluator confidence 低，只要 verdict=reject + skill_mismatch，也按明确拒绝处理；最终无可用 skill 时返回普通对话兜底。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(status="route", skill_id="file_skill", confidence=0.9),
@@ -222,7 +222,14 @@ async def test_skill_reject_records_rejected_skill_even_with_low_confidence() ->
 
     result = await router.route("搜索合同文件")
 
-    assert result.status == "no_match"
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
+    assert result.reason == "no remaining skill"
+    assert result.visited_skills == ["file_skill"]
+    assert result.loop_count == 2
+    assert result.correction_scopes == ["skill_mismatch"]
     second_router_prompt = json.loads(model.calls[3][1])
     assert second_router_prompt["current_loop_rejected_skill_ids"] == ["file_skill"]
 
@@ -465,7 +472,7 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
 
 
 async def test_param_reject_records_param_rejection_even_with_low_confidence() -> None:
-    """ 即使 confidence 低，param_mismatch 也会记录参数拒绝原因，并传给参数修正 prompt。"""
+    """ 即使 confidence 低，param_mismatch 也会记录参数拒绝原因，并传给参数修正 prompt；修正失败时返回普通对话兜底。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -497,7 +504,11 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
 
     result = await router.route("帮我找周杰伦的歌")
 
-    assert result.status == "no_match"
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
+    assert result.reason == "cannot repair params"
     param_repair_prompt = json.loads(model.calls[3][1])
     assert param_repair_prompt["param_rejections"] == [
         {
@@ -661,8 +672,8 @@ async def test_router_can_use_separate_evaluator_client() -> None:
     assert [call[2] for call in evaluator_model.calls] == [EvaluationDecision]
 
 
-async def test_router_returns_no_match_for_unsupported_capability() -> None:
-    """ 一级路由判断能力不支持时，直接返回 no_match。"""
+async def test_router_returns_dialogue_fallback_for_unsupported_capability() -> None:
+    """ 一级路由判断能力不支持时，直接返回普通对话兜底意图。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -675,8 +686,106 @@ async def test_router_returns_no_match_for_unsupported_capability() -> None:
 
     result = await router.route("生成一段小狗奔跑的视频")
 
-    assert result.status == "no_match"
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
+    assert result.params == {}
+    assert result.confidence == 0.0
     assert result.reason == "现有 skills 不支持文生视频"
+
+
+async def test_router_returns_dialogue_fallback_for_small_talk() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="普通寒暄，不需要业务 skill",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("你好")
+
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
+    assert result.reason == "普通寒暄，不需要业务 skill"
+
+
+async def test_router_treats_public_news_search_as_dialogue_fallback() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="公共互联网资讯查询，不是云盘资源搜索",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("搜一下今天的 AI 新闻")
+
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
+    assert result.reason == "公共互联网资讯查询，不是云盘资源搜索"
+
+    router_prompt = json.loads(model.calls[0][1])
+    assert router_prompt["resolved_query"] == "搜一下今天的 AI 新闻"
+    assert "时事新闻" in model.calls[0][0]
+    assert "互联网资讯" in model.calls[0][0]
+
+
+async def test_dialogue_agent_injects_0000_as_non_tool_history() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="普通寒暄，不需要业务 skill",
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="帮我找图片",
+                relation_to_history="new_request",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("你好")
+    second = await agent.send("帮我找图片")
+
+    assert first.status == "matched"
+    assert first.skill is None
+    assert first.intent == "普通对话"
+    assert first.code == "0000"
+    assert second.status == "matched"
+    assert second.intent == "搜图片"
+
+    contextualizer_prompt = json.loads(model.calls[1][1])
+    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    assert assistant_result["status"] == "matched"
+    assert assistant_result["skill_id"] is None
+    assert assistant_result["intent"] == "普通对话"
+    assert assistant_result["code"] == "0000"
 
 
 async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
@@ -1027,7 +1136,10 @@ async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
 
     result = await router.route("重新搜图片", dialogue_history=history)
 
-    assert result.status == "no_match"
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
     contextualizer_prompt = json.loads(model.calls[0][1])
     assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
     assert assistant_result == {"status": "no_match"}
@@ -1097,8 +1209,8 @@ async def test_dialogue_history_does_not_inject_loop_exhausted_internal_state() 
     assert "param_mismatch" not in model.calls[0][1]
 
 
-async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
-    """ intent 输出结构不合法参数时，进入参数修正；修正失败后返回 no_match，不重新误伤 skill。"""
+async def test_router_rejects_invalid_candidate_and_returns_dialogue_fallback() -> None:
+    """ intent 输出结构不合法参数时，进入参数修正；修正失败后返回普通对话兜底，不重新误伤 skill。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -1120,7 +1232,10 @@ async def test_router_rejects_invalid_candidate_and_returns_no_match() -> None:
 
     result = await router.route("找猫照片")
 
-    assert result.status == "no_match"
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "0000"
     assert result.reason == "cannot repair params"
     assert "mcloud_search_skill" in result.visited_skills
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
@@ -1381,4 +1496,4 @@ if __name__ == "__main__":
     test_dialogue_agent_returns_clarification_and_uses_history()
     test_router_retries_after_skill_no_match()
     test_router_retries_same_skill_after_intent_mismatch()
-    test_router_rejects_invalid_candidate_and_returns_no_match()
+    test_router_rejects_invalid_candidate_and_returns_dialogue_fallback()

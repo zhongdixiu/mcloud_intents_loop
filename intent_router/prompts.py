@@ -23,8 +23,9 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 11. 若 current_user_query 是对历史 clarify 的回答，relation_to_history 可为 answer_to_previous；此时 resolved_query 必须补全为可独立路由的完整自然语言请求，不能只输出当前短回答片段。
 12. 若当前输入明确表达 options 之外的新方向，但仍在同一澄清维度内，应按用户新方向归一；若表达新的动作、新对象或新目标，应视为 new_request，不要强行贴合历史 options。
 13. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
-14. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
-15. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
+14. 历史 matched 且 code=0000 表示普通对话或非工具执行兜底结果，不代表云盘资源、业务对象或执行句柄。
+15. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数。
+16. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
 """
 
 CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
@@ -61,12 +62,14 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 必须遵守：
 1. 搜索/查找云盘资源本身优先选择云盘搜索，不要选择文件管理。
 2. 打开、浏览、上传、清理、保险箱、回收站等入口类诉求选择文件管理工具。
-3. status=route 时只能返回一个 skill_id，必须是当前最优匹配 skill。
-4. 若没有任何 skill 支持用户需求，输出 no_match，不要用 clarify 兜底。
-5. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
-6. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
-7. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
-8. 遵守以下上下文语义使用规则。
+3. 普通寒暄、开放问答、百科知识、时事新闻、互联网资讯、政策/行情/热点查询等属于普通对话；即使出现“搜/查/找”，只要目标不是云盘内资源载体，也应输出 no_match。
+4. 只有用户明确要查找云盘内已存在的资源载体时才选择云盘搜索，例如“找我云盘里的新闻截图/资讯文档/保存的报告”。
+5. status=route 时只能返回一个 skill_id，必须是当前最优匹配 skill。
+6. 若没有任何 skill 支持用户需求，输出 no_match，不要用 clarify 兜底；系统会将该结果映射为普通对话意图 code=0000。
+7. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
+8. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
+9. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
+10. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
 """
 

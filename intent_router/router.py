@@ -184,14 +184,22 @@ class IntentRouter:
                         ),
                     )
                 if route_decision.status == "no_match":
+                    if state.get("invalid_evaluation_retried"):
+                        return _traced_result(
+                            trace,
+                            RouteResult(
+                                status="no_match",
+                                reason=route_decision.reason or "No matching skill",
+                                visited_skills=visited,
+                                resolved_query=state.get("resolved_query"),
+                                context_relation=state.get("context_relation"),
+                            ),
+                        )
                     return _traced_result(
                         trace,
-                        RouteResult(
-                            status="no_match",
-                            reason=route_decision.reason or "No matching skill",
-                            visited_skills=visited,
-                            resolved_query=state.get("resolved_query"),
-                            context_relation=state.get("context_relation"),
+                        _fallback_dialogue_result(
+                            state,
+                            route_decision.reason or "No matching skill",
                         ),
                     )
 
@@ -283,14 +291,11 @@ class IntentRouter:
                     continue
                 return _traced_result(
                     trace,
-                        RouteResult(
-                            status="no_match",
-                            reason=intent_decision.reason or "No matching intent",
-                            visited_skills=visited,
-                            resolved_query=state.get("resolved_query"),
-                            context_relation=state.get("context_relation"),
-                        ),
-                    )
+                    _fallback_dialogue_result(
+                        state,
+                        intent_decision.reason or "No matching intent",
+                    ),
+                )
 
             if retry_scope == "retry_params":
                 try:
@@ -714,6 +719,24 @@ def _new_state(query: str) -> dict[str, Any]:
         "retry_scope": "reroute_skill",
         "rejections": [],
     }
+
+
+def _fallback_dialogue_result(
+    state: dict[str, Any],
+    reason: str | None = None,
+) -> RouteResult:
+    return RouteResult(
+        status="matched",
+        skill=None,
+        intent="普通对话",
+        code="0000",
+        params={},
+        confidence=0.0,
+        reason=reason,
+        visited_skills=state.get("visited_skills", []),
+        resolved_query=state.get("resolved_query"),
+        context_relation=state.get("context_relation"),
+    )
 
 
 def _loop_exhausted_attempts(
