@@ -736,8 +736,8 @@ async def test_router_treats_public_news_search_as_dialogue_fallback() -> None:
 
     router_prompt = json.loads(model.calls[0][1])
     assert router_prompt["resolved_query"] == "搜一下今天的 AI 新闻"
-    assert "时事新闻" in model.calls[0][0]
-    assert "互联网资讯" in model.calls[0][0]
+    assert "资讯问答" in model.calls[0][0]
+    assert "普通对话 code=000" in model.calls[0][0]
 
 
 async def test_router_prompt_separates_answer_targets_from_resource_targets() -> None:
@@ -759,10 +759,10 @@ async def test_router_prompt_separates_answer_targets_from_resource_targets() ->
     assert result.code == "000"
 
     system_prompt = model.calls[0][0]
-    assert "先判断用户目标是“获得语言答案/信息服务”还是“查找资源载体本身”" in system_prompt
+    assert "主动作、目标对象和期望结果形态" in system_prompt
+    assert "语言答案或信息服务" in system_prompt
     assert "推荐建议" in system_prompt
-    assert "资源载体" in system_prompt
-    assert "不要求用户显式说“云盘里”" in system_prompt
+    assert "由系统映射为普通对话 code=000" in system_prompt
 
 
 async def test_router_routes_resource_target_search_to_mcloud_search() -> None:
@@ -794,7 +794,8 @@ async def test_router_routes_resource_target_search_to_mcloud_search() -> None:
     assert result.code == "014"
 
     router_system_prompt = model.calls[0][0]
-    assert "搜索/查找/帮我找/找一下 + 资源载体" in router_system_prompt
+    assert "主动作是查找、搜索、定位、获取" in router_system_prompt
+    assert "已有资源载体" in router_system_prompt
     intent_prompt = json.loads(model.calls[1][1])
     assert "资源目标 vs 答案目标" in intent_prompt["skill_markdown"]
     assert "默认理解为云盘资源检索" in intent_prompt["skill_markdown"]
@@ -1079,15 +1080,15 @@ async def test_dialogue_agent_switches_from_search_history_to_image_generation()
 
     contextualizer_system_prompt = model.calls[3][0]
     assert "当前动作优先" in contextualizer_system_prompt
-    assert "不应因历史是搜索而归一为继续搜索" in contextualizer_system_prompt
+    assert "不应归一为历史主动作" in contextualizer_system_prompt
     router_system_prompt = model.calls[4][0]
-    assert "生成、创作、编辑、处理、配文、识别、翻译、鉴伪、修复图片" in router_system_prompt
+    assert "主动作是生成、创作、编辑、处理、配文、识别、翻译、鉴伪、修复、总结或问答" in router_system_prompt
     second_router_prompt = json.loads(model.calls[4][1])
     assert second_router_prompt["resolved_query"] == (
         "生成一些近期的谢娜图片，素材来源是之前保存的图片"
     )
     image_intent_prompt = json.loads(model.calls[5][1])
-    assert "保存的/之前的/近期的/这些" in image_intent_prompt["skill_markdown"]
+    assert "历史指代、素材来源、时间范围" in image_intent_prompt["skill_markdown"]
     assert "输出\"文生图\"工具" in image_intent_prompt["skill_markdown"]
 
 
@@ -1374,8 +1375,8 @@ async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
     assert contextualizer_prompt["current_user_query"] == "搜蓝色"
     assert assistant_result["params"] == {"metadataList": ["合同", "文件"]}
     assert "判别性主体" in system_prompt
-    assert "核心主体、动作、对象类型和限定条件" in system_prompt
-    assert "新请求、替换历史主体、或在历史主体上追加限定条件" in system_prompt
+    assert "主动作、目标类型、核心主体、对象类型、限定条件、输入来源" in system_prompt
+    assert "新请求、替换历史主体、切换主动作、或在历史主体上追加限定条件" in system_prompt
     assert "不是封闭枚举" in system_prompt
     assert "answer_to_previous" in system_prompt
     assert "不能只输出当前短回答片段" in system_prompt

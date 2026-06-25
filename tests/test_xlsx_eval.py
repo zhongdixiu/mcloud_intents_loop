@@ -11,7 +11,9 @@ from intent_router.xlsx_eval import (
     HistoryCaseTurn,
     build_gold_dialogue_history,
     default_output_path,
+    evaluate_format_xlsx_cases,
     evaluate_xlsx_cases,
+    load_format_xlsx_cases,
     load_xlsx_cases,
     normalize_code,
     result_matches_expected_codes,
@@ -23,10 +25,18 @@ from intent_router.xlsx_eval import _build_code_index
 def test_normalize_and_split_codes() -> None:
     assert normalize_code(0) == "000"
     assert normalize_code("0000") == "000"
+    assert normalize_code(999) == "018"
+    assert normalize_code("999") == "018"
     assert normalize_code(22) == "022"
     assert normalize_code("22") == "022"
     assert normalize_code(36006) == "036006"
-    assert split_codes("012、22, 036006/0") == ["012", "022", "036006", "000"]
+    assert split_codes("012、22, 036006/0/999") == [
+        "012",
+        "022",
+        "036006",
+        "000",
+        "018",
+    ]
 
 
 def test_result_matches_022_only_for_mcloud_search_01x() -> None:
@@ -57,6 +67,34 @@ def test_result_matches_022_only_for_mcloud_search_01x() -> None:
     ) == {"matched": False, "reason": "code_mismatch"}
 
 
+def test_result_matching_ignores_022_equivalence_when_expected_has_many_codes() -> None:
+    search_012_result = RouteResult(
+        status="matched",
+        skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+        intent="搜图片",
+        code="012",
+    )
+    search_014_result = RouteResult(
+        status="matched",
+        skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+        intent="搜视频",
+        code="014",
+    )
+
+    assert result_matches_expected_codes(
+        search_012_result,
+        expected_code="022",
+        alternate_codes=["014", "016", "023"],
+        search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
+    ) == {"matched": False, "reason": "code_mismatch"}
+    assert result_matches_expected_codes(
+        search_014_result,
+        expected_code="022",
+        alternate_codes=["014", "016", "023"],
+        search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
+    ) == {"matched": True, "reason": "exact_code"}
+
+
 def test_load_xlsx_cases_skips_empty_history_cells(tmp_path: Path) -> None:
     path = tmp_path / "cases.xlsx"
     workbook = Workbook()
@@ -85,6 +123,58 @@ def test_load_xlsx_cases_skips_empty_history_cells(tmp_path: Path) -> None:
     assert cases[0].history_turns == [
         HistoryCaseTurn(query="搜合同", expected_code="018"),
     ]
+
+
+def test_load_format_xlsx_cases_uses_history_min_code_and_expected_codes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "format_cases.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "上文1",
+            "上文意图1",
+            "上文2",
+            "上文意图2",
+            "对话",
+            "预期意图",
+        ],
+    )
+    sheet.append(
+        [
+            "搜索三国演义的小说",
+            "022，013，016，023",
+            "中国机长",
+            "999",
+            "权力的游戏",
+            "999",
+        ],
+    )
+    sheet.append(
+        [
+            None,
+            None,
+            None,
+            None,
+            "无间道的呐",
+            "022，014，016，023",
+        ],
+    )
+    workbook.save(path)
+
+    cases = load_format_xlsx_cases(path)
+
+    assert len(cases) == 2
+    assert cases[0].query == "权力的游戏"
+    assert cases[0].expected_code == "018"
+    assert cases[0].alternate_codes == []
+    assert cases[0].history_turns == [
+        HistoryCaseTurn(query="搜索三国演义的小说", expected_code="013"),
+        HistoryCaseTurn(query="中国机长", expected_code="018"),
+    ]
+    assert cases[1].expected_code == "022"
+    assert cases[1].alternate_codes == ["014", "016", "023"]
 
 
 def test_build_gold_history_maps_022_to_search_context() -> None:
@@ -169,6 +259,73 @@ async def test_evaluate_xlsx_cases_writes_rows_and_summary(tmp_path: Path) -> No
         for row in summary_sheet.iter_rows(min_row=2, max_col=2)
     }
     assert summary_rows["passed"] == 2
+
+
+async def test_evaluate_format_xlsx_cases_writes_results_with_new_matching_rule(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "format_cases.xlsx"
+    output = tmp_path / "format_result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["上文1", "上文意图1", "对话", "期望意图标签"])
+    sheet.append(["搜电影", "022", "无间道", "022，014，016，023"])
+    sheet.append([None, None, "扫毒", "022"])
+    sheet.append([None, None, "权力的游戏", "999"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜图片",
+                code="012",
+                loop_count=1,
+            ),
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜图片",
+                code="012",
+                loop_count=1,
+            ),
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜综合",
+                code="018",
+                loop_count=2,
+            ),
+        ],
+    )
+
+    summary = await evaluate_format_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+    )
+
+    assert summary["total"] == 3
+    assert summary["passed"] == 2
+    assert summary["failed"] == 1
+    assert [len(history.turns) for history in router.histories] == [1, 0, 0]
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    rows = [
+        dict(zip(headers, [cell.value for cell in row], strict=True))
+        for row in result_sheet.iter_rows(min_row=2, max_row=4)
+    ]
+    assert rows[0]["matched"] is False
+    assert rows[0]["match_reason"] == "code_mismatch"
+    assert rows[0]["expected_codes"] == '["022", "014", "016", "023"]'
+    assert rows[1]["matched"] is True
+    assert rows[1]["match_reason"] == "022_search_equivalent"
+    assert rows[2]["matched"] is True
+    assert rows[2]["expected_code"] == "018"
 
 
 async def test_evaluate_xlsx_cases_defaults_output_to_same_directory(
