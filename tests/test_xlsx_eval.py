@@ -80,6 +80,18 @@ def test_result_matching_ignores_022_equivalence_when_expected_has_many_codes() 
         intent="搜视频",
         code="014",
     )
+    search_016_result = RouteResult(
+        status="matched",
+        skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+        intent="搜音频",
+        code="016",
+    )
+    search_023_result = RouteResult(
+        status="matched",
+        skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+        intent="历史意图023",
+        code="023",
+    )
 
     assert result_matches_expected_codes(
         search_012_result,
@@ -91,6 +103,34 @@ def test_result_matching_ignores_022_equivalence_when_expected_has_many_codes() 
         search_014_result,
         expected_code="022",
         alternate_codes=["014", "016", "023"],
+        search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
+    ) == {"matched": True, "reason": "exact_code"}
+    assert result_matches_expected_codes(
+        search_016_result,
+        expected_code="022",
+        alternate_codes=["014", "016", "023"],
+        search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
+    ) == {"matched": False, "reason": "code_mismatch"}
+    assert result_matches_expected_codes(
+        search_023_result,
+        expected_code="022",
+        alternate_codes=["014", "016", "023"],
+        search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
+    ) == {"matched": False, "reason": "code_mismatch"}
+
+
+def test_result_matching_accepts_any_expected_code_when_many_codes_without_022() -> None:
+    search_016_result = RouteResult(
+        status="matched",
+        skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+        intent="搜音频",
+        code="016",
+    )
+
+    assert result_matches_expected_codes(
+        search_016_result,
+        expected_code="014",
+        alternate_codes=["016", "023"],
         search_equivalent_codes={"012", "013", "014", "015", "016", "017", "018"},
     ) == {"matched": True, "reason": "exact_code"}
 
@@ -118,8 +158,9 @@ def test_load_xlsx_cases_skips_empty_history_cells(tmp_path: Path) -> None:
     assert len(cases) == 1
     assert cases[0].row_index == 2
     assert cases[0].query == "蓝色"
-    assert cases[0].expected_code == "022"
-    assert cases[0].alternate_codes == ["012", "013"]
+    assert cases[0].expected_code == "012"
+    assert cases[0].alternate_codes == []
+    assert cases[0].source_expected_codes == ["022", "012", "013"]
     assert cases[0].history_turns == [
         HistoryCaseTurn(query="搜合同", expected_code="018"),
     ]
@@ -173,8 +214,9 @@ def test_load_format_xlsx_cases_uses_history_min_code_and_expected_codes(
         HistoryCaseTurn(query="搜索三国演义的小说", expected_code="013"),
         HistoryCaseTurn(query="中国机长", expected_code="018"),
     ]
-    assert cases[1].expected_code == "022"
-    assert cases[1].alternate_codes == ["014", "016", "023"]
+    assert cases[1].expected_code == "014"
+    assert cases[1].alternate_codes == []
+    assert cases[1].source_expected_codes == ["022", "014", "016", "023"]
 
 
 def test_build_gold_history_maps_022_to_search_context() -> None:
@@ -321,7 +363,9 @@ async def test_evaluate_format_xlsx_cases_writes_results_with_new_matching_rule(
     ]
     assert rows[0]["matched"] is False
     assert rows[0]["match_reason"] == "code_mismatch"
+    assert rows[0]["expected_code"] == "014"
     assert rows[0]["expected_codes"] == '["022", "014", "016", "023"]'
+    assert rows[0]["effective_expected_codes"] == '["014"]'
     assert rows[1]["matched"] is True
     assert rows[1]["match_reason"] == "022_search_equivalent"
     assert rows[2]["matched"] is True

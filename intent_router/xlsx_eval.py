@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,6 +43,8 @@ class XlsxEvalCase:
     expected_code: str
     alternate_codes: list[str]
     history_turns: list[HistoryCaseTurn]
+    source_expected_codes: list[str] = field(default_factory=list)
+    allow_022_search_equivalence: bool = False
 
 
 async def evaluate_xlsx_cases(
@@ -52,10 +54,14 @@ async def evaluate_xlsx_cases(
     output_path: Path | None = None,
     trace_enabled: bool = False,
     router: IntentRouter | None = None,
+    dialogue_history_limit: int | None = 5,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
-    router = router or IntentRouter.from_config(skills_path=skills_path)
+    router = router or IntentRouter.from_config(
+        skills_path=skills_path,
+        dialogue_history_limit=dialogue_history_limit,
+    )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
     return await _evaluate_loaded_cases(
@@ -75,10 +81,14 @@ async def evaluate_format_xlsx_cases(
     output_path: Path | None = None,
     trace_enabled: bool = False,
     router: IntentRouter | None = None,
+    dialogue_history_limit: int | None = 5,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
-    router = router or IntentRouter.from_config(skills_path=skills_path)
+    router = router or IntentRouter.from_config(
+        skills_path=skills_path,
+        dialogue_history_limit=dialogue_history_limit,
+    )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
     return await _evaluate_loaded_cases(
@@ -131,6 +141,7 @@ async def _evaluate_loaded_cases(
             expected_code=case.expected_code,
             alternate_codes=case.alternate_codes,
             search_equivalent_codes=search_equivalent_codes,
+            allow_022_search_equivalence=case.allow_022_search_equivalence,
         )
         passed += int(match["matched"])
 
@@ -199,18 +210,23 @@ def load_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
     cases: list[XlsxEvalCase] = []
     for row_index, row in enumerate(rows, start=2):
         query = _cell_text(_row_value(row, current_query_index))
-        expected_code = normalize_code(_row_value(row, current_expected_index))
-        if not query or not expected_code:
+        expected_codes = split_codes(_row_value(row, current_expected_index))
+        if not query or not expected_codes:
             continue
 
-        alternate_codes: list[str] = []
         if current_alternate_index is not None:
-            alternate_codes = split_codes(_row_value(row, current_alternate_index))
+            expected_codes.extend(split_codes(_row_value(row, current_alternate_index)))
+        expected_codes = _dedupe_codes(expected_codes)
+        effective_expected_codes = expected_codes_for_matching(expected_codes)
+        if not effective_expected_codes:
+            continue
 
         history_turns = []
         for query_index, expected_index in history_pairs:
             history_query = _cell_text(_row_value(row, query_index))
-            history_code = normalize_code(_row_value(row, expected_index))
+            history_code = history_code_for_codes(
+                split_codes(_row_value(row, expected_index)),
+            )
             if not history_query or not history_code:
                 continue
             history_turns.append(
@@ -221,9 +237,13 @@ def load_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
             XlsxEvalCase(
                 row_index=row_index,
                 query=query,
-                expected_code=expected_code,
-                alternate_codes=alternate_codes,
+                expected_code=effective_expected_codes[0],
+                alternate_codes=effective_expected_codes[1:],
                 history_turns=history_turns,
+                source_expected_codes=expected_codes,
+                allow_022_search_equivalence=allows_022_search_equivalence(
+                    expected_codes,
+                ),
             ),
         )
     return cases
@@ -257,12 +277,16 @@ def load_format_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
         expected_codes = split_codes(_row_value(row, current_expected_index))
         if not query or not expected_codes:
             continue
+        expected_codes = _dedupe_codes(expected_codes)
+        effective_expected_codes = expected_codes_for_matching(expected_codes)
+        if not effective_expected_codes:
+            continue
 
         history_turns = []
         for query_index, expected_index in history_pairs:
             history_query = _cell_text(_row_value(row, query_index))
             history_codes = split_codes(_row_value(row, expected_index))
-            history_code = min_code(history_codes)
+            history_code = history_code_for_codes(history_codes)
             if not history_query or not history_code:
                 continue
             history_turns.append(
@@ -273,9 +297,13 @@ def load_format_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
             XlsxEvalCase(
                 row_index=row_index,
                 query=query,
-                expected_code=expected_codes[0],
-                alternate_codes=expected_codes[1:],
+                expected_code=effective_expected_codes[0],
+                alternate_codes=effective_expected_codes[1:],
                 history_turns=history_turns,
+                source_expected_codes=expected_codes,
+                allow_022_search_equivalence=allows_022_search_equivalence(
+                    expected_codes,
+                ),
             ),
         )
     return cases
@@ -309,13 +337,14 @@ def result_matches_expected_codes(
     expected_code: str,
     alternate_codes: list[str],
     search_equivalent_codes: set[str],
+    allow_022_search_equivalence: bool | None = None,
 ) -> dict[str, Any]:
     raw_accepted_codes = _dedupe_codes([expected_code, *alternate_codes])
-    single_022_expected = raw_accepted_codes == [SEARCH_022_CODE]
-    accepted_codes = (
-        raw_accepted_codes
-        if single_022_expected
-        else [code for code in raw_accepted_codes if code != SEARCH_022_CODE]
+    accepted_codes = expected_codes_for_matching(raw_accepted_codes)
+    allow_search_equivalence = (
+        allows_022_search_equivalence(raw_accepted_codes)
+        if allow_022_search_equivalence is None
+        else allow_022_search_equivalence
     )
     predicted_code = result.code
     predicted_skill_id = result.skill.id if result.skill else None
@@ -324,7 +353,7 @@ def result_matches_expected_codes(
         if predicted_code == accepted_code:
             return {"matched": True, "reason": "exact_code"}
     if (
-        single_022_expected
+        allow_search_equivalence
         and predicted_skill_id == SEARCH_SKILL_ID
         and predicted_code in search_equivalent_codes
     ):
@@ -343,6 +372,22 @@ def split_codes(value: Any) -> list[str]:
         if code and code not in codes:
             codes.append(code)
     return codes
+
+
+def history_code_for_codes(codes: list[str]) -> str | None:
+    return min_code(_dedupe_codes(codes))
+
+
+def expected_codes_for_matching(codes: list[str]) -> list[str]:
+    deduped_codes = _dedupe_codes(codes)
+    if len(deduped_codes) > 1 and SEARCH_022_CODE in deduped_codes:
+        code = min_code(deduped_codes)
+        return [code] if code else []
+    return deduped_codes
+
+
+def allows_022_search_equivalence(codes: list[str]) -> bool:
+    return _dedupe_codes(codes) == [SEARCH_022_CODE]
 
 
 def min_code(codes: list[str]) -> str | None:
@@ -367,6 +412,7 @@ def write_xlsx_result(
         "expected_code",
         "alternate_codes",
         "expected_codes",
+        "effective_expected_codes",
         "history_codes",
         "predicted_status",
         "predicted_skill_id",
@@ -518,7 +564,9 @@ def _build_record(
         "query": case.query,
         "expected_code": case.expected_code,
         "alternate_codes": case.alternate_codes,
-        "expected_codes": [case.expected_code, *case.alternate_codes],
+        "expected_codes": case.source_expected_codes
+        or [case.expected_code, *case.alternate_codes],
+        "effective_expected_codes": [case.expected_code, *case.alternate_codes],
         "history_codes": [turn.expected_code for turn in case.history_turns],
         "predicted_status": result.status,
         "predicted_skill_id": skill_id,

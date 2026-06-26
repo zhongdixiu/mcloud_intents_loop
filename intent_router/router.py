@@ -7,6 +7,7 @@ from typing import Any
 from .model_client import AgentScopeStructuredClient, StructuredModelClient
 from .prompts import (
     CONTEXTUALIZER_SYSTEM_PROMPT,
+    DIALOGUE_HISTORY_LIMIT,
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
@@ -45,6 +46,7 @@ class IntentRouter:
         evaluator_client: StructuredModelClient | None = None,
         *,
         max_attempts: int = 3,
+        dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
     ) -> None:
         self.registry = registry
         self.model_client = model_client or AgentScopeStructuredClient.from_env()
@@ -58,6 +60,7 @@ class IntentRouter:
             or self.model_client
         )
         self.max_attempts = max_attempts
+        self.dialogue_history_limit = dialogue_history_limit
 
     @classmethod
     def from_config(
@@ -67,12 +70,14 @@ class IntentRouter:
         evaluator_client: StructuredModelClient | None = None,
         *,
         max_attempts: int = 3,
+        dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
     ) -> "IntentRouter":
         return cls(
             SkillRegistry.from_path(skills_path),
             model_client=model_client,
             evaluator_client=evaluator_client,
             max_attempts=max_attempts,
+            dialogue_history_limit=dialogue_history_limit,
         )
 
     async def route(
@@ -647,7 +652,11 @@ class IntentRouter:
             )
         return await self.model_client.structured(
             system_prompt=CONTEXTUALIZER_SYSTEM_PROMPT,
-            user_prompt=build_contextualizer_prompt(query, dialogue_history),
+            user_prompt=build_contextualizer_prompt(
+                query,
+                dialogue_history,
+                history_limit=self.dialogue_history_limit,
+            ),
             response_model=ContextualizedRequest,
         )
 

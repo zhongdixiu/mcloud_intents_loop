@@ -15,6 +15,25 @@ from intent_router.types import (
 )
 
 
+def _matched_search_history(count: int) -> DialogueHistory:
+    return DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query=f"历史第{index}轮",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    intent="搜图片",
+                    code="012",
+                    params={"metadataList": [f"历史{index}"]},
+                ),
+                metadata={"internal": index},
+            )
+            for index in range(count)
+        ],
+    )
+
+
 async def test_router_returns_matched_result() -> None:
     """：一级 skill、二级 intent、参数、Evaluator accept 后返回 matched；
     同时验证 evaluator prompt 带了可用 skills 和 schema，但不注入 loop state。"""
@@ -469,6 +488,84 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
     assert "上下文语义归一节点" in model.calls[0][0]
     assert "不要伪造 image/content/file" in model.calls[1][0]
     assert "执行载体缺失不算 param_mismatch" in model.calls[-1][0]
+
+
+async def test_router_uses_configured_dialogue_history_limit() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="只找最近的猫图片",
+                relation_to_history="continuation",
+                used_history_turns=[0, 1, 2, 3, 4, 5, 6],
+                reason="当前输入需要继承历史搜索对象",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜图片",
+                code="012",
+                params={"metadataList": ["猫"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        dialogue_history_limit=7,
+    )
+    history = _matched_search_history(7)
+
+    result = await router.route("只找最近的", dialogue_history=history)
+
+    assert result.status == "matched"
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assert len(contextualizer_prompt["dialogue_history"]) == 7
+    assert contextualizer_prompt["dialogue_history"][0]["user_query"] == "历史第0轮"
+    assert contextualizer_prompt["dialogue_history"][-1]["user_query"] == "历史第6轮"
+
+
+async def test_router_allows_disabling_dialogue_history_injection() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="只找最近的",
+                relation_to_history="new_request",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["最近"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        dialogue_history_limit=0,
+    )
+    history = _matched_search_history(3)
+
+    result = await router.route("只找最近的", dialogue_history=history)
+
+    assert result.status == "matched"
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assert contextualizer_prompt["dialogue_history"] == []
 
 
 async def test_param_reject_records_param_rejection_even_with_low_confidence() -> None:

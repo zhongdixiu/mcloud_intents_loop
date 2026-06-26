@@ -145,11 +145,15 @@ EVALUATOR_SYSTEM_PROMPT = EVALUATOR_SYSTEM_PROMPT.format(
 def build_contextualizer_prompt(
     query: str,
     dialogue_history: DialogueHistory | None = None,
+    history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
 ) -> str:
     return json.dumps(
         {
             "current_user_query": query,
-            "dialogue_history": _dialogue_history_payload(dialogue_history),
+            "dialogue_history": _dialogue_history_payload(
+                dialogue_history,
+                history_limit=history_limit,
+            ),
         },
         ensure_ascii=False,
     )
@@ -281,11 +285,22 @@ def build_loop_exhausted_clarifier_prompt(
     )
 
 
-def _dialogue_history_payload(dialogue_history: DialogueHistory | None) -> list[dict]:
+def _dialogue_history_payload(
+    dialogue_history: DialogueHistory | None,
+    *,
+    history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
+) -> list[dict]:
     if dialogue_history is None:
         return []
+    turns = dialogue_history.turns
+    if history_limit is None:
+        selected_turns = turns
+    elif history_limit <= 0:
+        selected_turns = []
+    else:
+        selected_turns = turns[-history_limit:]
     payload = []
-    for turn in dialogue_history.turns[-DIALOGUE_HISTORY_LIMIT:]:
+    for turn in selected_turns:
         result = turn.result
         if result.status == "matched":
             assistant_result = {

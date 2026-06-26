@@ -19,15 +19,18 @@ def main() -> None:
     route_parser.add_argument("query")
     route_parser.add_argument("--skills", default="skills")
     route_parser.add_argument("--trace", action="store_true")
+    route_parser.add_argument("--history-limit", type=int, default=5)
 
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("--skills", default="skills")
     chat_parser.add_argument("--trace", action="store_true")
+    chat_parser.add_argument("--history-limit", type=int, default=5)
 
     eval_parser = subparsers.add_parser("eval")
     eval_parser.add_argument("--cases", required=True)
     eval_parser.add_argument("--skills", default="skills")
     eval_parser.add_argument("--trace", action="store_true")
+    eval_parser.add_argument("--history-limit", type=int, default=5)
 
     eval_xlsx_parser = subparsers.add_parser("eval-xlsx")
     eval_xlsx_parser.add_argument("--cases", required=True)
@@ -37,6 +40,7 @@ def main() -> None:
         help="结果 Excel 文件路径，默认保存到用例文件同目录的 *_测试结果.xlsx",
     )
     eval_xlsx_parser.add_argument("--trace", action="store_true")
+    eval_xlsx_parser.add_argument("--history-limit", type=int, default=5)
 
     eval_format_xlsx_parser = subparsers.add_parser("eval-format-xlsx")
     eval_format_xlsx_parser.add_argument("--cases", required=True)
@@ -46,24 +50,39 @@ def main() -> None:
         help="结果 Excel 文件路径，默认保存到用例文件同目录的 *_测试结果.xlsx",
     )
     eval_format_xlsx_parser.add_argument("--trace", action="store_true")
+    eval_format_xlsx_parser.add_argument("--history-limit", type=int, default=5)
 
     args = parser.parse_args()
     if args.command == "route":
         try:
-            asyncio.run(_route(args.query, args.skills, args.trace))
+            asyncio.run(_route(args.query, args.skills, args.trace, args.history_limit))
         except ValueError as exc:
             parser.error(str(exc))
     elif args.command == "chat":
-        asyncio.run(_chat(args.skills, args.trace))
+        asyncio.run(_chat(args.skills, args.trace, args.history_limit))
     elif args.command == "eval":
-        asyncio.run(_eval(Path(args.cases), args.skills, args.trace))
+        asyncio.run(_eval(Path(args.cases), args.skills, args.trace, args.history_limit))
     elif args.command == "eval-xlsx":
         output = Path(args.output) if args.output else None
-        asyncio.run(_eval_xlsx(Path(args.cases), args.skills, output, args.trace))
+        asyncio.run(
+            _eval_xlsx(
+                Path(args.cases),
+                args.skills,
+                output,
+                args.trace,
+                args.history_limit,
+            ),
+        )
     elif args.command == "eval-format-xlsx":
         output = Path(args.output) if args.output else None
         asyncio.run(
-            _eval_format_xlsx(Path(args.cases), args.skills, output, args.trace),
+            _eval_format_xlsx(
+                Path(args.cases),
+                args.skills,
+                output,
+                args.trace,
+                args.history_limit,
+            ),
         )
 
 
@@ -71,8 +90,12 @@ async def _route(
     query: str,
     skills: str,
     trace_enabled: bool,
+    history_limit: int = 5,
 ) -> None:
-    router = IntentRouter.from_config(skills_path=skills)
+    router = IntentRouter.from_config(
+        skills_path=skills,
+        dialogue_history_limit=history_limit,
+    )
     trace: list[dict] | None = [] if trace_enabled else None
     result = await router.route(query, trace=trace)
     if trace_enabled:
@@ -90,8 +113,11 @@ async def _route(
     print(result.model_dump_json(ensure_ascii=False, indent=2))
 
 
-async def _chat(skills: str, trace_enabled: bool) -> None:
-    agent = IntentDialogueAgent.from_config(skills_path=skills)
+async def _chat(skills: str, trace_enabled: bool, history_limit: int = 5) -> None:
+    agent = IntentDialogueAgent.from_config(
+        skills_path=skills,
+        dialogue_history_limit=history_limit,
+    )
     _print_chat_help()
     while True:
         try:
@@ -185,8 +211,16 @@ def _print_chat_history(agent: IntentDialogueAgent) -> None:
             print(f"     skill: {result.skill_name} ({result.skill_id})")
 
 
-async def _eval(cases_path: Path, skills: str, trace_enabled: bool) -> None:
-    router = IntentRouter.from_config(skills_path=skills)
+async def _eval(
+    cases_path: Path,
+    skills: str,
+    trace_enabled: bool,
+    history_limit: int = 5,
+) -> None:
+    router = IntentRouter.from_config(
+        skills_path=skills,
+        dialogue_history_limit=history_limit,
+    )
     total = 0
     passed = 0
     first_pass_ok = 0
@@ -244,6 +278,7 @@ async def _eval_xlsx(
     skills: str,
     output_path: Path | None,
     trace_enabled: bool,
+    history_limit: int = 5,
 ) -> None:
     print("开始执行 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
@@ -252,6 +287,7 @@ async def _eval_xlsx(
         skills_path=skills,
         output_path=output_path,
         trace_enabled=trace_enabled,
+        dialogue_history_limit=history_limit,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -263,6 +299,7 @@ async def _eval_format_xlsx(
     skills: str,
     output_path: Path | None,
     trace_enabled: bool,
+    history_limit: int = 5,
 ) -> None:
     print("开始执行重构格式 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
@@ -271,6 +308,7 @@ async def _eval_format_xlsx(
         skills_path=skills,
         output_path=output_path,
         trace_enabled=trace_enabled,
+        dialogue_history_limit=history_limit,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -285,7 +323,11 @@ def _print_eval_xlsx_progress(
 ) -> None:
     status = "OK" if record.get("matched") else "FAIL"
     accuracy = passed / processed if processed else 0.0
-    expected = record.get("expected_codes") or record.get("expected_code")
+    expected = (
+        record.get("effective_expected_codes")
+        or record.get("expected_codes")
+        or record.get("expected_code")
+    )
     print(
         "[{processed}/{total}] row={row} {status} "
         "expected={expected} predicted={predicted} "
