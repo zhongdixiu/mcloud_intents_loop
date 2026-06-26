@@ -41,6 +41,19 @@ def main() -> None:
     )
     eval_xlsx_parser.add_argument("--trace", action="store_true")
     eval_xlsx_parser.add_argument("--history-limit", type=int, default=5)
+    eval_xlsx_parser.add_argument(
+        "--if-end2end",
+        "--if_end2end",
+        action="store_true",
+        dest="if_end2end",
+        help="按端到端多轮对话模拟执行历史轮次，默认使用表格期望意图构造历史",
+    )
+    eval_xlsx_parser.add_argument(
+        "--intent-only",
+        action="store_true",
+        dest="intent_only",
+        help="仅评估 skill/intent/code 调度，忽略不影响意图的实体参数缺失",
+    )
 
     eval_format_xlsx_parser = subparsers.add_parser("eval-format-xlsx")
     eval_format_xlsx_parser.add_argument("--cases", required=True)
@@ -51,6 +64,19 @@ def main() -> None:
     )
     eval_format_xlsx_parser.add_argument("--trace", action="store_true")
     eval_format_xlsx_parser.add_argument("--history-limit", type=int, default=5)
+    eval_format_xlsx_parser.add_argument(
+        "--if-end2end",
+        "--if_end2end",
+        action="store_true",
+        dest="if_end2end",
+        help="按端到端多轮对话模拟执行历史轮次，默认使用表格期望意图构造历史",
+    )
+    eval_format_xlsx_parser.add_argument(
+        "--intent-only",
+        action="store_true",
+        dest="intent_only",
+        help="仅评估 skill/intent/code 调度，忽略不影响意图的实体参数缺失",
+    )
 
     args = parser.parse_args()
     if args.command == "route":
@@ -71,6 +97,8 @@ def main() -> None:
                 output,
                 args.trace,
                 args.history_limit,
+                args.if_end2end,
+                args.intent_only,
             ),
         )
     elif args.command == "eval-format-xlsx":
@@ -82,6 +110,8 @@ def main() -> None:
                 output,
                 args.trace,
                 args.history_limit,
+                args.if_end2end,
+                args.intent_only,
             ),
         )
 
@@ -279,15 +309,21 @@ async def _eval_xlsx(
     output_path: Path | None,
     trace_enabled: bool,
     history_limit: int = 5,
+    if_end2end: bool = False,
+    intent_only: bool = False,
 ) -> None:
     print("开始执行 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
+    print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
+    print(f"意图评测模式: {'intent_only' if intent_only else 'strict'}")
     summary = await evaluate_xlsx_cases(
         cases_path,
         skills_path=skills,
         output_path=output_path,
         trace_enabled=trace_enabled,
         dialogue_history_limit=history_limit,
+        if_end2end=if_end2end,
+        intent_only=intent_only,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -300,15 +336,21 @@ async def _eval_format_xlsx(
     output_path: Path | None,
     trace_enabled: bool,
     history_limit: int = 5,
+    if_end2end: bool = False,
+    intent_only: bool = False,
 ) -> None:
     print("开始执行重构格式 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
+    print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
+    print(f"意图评测模式: {'intent_only' if intent_only else 'strict'}")
     summary = await evaluate_format_xlsx_cases(
         cases_path,
         skills_path=skills,
         output_path=output_path,
         trace_enabled=trace_enabled,
         dialogue_history_limit=history_limit,
+        if_end2end=if_end2end,
+        intent_only=intent_only,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")

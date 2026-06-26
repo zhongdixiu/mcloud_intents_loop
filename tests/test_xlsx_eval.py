@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -292,6 +293,7 @@ async def test_evaluate_xlsx_cases_writes_rows_and_summary(tmp_path: Path) -> No
     first = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
     second = dict(zip(headers, [cell.value for cell in result_sheet[3]], strict=True))
     assert first["matched"] is True
+    assert first["eval_mode"] == "gold_history"
     assert first["match_reason"] == "022_search_equivalent"
     assert first["loop_count"] == 2
     assert first["correction_scopes"] == '["intent_mismatch"]'
@@ -438,6 +440,167 @@ async def test_evaluate_xlsx_cases_reports_progress(tmp_path: Path) -> None:
     assert progress_events == [(1, 1, True, 1)]
 
 
+async def test_evaluate_xlsx_cases_end_to_end_routes_history_before_current(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cases.xlsx"
+    output = tmp_path / "result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "第一轮对话",
+            "第一轮预期意图",
+            "第二轮对话",
+            "第二轮预期意图",
+            "当前对话",
+            "当前预期意图",
+        ],
+    )
+    sheet.append(["推荐刘德华的歌曲", "000", "有没有电影", "000", "找图片", "022"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RouteResult(status="matched", intent="普通对话", code="000", loop_count=1),
+            RouteResult(status="matched", intent="普通对话", code="000", loop_count=2),
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜图片",
+                code="012",
+                loop_count=1,
+            ),
+        ],
+    )
+
+    summary = await evaluate_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+        if_end2end=True,
+    )
+
+    assert summary["total"] == 1
+    assert summary["passed"] == 1
+    assert summary["accuracy"] == 1.0
+    assert summary["eval_mode"] == "end2end"
+    assert summary["intent_only"] is False
+    assert router.queries == ["推荐刘德华的歌曲", "有没有电影", "找图片"]
+    assert [len(history.turns) for history in router.histories] == [0, 1, 2]
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    row = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
+    assert row["eval_mode"] == "end2end"
+    assert row["intent_only"] is False
+    assert row["history_predicted_codes"] == '["000", "000"]'
+    assert row["history_loop_counts"] == "[1, 2]"
+    assert row["matched"] is True
+    assert row["match_reason"] == "022_search_equivalent"
+    turn_results = json.loads(row["turn_results"])
+    assert [turn["query"] for turn in turn_results] == [
+        "推荐刘德华的歌曲",
+        "有没有电影",
+        "找图片",
+    ]
+    assert [turn["is_scored"] for turn in turn_results] == [False, False, True]
+    assert turn_results[-1]["predicted_code"] == "012"
+
+
+async def test_evaluate_format_xlsx_cases_end_to_end_records_each_turn(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "format_cases.xlsx"
+    output = tmp_path / "format_result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["上文1", "上文意图1", "对话", "期望意图标签"])
+    sheet.append(["搜索谢娜的图片", "022", "再生成一些近期的", "036011"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜图片",
+                code="012",
+                loop_count=1,
+            ),
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="image_skill", name="图片处理"),
+                intent="生成图片",
+                code="036011",
+                loop_count=2,
+            ),
+        ],
+    )
+
+    summary = await evaluate_format_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+        if_end2end=True,
+    )
+
+    assert summary["passed"] == 1
+    assert router.queries == ["搜索谢娜的图片", "再生成一些近期的"]
+    assert [len(history.turns) for history in router.histories] == [0, 1]
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    row = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
+    assert row["predicted_code"] == "036011"
+    turn_results = json.loads(row["turn_results"])
+    assert len(turn_results) == 2
+    assert turn_results[0]["is_scored"] is False
+    assert turn_results[1]["is_scored"] is True
+
+
+async def test_evaluate_xlsx_cases_records_intent_only_mode(tmp_path: Path) -> None:
+    path = tmp_path / "cases.xlsx"
+    output = tmp_path / "result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["当前对话", "当前预期意图"])
+    sheet.append(["找相关文档", "013"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜文档",
+                code="013",
+                loop_count=1,
+            ),
+        ],
+    )
+
+    summary = await evaluate_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+        intent_only=True,
+    )
+
+    assert summary["intent_only"] is True
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    row = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
+    assert row["intent_only"] is True
+
+
 class FakeRouter:
     def __init__(self, results: list[RouteResult]) -> None:
         self.results = results
@@ -449,10 +612,13 @@ class FakeRouter:
         query: str,
         *,
         dialogue_history: DialogueHistory | None = None,
+        context: dict[str, Any] | None = None,
         trace: list[dict[str, Any]] | None = None,
     ) -> RouteResult:
         self.queries.append(query)
-        self.histories.append(dialogue_history or DialogueHistory())
+        self.histories.append(
+            (dialogue_history or DialogueHistory()).model_copy(deep=True),
+        )
         if trace is not None:
             trace.append({"event": "fake"})
         return self.results.pop(0)

@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from openpyxl import Workbook, load_workbook
 
+from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
 from .skills import SkillRegistry
 from .types import (
@@ -55,12 +56,15 @@ async def evaluate_xlsx_cases(
     trace_enabled: bool = False,
     router: IntentRouter | None = None,
     dialogue_history_limit: int | None = 5,
+    if_end2end: bool = False,
+    intent_only: bool = False,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
+        intent_only=intent_only,
     )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -70,6 +74,8 @@ async def evaluate_xlsx_cases(
         router=router,
         output_path=output_path,
         trace_enabled=trace_enabled,
+        if_end2end=if_end2end,
+        intent_only=intent_only,
         progress_callback=progress_callback,
     )
 
@@ -82,12 +88,15 @@ async def evaluate_format_xlsx_cases(
     trace_enabled: bool = False,
     router: IntentRouter | None = None,
     dialogue_history_limit: int | None = 5,
+    if_end2end: bool = False,
+    intent_only: bool = False,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
+        intent_only=intent_only,
     )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -97,6 +106,8 @@ async def evaluate_format_xlsx_cases(
         router=router,
         output_path=output_path,
         trace_enabled=trace_enabled,
+        if_end2end=if_end2end,
+        intent_only=intent_only,
         progress_callback=progress_callback,
     )
 
@@ -108,6 +119,8 @@ async def _evaluate_loaded_cases(
     router: IntentRouter,
     output_path: Path,
     trace_enabled: bool,
+    if_end2end: bool,
+    intent_only: bool,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None,
 ) -> dict[str, Any]:
     code_index = _build_code_index(registry)
@@ -116,23 +129,37 @@ async def _evaluate_loaded_cases(
     total = 0
     passed = 0
     elapsed_values: list[float] = []
+    total_elapsed_values: list[float] = []
     loop_counts: list[int] = []
     status_counts: dict[str, int] = {}
     records: list[dict[str, Any]] = []
 
     for case in cases:
         total += 1
-        history = build_gold_dialogue_history(case.history_turns, registry, code_index)
-        trace: list[dict[str, Any]] | None = [] if trace_enabled else None
+        if if_end2end:
+            evaluation = await _run_end_to_end_case(
+                case,
+                router=router,
+                trace_enabled=trace_enabled,
+            )
+        else:
+            history = build_gold_dialogue_history(
+                case.history_turns,
+                registry,
+                code_index,
+            )
+            evaluation = await _run_gold_history_case(
+                case,
+                router=router,
+                history=history,
+                trace_enabled=trace_enabled,
+            )
 
-        started = time.perf_counter()
-        result = await router.route(
-            case.query,
-            dialogue_history=history,
-            trace=trace,
-        )
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        result = evaluation["result"]
+        elapsed_ms = evaluation["elapsed_ms"]
+        total_elapsed_ms = evaluation["total_elapsed_ms"]
         elapsed_values.append(elapsed_ms)
+        total_elapsed_values.append(total_elapsed_ms)
         loop_counts.append(result.loop_count)
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
 
@@ -151,9 +178,13 @@ async def _evaluate_loaded_cases(
             matched=match["matched"],
             match_reason=match["reason"],
             elapsed_ms=elapsed_ms,
+            total_elapsed_ms=total_elapsed_ms,
+            eval_mode="end2end" if if_end2end else "gold_history",
+            intent_only=intent_only,
+            turn_results=evaluation["turn_results"],
         )
         if trace_enabled:
-            record["trace"] = trace
+            record["trace"] = evaluation["trace"]
         records.append(record)
         if progress_callback is not None:
             progress_callback(total, len(cases), record, passed)
@@ -164,7 +195,10 @@ async def _evaluate_loaded_cases(
         "passed": passed,
         "failed": failed,
         "accuracy": (passed / total) if total else 0.0,
+        "eval_mode": "end2end" if if_end2end else "gold_history",
+        "intent_only": intent_only,
         "avg_elapsed_ms": _average(elapsed_values),
+        "avg_total_elapsed_ms": _average(total_elapsed_values),
         "avg_loop_count": _average(loop_counts),
         "matched_count": status_counts.get("matched", 0),
         "clarify_count": status_counts.get("clarify", 0),
@@ -173,6 +207,108 @@ async def _evaluate_loaded_cases(
     }
     write_xlsx_result(output_path, records, summary)
     return summary
+
+
+async def _run_gold_history_case(
+    case: XlsxEvalCase,
+    *,
+    router: IntentRouter,
+    history: DialogueHistory,
+    trace_enabled: bool,
+) -> dict[str, Any]:
+    trace: list[dict[str, Any]] | None = [] if trace_enabled else None
+    started = time.perf_counter()
+    result = await router.route(
+        case.query,
+        dialogue_history=history,
+        trace=trace,
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    turn_results = [
+        _build_turn_result(
+            turn_index=len(case.history_turns) + 1,
+            query=case.query,
+            expected_code=case.expected_code,
+            result=result,
+            elapsed_ms=elapsed_ms,
+            is_scored=True,
+        ),
+    ]
+    return {
+        "result": result,
+        "elapsed_ms": elapsed_ms,
+        "total_elapsed_ms": elapsed_ms,
+        "turn_results": turn_results,
+        "trace": trace,
+    }
+
+
+async def _run_end_to_end_case(
+    case: XlsxEvalCase,
+    *,
+    router: IntentRouter,
+    trace_enabled: bool,
+) -> dict[str, Any]:
+    agent = IntentDialogueAgent(router)
+    turn_results: list[dict[str, Any]] = []
+    turn_traces: list[dict[str, Any]] = []
+    total_started = time.perf_counter()
+
+    turns = [
+        *[
+            {
+                "query": history_turn.query,
+                "expected_code": history_turn.expected_code,
+                "is_scored": False,
+            }
+            for history_turn in case.history_turns
+        ],
+        {
+            "query": case.query,
+            "expected_code": case.expected_code,
+            "is_scored": True,
+        },
+    ]
+
+    result: RouteResult | None = None
+    final_elapsed_ms = 0.0
+    for index, turn in enumerate(turns, start=1):
+        trace: list[dict[str, Any]] | None = [] if trace_enabled else None
+        started = time.perf_counter()
+        result = await agent.send(turn["query"], trace=trace)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if turn["is_scored"]:
+            final_elapsed_ms = elapsed_ms
+        turn_results.append(
+            _build_turn_result(
+                turn_index=index,
+                query=turn["query"],
+                expected_code=turn["expected_code"],
+                result=result,
+                elapsed_ms=elapsed_ms,
+                is_scored=turn["is_scored"],
+            ),
+        )
+        if trace_enabled:
+            turn_traces.append(
+                {
+                    "turn_index": index,
+                    "query": turn["query"],
+                    "trace": trace,
+                },
+            )
+
+    if result is None:
+        raise RuntimeError("Excel 评测用例缺少当前对话，无法执行端到端评测")
+
+    total_elapsed_ms = (time.perf_counter() - total_started) * 1000
+    return {
+        "result": result,
+        "elapsed_ms": final_elapsed_ms,
+        "total_elapsed_ms": total_elapsed_ms,
+        "turn_results": turn_results,
+        "trace": turn_traces if trace_enabled else None,
+    }
 
 
 def default_output_path(cases_path: Path) -> Path:
@@ -407,6 +543,8 @@ def write_xlsx_result(
     result_sheet.title = "results"
     headers = [
         "row_index",
+        "eval_mode",
+        "intent_only",
         "history_turn_count",
         "query",
         "expected_code",
@@ -414,6 +552,8 @@ def write_xlsx_result(
         "expected_codes",
         "effective_expected_codes",
         "history_codes",
+        "history_predicted_codes",
+        "history_loop_counts",
         "predicted_status",
         "predicted_skill_id",
         "predicted_intent",
@@ -421,6 +561,7 @@ def write_xlsx_result(
         "matched",
         "match_reason",
         "elapsed_ms",
+        "total_elapsed_ms",
         "loop_count",
         "correction_scopes",
         "resolved_query",
@@ -428,6 +569,7 @@ def write_xlsx_result(
         "question",
         "options",
         "reason",
+        "turn_results",
         "trace",
     ]
     result_sheet.append(headers)
@@ -556,10 +698,19 @@ def _build_record(
     matched: bool,
     match_reason: str,
     elapsed_ms: float,
+    total_elapsed_ms: float,
+    eval_mode: str,
+    intent_only: bool,
+    turn_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
     skill_id = result.skill.id if result.skill else None
+    history_turn_results = [
+        turn_result for turn_result in turn_results if not turn_result.get("is_scored")
+    ]
     return {
         "row_index": case.row_index,
+        "eval_mode": eval_mode,
+        "intent_only": intent_only,
         "history_turn_count": len(case.history_turns),
         "query": case.query,
         "expected_code": case.expected_code,
@@ -568,6 +719,12 @@ def _build_record(
         or [case.expected_code, *case.alternate_codes],
         "effective_expected_codes": [case.expected_code, *case.alternate_codes],
         "history_codes": [turn.expected_code for turn in case.history_turns],
+        "history_predicted_codes": [
+            turn_result.get("predicted_code") for turn_result in history_turn_results
+        ],
+        "history_loop_counts": [
+            turn_result.get("loop_count") for turn_result in history_turn_results
+        ],
         "predicted_status": result.status,
         "predicted_skill_id": skill_id,
         "predicted_intent": result.intent,
@@ -575,6 +732,7 @@ def _build_record(
         "matched": matched,
         "match_reason": match_reason,
         "elapsed_ms": round(elapsed_ms, 3),
+        "total_elapsed_ms": round(total_elapsed_ms, 3),
         "loop_count": result.loop_count,
         "correction_scopes": result.correction_scopes,
         "resolved_query": result.resolved_query,
@@ -582,6 +740,37 @@ def _build_record(
         "question": result.question,
         "options": result.options,
         "reason": result.reason,
+        "turn_results": turn_results,
+    }
+
+
+def _build_turn_result(
+    *,
+    turn_index: int,
+    query: str,
+    expected_code: str,
+    result: RouteResult,
+    elapsed_ms: float,
+    is_scored: bool,
+) -> dict[str, Any]:
+    skill_id = result.skill.id if result.skill else None
+    return {
+        "turn_index": turn_index,
+        "query": query,
+        "expected_code": expected_code,
+        "predicted_status": result.status,
+        "predicted_skill_id": skill_id,
+        "predicted_intent": result.intent,
+        "predicted_code": result.code,
+        "loop_count": result.loop_count,
+        "correction_scopes": result.correction_scopes,
+        "elapsed_ms": round(elapsed_ms, 3),
+        "resolved_query": result.resolved_query,
+        "context_relation": result.context_relation,
+        "question": result.question,
+        "options": result.options,
+        "reason": result.reason,
+        "is_scored": is_scored,
     }
 
 

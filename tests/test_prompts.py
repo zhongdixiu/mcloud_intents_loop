@@ -8,7 +8,11 @@ from intent_router.prompts import (
     PARAM_REPAIR_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     build_contextualizer_prompt,
+    build_evaluator_prompt,
+    build_intent_prompt,
+    build_router_prompt,
 )
+from intent_router.skills import SkillRegistry
 from intent_router.types import DialogueHistory, DialogueRouteSummary, DialogueTurn
 
 
@@ -61,6 +65,52 @@ def test_all_structured_prompts_include_output_contracts() -> None:
     assert "不能仅因出现电影、图片、歌曲、近期、保存等资源词" in (
         EVALUATOR_SYSTEM_PROMPT
     )
+    assert "缺少主体、主题、关键词或真实资源句柄" in (
+        CONTEXTUALIZER_SYSTEM_PROMPT
+    )
+    assert "intent_only=true 时" in EVALUATOR_SYSTEM_PROMPT
+    assert "多个搜索类 intent 都可满足" in INTENT_SYSTEM_PROMPT
+    assert "移动云盘功能、AI工具或入口" in ROUTER_SYSTEM_PROMPT
+
+
+def test_intent_only_flag_is_injected_into_model_prompts() -> None:
+    registry = SkillRegistry.from_path("skills")
+    search_skill = registry.get("mcloud_search_skill")
+
+    router_prompt = json.loads(
+        build_router_prompt(
+            "找相关文档",
+            registry.cards(),
+            [],
+            intent_only=True,
+        ),
+    )
+    intent_prompt = json.loads(
+        build_intent_prompt(
+            "找相关文档",
+            search_skill,
+            intent_only=True,
+        ),
+    )
+    evaluator_prompt = json.loads(
+        build_evaluator_prompt(
+            "找相关文档",
+            registry.cards(),
+            search_skill,
+            {
+                "status": "matched",
+                "intent": "搜文档",
+                "code": "013",
+                "params": {},
+                "confidence": 0.8,
+            },
+            intent_only=True,
+        ),
+    )
+
+    assert router_prompt["intent_only"] is True
+    assert intent_prompt["intent_only"] is True
+    assert evaluator_prompt["intent_only"] is True
 
 
 def test_contextualizer_history_payload_splits_semantic_state() -> None:

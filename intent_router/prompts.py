@@ -145,15 +145,17 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 16. 若当前输入显式要求搜索、查找、找资源、找文件、打开、生成、创作、编辑、处理、总结等业务动作，应按当前动作归一；历史只补全主体、对象类型、限定条件或素材来源。
 17. 承接历史时必须保留历史中的判别性主体，不要只继承“文件/图片/视频/音频/邮件/圈子”等泛化类型并丢弃其他具体的关键词。
 18. 颜色、时间、地点、范围、格式、数量、排序、来源状态等通常是限定条件或输入来源，不应单独替换历史核心主体，也不应覆盖当前明确主动作。
-19. 若当前输入可能是新请求、替换历史主体、切换主动作、或在历史主体上追加限定条件，且语义证据不足以唯一确定，输出 status=clarify，并用 options 覆盖这些可能方向。
-20. 若判断为在历史主体上追加限定条件，resolved_query 必须同时包含历史核心主体和新增限定条件；若判断为替换历史主体，resolved_query 不应残留被替换的历史主体。
-21. 历史 clarify 的 question/options 是理解澄清维度的语义参考，不是封闭枚举；当前输入可以选择其中方向、补充其他有效方向，或开启新请求。
-22. 若 current_user_query 是对历史 clarify 的回答，relation_to_history 可为 answer_to_previous；此时 resolved_query 必须补全为可独立路由的完整自然语言请求，不能只输出当前短回答片段。
-23. 若当前输入明确表达 options 之外的新方向，但仍在同一澄清维度内，应按用户新方向归一；若表达新的动作、新对象或新目标，relation_to_history 应为 new_request，不要强行贴合历史 options。
-24. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
-25. 历史 matched 且 code=000 表示普通对话或非工具执行兜底结果，可用于承接推荐、问答、解释等答案型语义，也可承接用法咨询，但不代表云盘资源、业务对象或执行句柄。
-26. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；但可以把历史中的自然语言对象、主题或来源保留在 resolved_query 中，供后续意图识别判断。
-27. 如果 current_user_query 与历史合并后仍无法确定用户真实意图，输出 status=clarify 并给出问题和可选项。
+19. 若当前输入只缺少主体、主题、关键词或真实资源句柄，但业务主动作、对象类型和期望结果形态已经足以支持后续 skill/intent/code 判断，应输出 status=resolved，并在 resolved_query 中保留可确定的信息；不要只因实体不完整而澄清。
+20. 普通问答、开放问答、用法咨询、事实询问等答案型请求即使缺少具体主题，也应先输出 status=resolved，让后续路由归为普通对话；除非用户明确要求执行某个业务功能且缺失信息会改变业务类别。
+21. 若当前输入可能是新请求、替换历史主体、切换主动作、或在历史主体上追加限定条件，且差异会改变 skill/intent/code，输出 status=clarify，并用 options 覆盖这些可能方向。
+22. 若判断为在历史主体上追加限定条件，resolved_query 必须同时包含历史核心主体和新增限定条件；若判断为替换历史主体，resolved_query 不应残留被替换的历史主体。
+23. 历史 clarify 的 question/options 是理解澄清维度的语义参考，不是封闭枚举；当前输入可以选择其中方向、补充其他有效方向，或开启新请求。
+24. 若 current_user_query 是对历史 clarify 的回答，relation_to_history 可为 answer_to_previous；此时 resolved_query 必须补全为可独立路由的完整自然语言请求，不能只输出当前短回答片段。
+25. 若当前输入明确表达 options 之外的新方向，但仍在同一澄清维度内，应按用户新方向归一；若表达新的动作、新对象或新目标，relation_to_history 应为 new_request，不要强行贴合历史 options。
+26. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
+27. 历史 matched 且 code=000 表示普通对话或非工具执行兜底结果，可用于承接推荐、问答、解释等答案型语义，也可承接人物、作品、主题和用法咨询，但不代表云盘资源、业务对象或执行句柄。
+28. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；但可以把历史中的自然语言对象、主题或来源保留在 resolved_query 中，供后续意图识别判断。
+29. 如果 current_user_query 与历史合并后仍无法确定会影响 skill/intent/code 的用户真实意图，输出 status=clarify 并给出问题和可选项。
 """
 
 CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
@@ -168,6 +170,11 @@ CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
 9. 若 resolved_query 包含生成、创作、编辑、处理、配文、识别、翻译、总结、问答等明确主动作，后续路由必须尊重该主动作，不要因历史 skill 类型、对象词或限定条件而改写主动作。
 10. 有没有、是否、有吗、还有吗、有哪些、如何、是什么、介绍下、推荐下、怎么看等是问句形态；若期望结果是语言答案、推荐建议或公共信息，且不是明确要求打开、搜索、管理或执行某个工具，应归为普通对话兜底而不是澄清。
 11. 搜索类 skill 只承接查找、搜索、定位、获取已有资源载体；不能仅因出现电影、图片、歌曲、近期、保存等资源词，就覆盖 current_user_query 中的推荐、问答、生成或处理形态。
+12. 若用户明确表达搜索、查找、打开、入口、工具、功能、执行、生成、处理等业务动作，应优先判断是否存在可承接的 skill；只有没有可执行 skill 时才归为普通对话。
+13. 缺少主体、主题、关键词、联系人、文件句柄或唯一资源选择时，只有这些信息会改变 skill/intent/code 才可澄清；若只影响业务执行或参数完整性，不应阻塞意图调度。
+14. 同一 skill 内多个搜索类 intent 都可满足且当前系统只能输出单 intent 时，不要因为多资源类型直接澄清；按可执行单 intent 输出最贴近的一个，优先级为图片、文档、视频/影视、音频、文件夹、笔记、综合、圈子。
+15. 对纯实体名、作品名、人物名或泛资源名，不要用外部常识强行推断资源类型；除非 query 或历史明确限定图片/文档/视频/音频等类型，否则优先使用综合或历史最近兼容类型。
+16. intent_only=true 时，本轮只评估 skill/intent/code 调度效果；缺失或不完整的实体参数不得导致 clarify 或 param_mismatch，除非缺失信息会改变 skill/intent/code。
 """
 
 EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
@@ -175,6 +182,7 @@ EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
 2. 只有参数违反 schema、过度补全、误拆/漏拆关键词、错误继承历史语义或伪造执行载体时，才 reject 且 reject_scope=param_mismatch。
 3. 对总结、润色、翻译、配文、识别、编辑、生成等处理型意图，resolved_query 中的自然语言对象来源可作为语义参数来源；不要因为缺 file_id、image_id、真实文件名或唯一资源选择而 clarify。
 4. 若候选结果满足的是历史搜索动作，但 current_user_query 明确表达推荐、问答、生成、创作、编辑、处理或总结等非搜索形态，应按错误层级 reject；不要接受被历史污染成搜索的结果。
+5. intent_only=true 时，只要 skill/intent/code 正确且 params 没有伪造执行句柄或违反 schema，不要因为主体、关键词、联系人、文件句柄、图片句柄或唯一资源选择缺失而 reject 或 clarify；这类问题不影响意图 code 评测。
 """
 
 LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的澄清问题生成节点。
@@ -205,9 +213,11 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 7. status=route 时只能返回一个 skill_id，必须是当前最优匹配 skill。
 8. 若没有任何 skill 支持用户需求，输出 no_match，不要用 clarify 兜底。
 9. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
-10. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
-11. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
-12. 遵守以下上下文语义使用规则。
+10. 若用户明确查找某个移动云盘功能、AI工具或入口，应优先选择对应功能/工具 skill；不要仅因“推荐一下/有没有/如何使用”就直接归普通对话。
+11. 若用户明确询问云盘中是否有某类资源，或要求把资源找出来，应按资源搜索理解，不要当作纯语言问答。
+12. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
+13. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
+14. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
 """
 
@@ -226,7 +236,9 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图�
 9. 若 rejected_intents 中已有被拒绝的 intent，除非用户澄清明确要求它，否则不要重复选择。
 10. 若该 skill 不支持用户请求，输出 no_match。
 11. 明确不具备的能力不要用 clarify 兜底。
-12. 遵守以下上下文语义使用规则。
+12. 若多个搜索类 intent 都可满足同一资源检索请求且当前只能输出单 intent，按对象类型优先级选择最贴近的一个，不要仅因同时出现多种资源类型而澄清。
+13. intent_only=true 时，缺少主体、主题、关键词、联系人、文件句柄或图片句柄不应导致 clarify；在 code 可确定时输出 matched，params 可为空或只填确定字段。
+14. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
 """
 
@@ -313,6 +325,8 @@ def build_router_prompt(
     rejected: list[str],
     contextualized_request: ContextualizedRequest | None = None,
     current_user_query: str | None = None,
+    *,
+    intent_only: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -321,6 +335,7 @@ def build_router_prompt(
             "contextualized_request": _contextualized_request_payload(
                 contextualized_request,
             ),
+            "intent_only": intent_only,
             "available_skills": [card.model_dump() for card in cards],
             "current_loop_rejected_skill_ids": rejected,
         },
@@ -335,6 +350,8 @@ def build_intent_prompt(
     param_rejections: list[dict] | None = None,
     contextualized_request: ContextualizedRequest | None = None,
     current_user_query: str | None = None,
+    *,
+    intent_only: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -343,6 +360,7 @@ def build_intent_prompt(
             "contextualized_request": _contextualized_request_payload(
                 contextualized_request,
             ),
+            "intent_only": intent_only,
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "rejected_intents": rejected_intents or [],
@@ -360,6 +378,8 @@ def build_param_repair_prompt(
     param_rejections: list[dict] | None = None,
     contextualized_request: ContextualizedRequest | None = None,
     current_user_query: str | None = None,
+    *,
+    intent_only: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -368,6 +388,7 @@ def build_param_repair_prompt(
             "contextualized_request": _contextualized_request_payload(
                 contextualized_request,
             ),
+            "intent_only": intent_only,
             "skill_id": skill.id,
             "skill_markdown": skill.raw_markdown,
             "locked_intent": locked_intent,
@@ -386,6 +407,8 @@ def build_evaluator_prompt(
     candidate: dict,
     contextualized_request: ContextualizedRequest | None = None,
     current_user_query: str | None = None,
+    *,
+    intent_only: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -394,6 +417,7 @@ def build_evaluator_prompt(
             "contextualized_request": _contextualized_request_payload(
                 contextualized_request,
             ),
+            "intent_only": intent_only,
             "available_skills": [card.model_dump() for card in available_skills],
             "skill": {
                 "id": skill.id,

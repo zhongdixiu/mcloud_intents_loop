@@ -628,6 +628,61 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
     ]
 
 
+async def test_intent_only_accepts_evaluator_param_mismatch() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜音频",
+                code="015",
+                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="param_mismatch",
+                skill_check="pass",
+                intent_check="pass",
+                params_check="fail",
+                confidence=0.4,
+                reason="只影响参数完整性",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    trace: list[dict] = []
+
+    result = await router.route("帮我找周杰伦的歌", trace=trace)
+
+    assert result.status == "matched"
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.intent == "搜音频"
+    assert result.code == "015"
+    assert result.loop_count == 1
+    assert result.correction_scopes == ["param_mismatch"]
+    assert any(
+        event["event"] == "intent_only_accept_param_mismatch"
+        for event in trace
+    )
+    assert len(model.calls) == 3
+    router_prompt = json.loads(model.calls[0][1])
+    intent_prompt = json.loads(model.calls[1][1])
+    evaluator_prompt = json.loads(model.calls[2][1])
+    assert router_prompt["intent_only"] is True
+    assert intent_prompt["intent_only"] is True
+    assert evaluator_prompt["intent_only"] is True
+
+
 async def test_max_attempts_reject_returns_guided_clarify() -> None:
     model = FakeStructuredClient(
         [

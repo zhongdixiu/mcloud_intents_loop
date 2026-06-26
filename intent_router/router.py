@@ -47,6 +47,7 @@ class IntentRouter:
         *,
         max_attempts: int = 3,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
+        intent_only: bool = False,
     ) -> None:
         self.registry = registry
         self.model_client = model_client or AgentScopeStructuredClient.from_env()
@@ -61,6 +62,7 @@ class IntentRouter:
         )
         self.max_attempts = max_attempts
         self.dialogue_history_limit = dialogue_history_limit
+        self.intent_only = intent_only
 
     @classmethod
     def from_config(
@@ -71,6 +73,7 @@ class IntentRouter:
         *,
         max_attempts: int = 3,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
+        intent_only: bool = False,
     ) -> "IntentRouter":
         return cls(
             SkillRegistry.from_path(skills_path),
@@ -78,6 +81,7 @@ class IntentRouter:
             evaluator_client=evaluator_client,
             max_attempts=max_attempts,
             dialogue_history_limit=dialogue_history_limit,
+            intent_only=intent_only,
         )
 
     async def route(
@@ -482,6 +486,27 @@ class IntentRouter:
             reason=evaluation.reason,
             next_retry_scope=state.get("retry_scope"),
         )
+        if self.intent_only and evaluation.reject_scope == "param_mismatch":
+            _trace(
+                trace,
+                "intent_only_accept_param_mismatch",
+                attempt=attempt,
+                skill_id=skill_id,
+                intent=validated.intent,
+                code=validated.code,
+                reason=evaluation.reason,
+            )
+            return RouteResult(
+                status="matched",
+                skill=SkillRef(id=skill_id, name=skill_name),
+                intent=validated.intent,
+                code=validated.code,
+                params=validated.params,
+                confidence=min(route_confidence, validated.confidence),
+                visited_skills=state.get("visited_skills", []),
+                resolved_query=state.get("resolved_query"),
+                context_relation=state.get("context_relation"),
+            )
         if evaluation.reject_scope == "intent_mismatch":
             _record_intent_rejection(
                 state,
@@ -556,6 +581,7 @@ class IntentRouter:
             rejected,
             contextualized_request,
             current_user_query,
+            intent_only=self.intent_only,
         )
         if context:
             prompt = json.dumps(
@@ -587,6 +613,7 @@ class IntentRouter:
                 param_rejections,
                 contextualized_request,
                 current_user_query,
+                intent_only=self.intent_only,
             ),
             response_model=IntentDecision,
         )
@@ -612,6 +639,7 @@ class IntentRouter:
                 param_rejections,
                 contextualized_request,
                 current_user_query,
+                intent_only=self.intent_only,
             ),
             response_model=IntentDecision,
         )
@@ -635,6 +663,7 @@ class IntentRouter:
                 decision.model_dump(),
                 contextualized_request=contextualized_request,
                 current_user_query=current_user_query,
+                intent_only=self.intent_only,
             ),
             response_model=EvaluationDecision,
         )
