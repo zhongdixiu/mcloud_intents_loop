@@ -43,6 +43,16 @@ class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+ClarifyScope = Literal[
+    "route_boundary",
+    "intent_code_boundary",
+    "context_boundary",
+    "missing_entity",
+    "execution_handle_missing",
+    "same_code_intent_boundary",
+]
+
+
 class SkillRouteDecision(StrictOutputModel):
     status: Literal["route", "clarify", "no_match"]
     skill_id: str | None = None
@@ -50,6 +60,17 @@ class SkillRouteDecision(StrictOutputModel):
     reason: str = ""
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
+
+
+class SkillRouteDecisionNoClarify(StrictOutputModel):
+    status: Literal["route", "no_match"]
+    skill_id: str | None = None
+    confidence: float = 0.0
+    reason: str = ""
+    question: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
 
 
 class IntentDecision(StrictOutputModel):
@@ -61,6 +82,19 @@ class IntentDecision(StrictOutputModel):
     reason: str = ""
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
+
+
+class IntentDecisionNoClarify(StrictOutputModel):
+    status: Literal["matched", "no_match"]
+    intent: str | None = None
+    code: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 0.0
+    reason: str = ""
+    question: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
 
 
 class EvaluationDecision(StrictOutputModel):
@@ -76,6 +110,27 @@ class EvaluationDecision(StrictOutputModel):
     clarity_reason: str | None = None
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
+    preferred_intent: str | None = None
+    preferred_code: str | None = None
+
+
+class EvaluationDecisionNoClarify(StrictOutputModel):
+    verdict: Literal["accept", "reject"]
+    reject_scope: (
+        Literal["skill_mismatch", "intent_mismatch", "param_mismatch"] | None
+    ) = None
+    skill_check: Literal["pass", "fail", "unclear"] | None = None
+    intent_check: Literal["pass", "fail", "unclear"] | None = None
+    params_check: Literal["pass", "fail", "unclear"] | None = None
+    confidence: float = 0.0
+    reason: str = ""
+    clarity_reason: str | None = None
+    question: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
+    preferred_intent: str | None = None
+    preferred_code: str | None = None
 
 
 class ContextualizedRequest(StrictOutputModel):
@@ -92,6 +147,7 @@ class ContextualizedRequest(StrictOutputModel):
     reason: str = ""
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -120,6 +176,23 @@ class ContextualizedRequest(StrictOutputModel):
         else:
             normalized["status"] = "resolved"
         return normalized
+
+
+class ContextualizedRequestNoClarify(StrictOutputModel):
+    status: Literal["resolved"]
+    resolved_query: str | None = None
+    relation_to_history: Literal[
+        "new_request",
+        "continuation",
+        "revision",
+        "answer_to_previous",
+        "ambiguous",
+    ] = "new_request"
+    used_history_turns: list[int] = Field(default_factory=list)
+    reason: str = ""
+    question: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+    clarify_scope: ClarifyScope | None = None
 
 
 class LoopExhaustedClarification(StrictOutputModel):

@@ -126,6 +126,7 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 - relation_to_history 只能是 new_request、continuation、revision、answer_to_previous 或 ambiguous，表示当前输入与历史的语义关系。
 - 新请求必须输出 status=resolved 且 relation_to_history=new_request，禁止把 status 写成 new_request。
 - 只有需要向用户追问时才输出 status=clarify；此时 relation_to_history 可为 ambiguous 或其他最贴近的历史关系。
+- status=clarify 时必须填写 clarify_scope；只有 context_boundary 表示历史关系不清且会改变后续 skill/code。
 必须遵守：
 1. 不输出 skill_id、intent、code 或 params，只输出用户本轮真实想表达的完整自然语言请求。
 2. current_user_query 是最高优先级事实，但不要孤立理解；dialogue_history 只用于理解省略、延续、修正、改口、指代和对历史问题的回应。
@@ -155,7 +156,8 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
 26. 历史 matched assistant_result 是历史意图决策语义，不是业务执行结果，不代表真实图片、文件、邮件、文档或内容句柄已经存在。
 27. 历史 matched 且 code=000 表示普通对话或非工具执行兜底结果，可用于承接推荐、问答、解释等答案型语义，也可承接人物、作品、主题和用法咨询，但不代表云盘资源、业务对象或执行句柄。
 28. 不要伪造 image/content/file/audio/video/mail_id/file_id 等执行载体参数；但可以把历史中的自然语言对象、主题或来源保留在 resolved_query 中，供后续意图识别判断。
-29. 如果 current_user_query 与历史合并后仍无法确定会影响 skill/intent/code 的用户真实意图，输出 status=clarify 并给出问题和可选项。
+29. 如果 current_user_query 与历史合并后仍无法确定会影响 skill/intent/code 的用户真实意图，输出 status=clarify、clarify_scope=context_boundary 并给出问题和可选项。
+30. 若只是缺主体、主题、关键词、联系人、时间、文件名或真实资源句柄，但不会改变 skill/code，必须输出 status=resolved，不要澄清。
 """
 
 CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
@@ -175,6 +177,8 @@ CONTEXTUALIZED_REQUEST_RULES = """上下文语义使用规则：
 14. 同一 skill 内多个搜索类 intent 都可满足且当前系统只能输出单 intent 时，不要因为多资源类型直接澄清；按可执行单 intent 输出最贴近的一个，优先级为图片、文档、视频/影视、音频、文件夹、笔记、综合、圈子。
 15. 对纯实体名、作品名、人物名或泛资源名，不要用外部常识强行推断资源类型；除非 query 或历史明确限定图片/文档/视频/音频等类型，否则优先使用综合或历史最近兼容类型。
 16. intent_only=true 时，本轮只评估 skill/intent/code 调度效果；缺失或不完整的实体参数不得导致 clarify 或 param_mismatch，除非缺失信息会改变 skill/intent/code。
+17. clarify_scope 取值含义：route_boundary 表示补充后会改变 skill；intent_code_boundary 表示补充后会改变 code；context_boundary 表示历史承接关系不清且会改变 skill/code；missing_entity、execution_handle_missing、same_code_intent_boundary 都不是 intent_only 下可接受的澄清理由。
+18. intent_only=true 时，只有 route_boundary、intent_code_boundary、context_boundary 可以输出 clarify；missing_entity、execution_handle_missing、same_code_intent_boundary 必须改为最可能的 matched/route/resolved 结果。
 """
 
 EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
@@ -183,6 +187,8 @@ EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
 3. 对总结、润色、翻译、配文、识别、编辑、生成等处理型意图，resolved_query 中的自然语言对象来源可作为语义参数来源；不要因为缺 file_id、image_id、真实文件名或唯一资源选择而 clarify。
 4. 若候选结果满足的是历史搜索动作，但 current_user_query 明确表达推荐、问答、生成、创作、编辑、处理或总结等非搜索形态，应按错误层级 reject；不要接受被历史污染成搜索的结果。
 5. intent_only=true 时，只要 skill/intent/code 正确且 params 没有伪造执行句柄或违反 schema，不要因为主体、关键词、联系人、文件句柄、图片句柄或唯一资源选择缺失而 reject 或 clarify；这类问题不影响意图 code 评测。
+6. verdict=clarify 时必须填写 clarify_scope；intent_only=true 时仅当缺失信息会改变 skill 或 code 才可 clarify。
+7. 若判定 candidate 的 intent 名称不是最佳，但最佳 intent 与 candidate 的 code 相同，应填写 preferred_intent/preferred_code；intent_only=true 时不要因此 reject。
 """
 
 LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的澄清问题生成节点。
@@ -219,6 +225,7 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 13. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
 14. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
+15. status=clarify 时必须填写 clarify_scope；只有用户补充会改变一级 skill 时使用 route_boundary。
 """
 
 INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图选择节点。
@@ -240,6 +247,8 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图�
 13. intent_only=true 时，缺少主体、主题、关键词、联系人、文件句柄或图片句柄不应导致 clarify；在 code 可确定时输出 matched，params 可为空或只填确定字段。
 14. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
+15. status=clarify 时必须填写 clarify_scope；只有用户补充会改变最终 code 时使用 intent_code_boundary。
+16. 同一 skill 内多个 intent 名称不同但 code 相同，属于 same_code_intent_boundary；intent_only=true 时必须选择其中一个最贴近 intent 输出 matched，不要澄清。
 """
 
 PARAM_REPAIR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的参数修正节点。

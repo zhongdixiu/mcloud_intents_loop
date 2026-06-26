@@ -5,11 +5,13 @@ from intent_router.model_client import FakeStructuredClient
 from intent_router.router import IntentRouter
 from intent_router.types import (
     ContextualizedRequest,
+    ContextualizedRequestNoClarify,
     DialogueHistory,
     DialogueRouteSummary,
     DialogueTurn,
     EvaluationDecision,
     IntentDecision,
+    IntentDecisionNoClarify,
     LoopExhaustedClarification,
     SkillRouteDecision,
 )
@@ -681,6 +683,229 @@ async def test_intent_only_accepts_evaluator_param_mismatch() -> None:
     assert router_prompt["intent_only"] is True
     assert intent_prompt["intent_only"] is True
     assert evaluator_prompt["intent_only"] is True
+
+
+async def test_intent_only_retries_intent_clarify_for_missing_entity() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="clarify",
+                question="请问您想搜索什么文档？",
+                clarify_scope="missing_entity",
+            ),
+            {
+                "status": "matched",
+                "intent": "搜文档",
+                "code": "013",
+                "params": {},
+                "confidence": 0.8,
+            },
+            EvaluationDecision(verdict="accept", confidence=0.7),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    trace: list[dict] = []
+
+    result = await router.route("找相关文档", trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "搜文档"
+    assert result.code == "013"
+    assert any(
+        event["event"] == "clarify_suppressed"
+        and event["stage"] == "intent"
+        and event["clarify_scope"] == "missing_entity"
+        for event in trace
+    )
+    assert model.calls[2][2] is IntentDecisionNoClarify
+    retry_prompt = json.loads(model.calls[2][1])
+    assert retry_prompt["clarify_policy"]["mode"] == "no_clarify_retry"
+
+
+async def test_intent_only_retries_contextualizer_clarify_for_missing_entity() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="clarify",
+                question="请问您想总结什么内容？",
+                clarify_scope="missing_entity",
+            ),
+            {
+                "status": "resolved",
+                "resolved_query": "总结概括上一轮文档",
+                "relation_to_history": "continuation",
+                "used_history_turns": [0],
+            },
+            SkillRouteDecision(
+                status="route",
+                skill_id="work_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="总结概括",
+                code="036011",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.7),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜索AI助手的测评报告文档",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    resolved_query="搜索AI助手的测评报告文档",
+                ),
+            ),
+        ],
+    )
+    trace: list[dict] = []
+
+    result = await router.route("总结概括", dialogue_history=history, trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "总结概括"
+    assert result.resolved_query == "总结概括上一轮文档"
+    assert any(
+        event["event"] == "clarify_suppressed"
+        and event["stage"] == "contextualizer"
+        for event in trace
+    )
+    assert model.calls[1][2] is ContextualizedRequestNoClarify
+
+
+async def test_intent_only_keeps_true_route_boundary_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="clarify",
+                question="您是想搜索已有图片，还是生成新图片？",
+                clarify_scope="route_boundary",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    trace: list[dict] = []
+
+    result = await router.route("图片", trace=trace)
+
+    assert result.status == "clarify"
+    assert result.question == "您是想搜索已有图片，还是生成新图片？"
+    assert not any(event["event"] == "clarify_suppressed" for event in trace)
+    assert len(model.calls) == 1
+
+
+async def test_intent_only_accepts_evaluator_non_boundary_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="image_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="文生图",
+                code="002",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="clarify",
+                question="请问您想生成谁的照片？",
+                clarify_scope="missing_entity",
+                confidence=0.6,
+            ),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    trace: list[dict] = []
+
+    result = await router.route("帮我AI生成几张他们的照片", trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "文生图"
+    assert result.code == "002"
+    assert any(
+        event["event"] == "evaluation_no_clarify_accept"
+        for event in trace
+    )
+
+
+async def test_intent_only_accepts_same_code_intent_mismatch() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜文档",
+                code="013",
+                params={"metadataList": ["四大名著"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="intent_mismatch",
+                skill_check="pass",
+                intent_check="fail",
+                params_check="unclear",
+                preferred_intent="搜书籍",
+                preferred_code="013",
+                confidence=0.6,
+                reason="搜书籍更专用，但 code 相同",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    trace: list[dict] = []
+
+    result = await router.route("找四大名著的文档", trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "搜文档"
+    assert result.code == "013"
+    assert result.correction_scopes == []
+    assert any(
+        event["event"] == "intent_only_accept_same_code_intent_mismatch"
+        for event in trace
+    )
 
 
 async def test_max_attempts_reject_returns_guided_clarify() -> None:
