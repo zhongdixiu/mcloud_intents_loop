@@ -1,7 +1,13 @@
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from intent_router.skills import SkillRegistry
-from intent_router.types import EvaluationDecision, IntentDecision
+from intent_router.types import (
+    ContextualizedRequest,
+    EvaluationDecision,
+    IntentDecision,
+    SkillRouteDecision,
+)
 from intent_router.validation import (
     ValidationError,
     validate_evaluation_decision,
@@ -95,3 +101,54 @@ def test_validate_evaluation_accepts_layered_param_mismatch() -> None:
     )
 
     assert validate_evaluation_decision(decision) is decision
+
+
+def test_contextualized_request_normalizes_status_relation_mixup() -> None:
+    request = ContextualizedRequest.model_validate(
+        {
+            "status": "new_request",
+            "resolved_query": "项目进展如何",
+        },
+    )
+
+    assert request.status == "resolved"
+    assert request.relation_to_history == "new_request"
+    assert request.resolved_query == "项目进展如何"
+
+
+def test_contextualized_request_normalizes_continuation_status() -> None:
+    request = ContextualizedRequest.model_validate(
+        {
+            "status": "continuation",
+            "resolved_query": "搜索AI助手测评报告PPT",
+        },
+    )
+
+    assert request.status == "resolved"
+    assert request.relation_to_history == "continuation"
+
+
+def test_contextualized_request_normalizes_ambiguous_status_to_clarify() -> None:
+    request = ContextualizedRequest.model_validate(
+        {
+            "status": "ambiguous",
+            "resolved_query": "蓝色",
+            "question": "您是要搜索蓝色图片还是蓝色文档？",
+            "options": [{"label": "图片", "value": "图片"}],
+        },
+    )
+
+    assert request.status == "clarify"
+    assert request.relation_to_history == "ambiguous"
+    assert request.question == "您是要搜索蓝色图片还是蓝色文档？"
+
+
+def test_structured_output_models_reject_unknown_fields() -> None:
+    with pytest.raises(PydanticValidationError):
+        SkillRouteDecision.model_validate(
+            {
+                "status": "route",
+                "skill_id": "mcloud_search_skill",
+                "unexpected": "extra",
+            },
+        )

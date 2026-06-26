@@ -468,9 +468,21 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
     assert len(contextualizer_prompt["dialogue_history"]) == 5
     assert contextualizer_prompt["dialogue_history"][0]["user_query"] == "历史第1轮"
     assert contextualizer_prompt["dialogue_history"][-1]["user_query"] == "历史第5轮"
+    assert contextualizer_prompt["dialogue_history"][0]["turn_index"] == 0
+    assert contextualizer_prompt["dialogue_history"][0]["semantic_state"] == {
+        "status": "matched",
+        "resolved_query": "历史第1轮",
+        "relation_to_previous": None,
+    }
     assert (
         contextualizer_prompt["dialogue_history"][0]["assistant_result"]["status"]
         == "matched"
+    )
+    assert "resolved_query" not in (
+        contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    )
+    assert "context_relation" not in (
+        contextualizer_prompt["dialogue_history"][0]["assistant_result"]
     )
     assert "metadata" not in contextualizer_prompt["dialogue_history"][0]
     assert "agent_result" not in contextualizer_prompt["dialogue_history"][0]
@@ -856,10 +868,11 @@ async def test_router_prompt_separates_answer_targets_from_resource_targets() ->
     assert result.code == "000"
 
     system_prompt = model.calls[0][0]
-    assert "主动作、目标对象和期望结果形态" in system_prompt
+    assert "主动作、问句形态、目标对象和期望结果形态" in system_prompt
     assert "语言答案或信息服务" in system_prompt
     assert "推荐建议" in system_prompt
     assert "由系统映射为普通对话 code=000" in system_prompt
+    assert "不能仅因出现电影、图片、歌曲、近期、保存等资源词" in system_prompt
 
 
 async def test_router_routes_resource_target_search_to_mcloud_search() -> None:
@@ -939,7 +952,13 @@ async def test_dialogue_agent_injects_000_as_non_tool_history() -> None:
     assert second.intent == "搜图片"
 
     contextualizer_prompt = json.loads(model.calls[1][1])
-    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    history_payload = contextualizer_prompt["dialogue_history"][0]
+    assert history_payload["semantic_state"] == {
+        "status": "matched",
+        "resolved_query": "你好",
+        "relation_to_previous": "new_request",
+    }
+    assistant_result = history_payload["assistant_result"]
     assert assistant_result["status"] == "matched"
     assert assistant_result["skill_id"] is None
     assert assistant_result["intent"] == "普通对话"
@@ -1000,6 +1019,11 @@ async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
     assert second_context_prompt["dialogue_history"][0]["assistant_result"]["question"] == (
         "你想搜索资源还是打开入口？"
     )
+    assert second_context_prompt["dialogue_history"][0]["semantic_state"] == {
+        "status": "clarify",
+        "resolved_query": "帮我找一下",
+        "relation_to_previous": "new_request",
+    }
     second_router_prompt = json.loads(model.calls[2][1])
     assert second_router_prompt["resolved_query"] == "打开文件入口"
 
@@ -1061,6 +1085,11 @@ async def test_dialogue_agent_uses_matched_history_for_followup_image_caption() 
     assert second_context_prompt["dialogue_history"][0]["user_query"] == (
         "帮我找蓝色天空的图片"
     )
+    assert second_context_prompt["dialogue_history"][0]["semantic_state"] == {
+        "status": "matched",
+        "resolved_query": "帮我找蓝色天空的图片",
+        "relation_to_previous": "new_request",
+    }
     assert second_context_prompt["dialogue_history"][0]["assistant_result"]["intent"] == (
         "搜图片"
     )
@@ -1113,10 +1142,103 @@ async def test_dialogue_agent_continues_ordinary_recommendation_context() -> Non
     assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
     assert assistant_result["status"] == "matched"
     assert assistant_result["code"] == "000"
-    assert "任务框架" in contextualizer_system_prompt
-    assert "继承历史主动作和核心主体" in contextualizer_system_prompt
+    assert "本轮语义框架" in contextualizer_system_prompt
+    assert "有没有、是否、有吗、还有吗" in contextualizer_system_prompt
+    assert "问句形态或答案型表达，不是搜索" in contextualizer_system_prompt
+    assert "普通推荐/问答历史继续保持答案型请求" in (
+        contextualizer_system_prompt
+    )
     assert "code=000" in contextualizer_system_prompt
     assert "可用于承接推荐、问答、解释等答案型语义" in contextualizer_system_prompt
+
+
+async def test_dialogue_agent_continues_usage_question_as_ordinary_dialogue() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="no_match",
+                reason="智能体主题咨询属于普通对话",
+            ),
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="如何使用灵犀智能体",
+                relation_to_history="continuation",
+                used_history_turns=[0],
+                reason="当前问法缺少主题，继承上一轮答案型主题",
+            ),
+            SkillRouteDecision(
+                status="no_match",
+                reason="功能用法咨询属于普通对话",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    agent = IntentDialogueAgent(router)
+
+    first = await agent.send("灵犀智能体")
+    second = await agent.send("如何使用")
+
+    assert first.status == "matched"
+    assert first.intent == "普通对话"
+    assert second.status == "matched"
+    assert second.skill is None
+    assert second.intent == "普通对话"
+    assert second.code == "000"
+    assert second.resolved_query == "如何使用灵犀智能体"
+
+    contextualizer_system_prompt = model.calls[1][0]
+    router_system_prompt = model.calls[2][0]
+    assert "如何、怎么用、是什么" in contextualizer_system_prompt
+    assert "问句形态或答案型表达" in contextualizer_system_prompt
+    assert "功能用法咨询" in router_system_prompt
+    assert "不等同于打开入口" in router_system_prompt
+
+
+async def test_router_tolerates_contextualizer_status_relation_mixup() -> None:
+    model = FakeStructuredClient(
+        [
+            {
+                "status": "new_request",
+                "resolved_query": "项目进展如何",
+                "reason": "当前输入是独立的新问答请求",
+            },
+            SkillRouteDecision(
+                status="no_match",
+                reason="项目进展问答属于普通对话",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜索AI助手的测评报告文档",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    params={"metadataList": ["AI助手", "测评报告"]},
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("项目进展如何", dialogue_history=history)
+
+    assert result.status == "matched"
+    assert result.skill is None
+    assert result.intent == "普通对话"
+    assert result.code == "000"
+    assert result.resolved_query == "项目进展如何"
+    assert result.context_relation == "new_request"
+
+    contextualizer_system_prompt = model.calls[0][0]
+    router_prompt = json.loads(model.calls[1][1])
+    assert "status 只能是 resolved 或 clarify" in contextualizer_system_prompt
+    assert "禁止把 status 写成 new_request" in contextualizer_system_prompt
+    assert router_prompt["resolved_query"] == "项目进展如何"
 
 
 async def test_dialogue_agent_switches_from_search_history_to_image_generation() -> None:
@@ -1178,8 +1300,14 @@ async def test_dialogue_agent_switches_from_search_history_to_image_generation()
     contextualizer_system_prompt = model.calls[3][0]
     assert "当前动作优先" in contextualizer_system_prompt
     assert "不应归一为历史主动作" in contextualizer_system_prompt
+    assert "历史只补全主体、对象类型、限定条件或素材来源" in (
+        contextualizer_system_prompt
+    )
     router_system_prompt = model.calls[4][0]
     assert "主动作是生成、创作、编辑、处理、配文、识别、翻译、鉴伪、修复、总结或问答" in router_system_prompt
+    assert "同时用 current_user_query 校验本轮显式动作是否被上下文改写" in (
+        router_system_prompt
+    )
     second_router_prompt = json.loads(model.calls[4][1])
     assert second_router_prompt["resolved_query"] == (
         "生成一些近期的谢娜图片，素材来源是之前保存的图片"
@@ -1187,6 +1315,78 @@ async def test_dialogue_agent_switches_from_search_history_to_image_generation()
     image_intent_prompt = json.loads(model.calls[5][1])
     assert "历史指代、素材来源、时间范围" in image_intent_prompt["skill_markdown"]
     assert "输出\"文生图\"工具" in image_intent_prompt["skill_markdown"]
+
+
+async def test_processing_intent_does_not_require_business_resource_handle() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="总结概括金科公司的PPTX格式文档",
+                relation_to_history="continuation",
+                used_history_turns=[0, 1],
+                reason="当前处理动作继承历史搜索到的文档主题和格式限定",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="work_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="总结概括",
+                code="036011",
+                params={"content": "金科公司的PPTX格式文档"},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="找找金科公司的相关文档",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    params={"metadataList": ["金科公司"]},
+                ),
+            ),
+            DialogueTurn(
+                user_query="只要PPTX格式那个",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    params={
+                        "metadataList": ["金科公司"],
+                        "suffixList": ["PPTX"],
+                    },
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("总结概括", dialogue_history=history)
+
+    assert result.status == "matched"
+    assert result.skill is not None
+    assert result.skill.id == "work_skill"
+    assert result.intent == "总结概括"
+    assert result.code == "036011"
+    assert result.params == {"content": "金科公司的PPTX格式文档"}
+
+    intent_system_prompt = model.calls[2][0]
+    evaluator_system_prompt = model.calls[3][0]
+    assert "自然语言处理对象、主题或来源" in intent_system_prompt
+    assert "不验证外层业务是否已返回真实文件" in evaluator_system_prompt
+    assert "缺 file_id、image_id、真实文件名或唯一资源选择" in evaluator_system_prompt
 
 
 async def test_dialogue_agent_keeps_search_refinement_when_action_is_still_search() -> None:
@@ -1283,6 +1483,77 @@ async def test_dialogue_agent_current_search_action_overrides_ordinary_history()
     assert second.skill.id == "mcloud_search_skill"
     assert second.intent == "搜影视"
     assert second.resolved_query == "搜索刘德华的电影资源"
+
+
+async def test_contextualizer_prefers_recent_effective_semantic_target() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="resolved",
+                resolved_query="搜索周星驰相关的圈子",
+                relation_to_history="revision",
+                used_history_turns=[0, 1],
+                reason="最近轮次已把对象类型切换为圈子，当前只替换主体",
+            ),
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜索圈子",
+                code="023",
+                params={"metadataList": ["周星驰"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜索命名为刘德华的文件夹",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文件夹",
+                    code="016",
+                    params={"metadataList": ["刘德华"]},
+                ),
+            ),
+            DialogueTurn(
+                user_query="再找下相关的圈子",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜索圈子",
+                    code="023",
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("不要他的了要周星驰的", dialogue_history=history)
+
+    assert result.status == "matched"
+    assert result.intent == "搜索圈子"
+    assert result.code == "023"
+    assert result.resolved_query == "搜索周星驰相关的圈子"
+
+    contextualizer_system_prompt = model.calls[0][0]
+    contextualizer_prompt = json.loads(model.calls[0][1])
+    assert "最近有效语义目标" in contextualizer_system_prompt
+    assert "更早已被覆盖的对象类型" in contextualizer_system_prompt
+    assert contextualizer_prompt["dialogue_history"][-1]["user_query"] == (
+        "再找下相关的圈子"
+    )
+    assert contextualizer_prompt["dialogue_history"][-1]["assistant_result"]["code"] == (
+        "023"
+    )
 
 
 async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> None:
@@ -1410,6 +1681,7 @@ async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> Non
 
     third_context_prompt = json.loads(model.calls[4][1])
     clarify_result = third_context_prompt["dialogue_history"][-1]["assistant_result"]
+    clarify_state = third_context_prompt["dialogue_history"][-1]["semantic_state"]
     assert clarify_result["status"] == "clarify"
     assert clarify_result["question"] == (
         "“蓝色”是指搜索蓝色的图片，还是蓝色的合同文件？"
@@ -1418,8 +1690,10 @@ async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> Non
         {"label": "搜蓝色的图片", "value": "搜蓝色的图片"},
         {"label": "搜蓝色的合同文件", "value": "搜蓝色的合同文件"},
     ]
-    assert clarify_result["resolved_query"] == "蓝色"
-    assert clarify_result["context_relation"] == "ambiguous"
+    assert "resolved_query" not in clarify_result
+    assert "context_relation" not in clarify_result
+    assert clarify_state["resolved_query"] == "蓝色"
+    assert clarify_state["relation_to_previous"] == "ambiguous"
 
     third_router_prompt = json.loads(model.calls[5][1])
     assert third_router_prompt["resolved_query"] == "搜蓝色的图片"
@@ -1472,7 +1746,7 @@ async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
     assert contextualizer_prompt["current_user_query"] == "搜蓝色"
     assert assistant_result["params"] == {"metadataList": ["合同", "文件"]}
     assert "判别性主体" in system_prompt
-    assert "主动作、目标类型、核心主体、对象类型、限定条件、输入来源" in system_prompt
+    assert "业务主动作、问句形态、期望结果、核心主体、对象类型、限定条件、输入来源" in system_prompt
     assert "新请求、替换历史主体、切换主动作、或在历史主体上追加限定条件" in system_prompt
     assert "不是封闭枚举" in system_prompt
     assert "answer_to_previous" in system_prompt
@@ -1513,8 +1787,14 @@ async def test_dialogue_history_does_not_inject_no_match_reason() -> None:
     assert result.intent == "普通对话"
     assert result.code == "000"
     contextualizer_prompt = json.loads(model.calls[0][1])
-    assistant_result = contextualizer_prompt["dialogue_history"][0]["assistant_result"]
+    history_payload = contextualizer_prompt["dialogue_history"][0]
+    assistant_result = history_payload["assistant_result"]
     assert assistant_result == {"status": "no_match"}
+    assert history_payload["semantic_state"] == {
+        "status": "no_match",
+        "resolved_query": "蓝图片",
+        "relation_to_previous": None,
+    }
     assert "rejected_skill_ids" not in model.calls[0][1]
 
 

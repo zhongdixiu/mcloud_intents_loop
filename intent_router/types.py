@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ParamSchema(BaseModel):
@@ -39,7 +39,11 @@ class SkillCard(BaseModel):
     intents: list[str]
 
 
-class SkillRouteDecision(BaseModel):
+class StrictOutputModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SkillRouteDecision(StrictOutputModel):
     status: Literal["route", "clarify", "no_match"]
     skill_id: str | None = None
     confidence: float = 0.0
@@ -48,7 +52,7 @@ class SkillRouteDecision(BaseModel):
     options: list[dict[str, str]] = Field(default_factory=list)
 
 
-class IntentDecision(BaseModel):
+class IntentDecision(StrictOutputModel):
     status: Literal["matched", "clarify", "no_match"]
     intent: str | None = None
     code: str | None = None
@@ -59,7 +63,7 @@ class IntentDecision(BaseModel):
     options: list[dict[str, str]] = Field(default_factory=list)
 
 
-class EvaluationDecision(BaseModel):
+class EvaluationDecision(StrictOutputModel):
     verdict: Literal["accept", "reject", "clarify"]
     reject_scope: (
         Literal["skill_mismatch", "intent_mismatch", "param_mismatch"] | None
@@ -74,7 +78,7 @@ class EvaluationDecision(BaseModel):
     options: list[dict[str, str]] = Field(default_factory=list)
 
 
-class ContextualizedRequest(BaseModel):
+class ContextualizedRequest(StrictOutputModel):
     status: Literal["resolved", "clarify"]
     resolved_query: str | None = None
     relation_to_history: Literal[
@@ -89,8 +93,36 @@ class ContextualizedRequest(BaseModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_status_relation_mixup(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        status = data.get("status")
+        relation_values = {
+            "new_request",
+            "continuation",
+            "revision",
+            "answer_to_previous",
+            "ambiguous",
+        }
+        if status not in relation_values:
+            return data
 
-class LoopExhaustedClarification(BaseModel):
+        normalized = dict(data)
+        normalized.setdefault("relation_to_history", status)
+        if status == "ambiguous":
+            normalized["status"] = (
+                "clarify"
+                if normalized.get("question") or normalized.get("options")
+                else "resolved"
+            )
+        else:
+            normalized["status"] = "resolved"
+        return normalized
+
+
+class LoopExhaustedClarification(StrictOutputModel):
     question: str
     options: list[dict[str, str]] = Field(default_factory=list)
     reason: str = ""
