@@ -4,7 +4,6 @@ from pydantic import ValidationError as PydanticValidationError
 from intent_router.skills import SkillRegistry
 from intent_router.types import (
     ContextualizedRequest,
-    ContextualizedRequestNoClarify,
     EvaluationDecision,
     IntentDecision,
     IntentDecisionNoClarify,
@@ -46,7 +45,7 @@ def test_validate_rejects_wrong_code() -> None:
         validate_intent_decision(skill, decision)
 
 
-def test_validate_rejects_unknown_param() -> None:
+def test_validate_ignores_unknown_param_for_code_evaluation() -> None:
     registry = SkillRegistry.from_path("skills")
     skill = registry.get("mcloud_search_skill")
     decision = IntentDecision(
@@ -56,11 +55,10 @@ def test_validate_rejects_unknown_param() -> None:
         params={"suffixList": ["jpg"]},
     )
 
-    with pytest.raises(ValidationError):
-        validate_intent_decision(skill, decision)
+    assert validate_intent_decision(skill, decision) is decision
 
 
-def test_validate_rejects_activity_outside_enum() -> None:
+def test_validate_ignores_param_enum_for_code_evaluation() -> None:
     registry = SkillRegistry.from_path("skills")
     skill = registry.get("activity_search_skill")
     decision = IntentDecision(
@@ -70,8 +68,7 @@ def test_validate_rejects_activity_outside_enum() -> None:
         params={"metadataList": ["不存在的活动"]},
     )
 
-    with pytest.raises(ValidationError):
-        validate_intent_decision(skill, decision)
+    assert validate_intent_decision(skill, decision) is decision
 
 
 def test_validate_evaluation_rejects_missing_scope() -> None:
@@ -81,7 +78,7 @@ def test_validate_evaluation_rejects_missing_scope() -> None:
         validate_evaluation_decision(decision)
 
 
-def test_validate_evaluation_rejects_unclear_checks_with_scope() -> None:
+def test_validate_evaluation_accepts_legacy_param_mismatch_shape() -> None:
     decision = EvaluationDecision(
         verdict="reject",
         reject_scope="param_mismatch",
@@ -90,8 +87,7 @@ def test_validate_evaluation_rejects_unclear_checks_with_scope() -> None:
         params_check="fail",
     )
 
-    with pytest.raises(ValidationError):
-        validate_evaluation_decision(decision)
+    assert validate_evaluation_decision(decision) is decision
 
 
 def test_validate_evaluation_accepts_layered_param_mismatch() -> None:
@@ -131,7 +127,7 @@ def test_contextualized_request_normalizes_continuation_status() -> None:
     assert request.relation_to_history == "continuation"
 
 
-def test_contextualized_request_normalizes_ambiguous_status_to_clarify() -> None:
+def test_contextualized_request_normalizes_ambiguous_status_to_resolved() -> None:
     request = ContextualizedRequest.model_validate(
         {
             "status": "ambiguous",
@@ -141,37 +137,25 @@ def test_contextualized_request_normalizes_ambiguous_status_to_clarify() -> None
         },
     )
 
-    assert request.status == "clarify"
+    assert request.status == "resolved"
     assert request.relation_to_history == "ambiguous"
     assert request.question == "您是要搜索蓝色图片还是蓝色文档？"
 
 
-def test_contextualized_request_no_clarify_normalizes_clarify_to_resolved() -> None:
-    request = ContextualizedRequestNoClarify.model_validate(
+def test_contextualized_request_normalizes_clarify_to_resolved() -> None:
+    request = ContextualizedRequest.model_validate(
         {
             "status": "clarify",
-            "resolved_query": "总结概括上一轮文档",
+            "resolved_query": "找相关文档",
             "relation_to_history": "continuation",
-            "question": "请问您想总结什么内容？",
+            "question": "请问您想找什么主题？",
             "clarify_scope": "missing_entity",
         },
     )
 
     assert request.status == "resolved"
     assert request.relation_to_history == "continuation"
-    assert request.resolved_query == "总结概括上一轮文档"
-
-
-def test_contextualized_request_no_clarify_normalizes_relation_status() -> None:
-    request = ContextualizedRequestNoClarify.model_validate(
-        {
-            "status": "continuation",
-            "resolved_query": "搜索AI助手测评报告PPT",
-        },
-    )
-
-    assert request.status == "resolved"
-    assert request.relation_to_history == "continuation"
+    assert request.resolved_query == "找相关文档"
 
 
 def test_no_clarify_route_and_intent_models_normalize_residual_clarify() -> None:

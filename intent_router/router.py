@@ -11,19 +11,16 @@ from .prompts import (
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
-    PARAM_REPAIR_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     build_contextualizer_prompt,
     build_evaluator_prompt,
     build_intent_prompt,
     build_loop_exhausted_clarifier_prompt,
-    build_param_repair_prompt,
     build_router_prompt,
 )
 from .skills import SkillRegistry
 from .types import (
     ContextualizedRequest,
-    ContextualizedRequestNoClarify,
     DialogueHistory,
     EvaluationDecision,
     IntentDecision,
@@ -41,10 +38,10 @@ from .validation import (
 )
 
 
-ALLOWED_INTENT_ONLY_CLARIFY_SCOPES = {
-    "route_boundary",
-    "intent_code_boundary",
-    "context_boundary",
+ALLOWED_CLARIFY_SCOPES_BY_STAGE = {
+    "router": {"route_boundary"},
+    "intent": {"intent_code_boundary"},
+    "evaluator": {"route_boundary", "intent_code_boundary"},
 }
 
 
@@ -57,7 +54,6 @@ class IntentRouter:
         *,
         max_attempts: int = 3,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
-        intent_only: bool = False,
     ) -> None:
         self.registry = registry
         self.model_client = model_client or AgentScopeStructuredClient.from_env()
@@ -72,7 +68,6 @@ class IntentRouter:
         )
         self.max_attempts = max_attempts
         self.dialogue_history_limit = dialogue_history_limit
-        self.intent_only = intent_only
 
     @classmethod
     def from_config(
@@ -83,7 +78,6 @@ class IntentRouter:
         *,
         max_attempts: int = 3,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
-        intent_only: bool = False,
     ) -> "IntentRouter":
         return cls(
             SkillRegistry.from_path(skills_path),
@@ -91,7 +85,6 @@ class IntentRouter:
             evaluator_client=evaluator_client,
             max_attempts=max_attempts,
             dialogue_history_limit=dialogue_history_limit,
-            intent_only=intent_only,
         )
 
     async def route(
@@ -116,37 +109,9 @@ class IntentRouter:
             "rejected_intents",
             {},
         )
-        param_rejections: dict[str, list[dict[str, str]]] = state.setdefault(
-            "param_rejections",
-            {},
-        )
         visited: list[str] = state.setdefault("visited_skills", [])
         context = context or {}
         contextualized_request = await self._contextualize(query, history)
-        if _should_suppress_clarify(self.intent_only, contextualized_request):
-            _trace(
-                trace,
-                "clarify_suppressed",
-                stage="contextualizer",
-                clarify_scope=contextualized_request.clarify_scope,
-                reason=contextualized_request.reason,
-                question=contextualized_request.question,
-            )
-            contextualized_request = await self._contextualize_no_clarify(
-                query,
-                history,
-                suppressed=contextualized_request,
-            )
-            _trace(
-                trace,
-                "contextualize_no_clarify",
-                current_user_query=query,
-                status=contextualized_request.status,
-                resolved_query=contextualized_request.resolved_query,
-                relation_to_history=contextualized_request.relation_to_history,
-                used_history_turns=list(contextualized_request.used_history_turns),
-                reason=contextualized_request.reason,
-            )
         _trace(
             trace,
             "contextualize",
@@ -159,15 +124,6 @@ class IntentRouter:
         )
         state["resolved_query"] = contextualized_request.resolved_query or query
         state["context_relation"] = contextualized_request.relation_to_history
-        if contextualized_request.status == "clarify":
-            return _traced_result(
-                trace,
-                self._clarify(
-                    contextualized_request.question,
-                    contextualized_request.options,
-                    state,
-                ),
-            )
         resolved_query = contextualized_request.resolved_query or query
 
         for _ in range(self.max_attempts):
@@ -182,7 +138,7 @@ class IntentRouter:
                 locked_skill_id=locked_skill_id,
             )
 
-            if retry_scope in {"retry_intent", "retry_params"} and locked_skill_id:
+            if retry_scope == "retry_intent" and locked_skill_id:
                 skill_id = locked_skill_id
                 route_confidence = float(state.get("locked_skill_confidence") or 1.0)
                 if not self.registry.has(skill_id) or skill_id in rejected:
@@ -218,7 +174,7 @@ class IntentRouter:
                     rejected_skill_ids=list(rejected),
                 )
                 if route_decision.status == "clarify":
-                    if _should_suppress_clarify(self.intent_only, route_decision):
+                    if _should_suppress_clarify("router", route_decision):
                         _trace(
                             trace,
                             "clarify_suppressed",
@@ -292,46 +248,23 @@ class IntentRouter:
             if skill_id not in visited:
                 visited.append(skill_id)
 
-            locked_intent = state.get("locked_intent")
-            locked_code = state.get("locked_code")
-            if retry_scope == "retry_params" and locked_intent and locked_code:
-                intent_decision = await self._repair_params(
-                    resolved_query,
-                    skill_id,
-                    locked_intent,
-                    locked_code,
-                    param_rejections.get(_param_rejection_key(skill_id, locked_intent), []),
-                    contextualized_request,
-                    query,
-                )
-                _trace(
-                    trace,
-                    "param_repair",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    locked_intent=locked_intent,
-                    locked_code=locked_code,
-                    decision=intent_decision.model_dump(mode="json"),
-                )
-            else:
-                intent_decision = await self._select_intent(
-                    resolved_query,
-                    skill_id,
-                    rejected_intents.get(skill_id, []),
-                    _skill_param_rejections(param_rejections, skill_id),
-                    contextualized_request,
-                    query,
-                )
-                _trace(
-                    trace,
-                    "intent_select",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    decision=intent_decision.model_dump(mode="json"),
-                    rejected_intents=rejected_intents.get(skill_id, []),
-                )
+            intent_decision = await self._select_intent(
+                resolved_query,
+                skill_id,
+                rejected_intents.get(skill_id, []),
+                contextualized_request,
+                query,
+            )
+            _trace(
+                trace,
+                "intent_select",
+                attempt=attempt,
+                skill_id=skill_id,
+                decision=intent_decision.model_dump(mode="json"),
+                rejected_intents=rejected_intents.get(skill_id, []),
+            )
             if intent_decision.status == "clarify":
-                if _should_suppress_clarify(self.intent_only, intent_decision):
+                if _should_suppress_clarify("intent", intent_decision):
                     _trace(
                         trace,
                         "clarify_suppressed",
@@ -346,7 +279,6 @@ class IntentRouter:
                         resolved_query,
                         skill_id,
                         rejected_intents.get(skill_id, []),
-                        _skill_param_rejections(param_rejections, skill_id),
                         contextualized_request,
                         query,
                         suppressed=intent_decision,
@@ -395,53 +327,21 @@ class IntentRouter:
                     ),
                 )
 
-            if retry_scope == "retry_params":
-                try:
-                    _validate_locked_param_repair(intent_decision, locked_intent, locked_code)
-                except ValidationError as exc:
-                    state.setdefault("rejections", []).append(
-                        {
-                            "scope": "invalid_param_repair",
-                            "skill_id": skill_id,
-                            "intent": intent_decision.intent or "",
-                            "reason": str(exc),
-                        },
-                    )
-                    state["retry_scope"] = "retry_params"
-                    _trace(
-                        trace,
-                        "invalid_param_repair",
-                        attempt=attempt,
-                        skill_id=skill_id,
-                        intent=intent_decision.intent,
-                        reason=str(exc),
-                    )
-                    continue
-
             try:
                 validated = validate_intent_decision(skill, intent_decision)
             except ValidationError as exc:
-                if _looks_like_param_error(skill, intent_decision):
-                    state["locked_skill_id"] = skill_id
-                    state["locked_skill_confidence"] = route_confidence
-                    state["locked_intent"] = intent_decision.intent
-                    state["locked_code"] = intent_decision.code
-                    state["retry_scope"] = "retry_params"
-                    _record_param_rejection(state, skill_id, intent_decision.intent, str(exc))
-                    correction_scope = "param_mismatch"
-                else:
-                    state["locked_skill_id"] = skill_id
-                    state["locked_skill_confidence"] = route_confidence
-                    state["locked_intent"] = None
-                    state["locked_code"] = None
-                    state["retry_scope"] = "retry_intent"
-                    _record_intent_rejection(
-                        state,
-                        skill_id,
-                        intent_decision.intent,
-                        str(exc),
-                    )
-                    correction_scope = "intent_mismatch"
+                state["locked_skill_id"] = skill_id
+                state["locked_skill_confidence"] = route_confidence
+                state["locked_intent"] = None
+                state["locked_code"] = None
+                state["retry_scope"] = "retry_intent"
+                _record_intent_rejection(
+                    state,
+                    skill_id,
+                    intent_decision.intent,
+                    str(exc),
+                )
+                correction_scope = "intent_mismatch"
                 _trace(
                     trace,
                     "validation_error",
@@ -471,7 +371,7 @@ class IntentRouter:
                 candidate=validated.model_dump(mode="json"),
                 evaluation=raw_evaluation.model_dump(mode="json"),
             )
-            if _should_suppress_clarify(self.intent_only, raw_evaluation):
+            if _should_suppress_clarify("evaluator", raw_evaluation):
                 _trace(
                     trace,
                     "clarify_suppressed",
@@ -491,7 +391,7 @@ class IntentRouter:
                     params_check="pass",
                     confidence=raw_evaluation.confidence,
                     reason=(
-                        "intent_only suppressed non-boundary evaluator clarify: "
+                        "suppressed non-boundary evaluator clarify: "
                         f"{raw_evaluation.reason or raw_evaluation.clarity_reason or ''}"
                     ),
                 )
@@ -548,6 +448,207 @@ class IntentRouter:
         )
         return _traced_result(trace, result)
 
+    async def route_no_loop(
+        self,
+        query: str,
+        *,
+        dialogue_history: DialogueHistory | dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> RouteResult:
+        trace = [] if trace is None else trace
+        state = _new_state(query)
+        history = _normalize_dialogue_history(dialogue_history)
+        _trace(
+            trace,
+            "route_start",
+            mode="no_loop",
+            query=query,
+            dialogue_turns=len(history.turns),
+        )
+        context = context or {}
+        contextualized_request = await self._contextualize(query, history)
+        _trace(
+            trace,
+            "contextualize",
+            mode="no_loop",
+            current_user_query=query,
+            status=contextualized_request.status,
+            resolved_query=contextualized_request.resolved_query,
+            relation_to_history=contextualized_request.relation_to_history,
+            used_history_turns=list(contextualized_request.used_history_turns),
+            reason=contextualized_request.reason,
+        )
+        state["resolved_query"] = contextualized_request.resolved_query or query
+        state["context_relation"] = contextualized_request.relation_to_history
+
+        resolved_query = contextualized_request.resolved_query or query
+        _trace(
+            trace,
+            "attempt_start",
+            mode="no_loop",
+            attempt=1,
+            retry_scope="no_loop",
+            locked_skill_id=None,
+        )
+
+        route_decision = await self._select_skills(
+            resolved_query,
+            [],
+            context,
+            contextualized_request,
+            query,
+        )
+        _trace(
+            trace,
+            "skill_route",
+            mode="no_loop",
+            attempt=1,
+            decision=route_decision.model_dump(mode="json"),
+            rejected_skill_ids=[],
+        )
+        if route_decision.status == "clarify":
+            if _should_suppress_clarify("router", route_decision):
+                _trace(
+                    trace,
+                    "clarify_suppressed",
+                    mode="no_loop",
+                    attempt=1,
+                    stage="router",
+                    clarify_scope=route_decision.clarify_scope,
+                    reason=route_decision.reason,
+                    question=route_decision.question,
+                )
+                route_decision = await self._select_skills_no_clarify(
+                    resolved_query,
+                    [],
+                    context,
+                    contextualized_request,
+                    query,
+                    suppressed=route_decision,
+                )
+                _trace(
+                    trace,
+                    "skill_route_no_clarify",
+                    mode="no_loop",
+                    attempt=1,
+                    decision=route_decision.model_dump(mode="json"),
+                    rejected_skill_ids=[],
+                )
+            if route_decision.status == "clarify":
+                return _traced_result(
+                    trace,
+                    self._clarify(
+                        route_decision.question,
+                        route_decision.options,
+                        state,
+                    ),
+                )
+        if route_decision.status == "no_match":
+            return _traced_result(
+                trace,
+                _fallback_dialogue_result(
+                    state,
+                    route_decision.reason or "No matching skill",
+                ),
+            )
+
+        skill_id = route_decision.skill_id
+        route_confidence = route_decision.confidence
+        visited: list[str] = state.setdefault("visited_skills", [])
+        if not skill_id or not self.registry.has(skill_id):
+            return _traced_result(
+                trace,
+                RouteResult(
+                    status="no_match",
+                    reason="Router did not return a usable skill",
+                    visited_skills=visited,
+                    resolved_query=state.get("resolved_query"),
+                    context_relation=state.get("context_relation"),
+                ),
+            )
+        visited.append(skill_id)
+        skill = self.registry.get(skill_id)
+
+        intent_decision = await self._select_intent(
+            resolved_query,
+            skill_id,
+            [],
+            contextualized_request,
+            query,
+        )
+        _trace(
+            trace,
+            "intent_select",
+            mode="no_loop",
+            attempt=1,
+            skill_id=skill_id,
+            decision=intent_decision.model_dump(mode="json"),
+            rejected_intents=[],
+        )
+        if intent_decision.status == "clarify":
+            if _should_suppress_clarify("intent", intent_decision):
+                _trace(
+                    trace,
+                    "clarify_suppressed",
+                    mode="no_loop",
+                    attempt=1,
+                    stage="intent",
+                    skill_id=skill_id,
+                    clarify_scope=intent_decision.clarify_scope,
+                    reason=intent_decision.reason,
+                    question=intent_decision.question,
+                )
+                intent_decision = await self._select_intent_no_clarify(
+                    resolved_query,
+                    skill_id,
+                    [],
+                    contextualized_request,
+                    query,
+                    suppressed=intent_decision,
+                )
+                _trace(
+                    trace,
+                    "intent_select_no_clarify",
+                    mode="no_loop",
+                    attempt=1,
+                    skill_id=skill_id,
+                    decision=intent_decision.model_dump(mode="json"),
+                    rejected_intents=[],
+                )
+            if intent_decision.status == "clarify":
+                return _traced_result(
+                    trace,
+                    self._clarify(
+                        intent_decision.question,
+                        intent_decision.options,
+                        state,
+                    ),
+                )
+        if intent_decision.status == "no_match":
+            return _traced_result(
+                trace,
+                _fallback_dialogue_result(
+                    state,
+                    intent_decision.reason or "No matching intent",
+                ),
+            )
+
+        return _traced_result(
+            trace,
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id=skill_id, name=skill.name),
+                intent=intent_decision.intent,
+                code=intent_decision.code,
+                params=intent_decision.params,
+                confidence=min(route_confidence, intent_decision.confidence),
+                visited_skills=visited,
+                resolved_query=state.get("resolved_query"),
+                context_relation=state.get("context_relation"),
+            ),
+        )
+
     def _apply_evaluation_result(
         self,
         evaluation: EvaluationDecision,
@@ -589,8 +690,7 @@ class IntentRouter:
             )
 
         if (
-            self.intent_only
-            and evaluation.reject_scope == "intent_mismatch"
+            evaluation.reject_scope == "intent_mismatch"
             and self._preferred_code_matches_candidate(
                 evaluation,
                 skill_id=skill_id,
@@ -599,7 +699,7 @@ class IntentRouter:
         ):
             _trace(
                 trace,
-                "intent_only_accept_same_code_intent_mismatch",
+                "accept_same_code_intent_mismatch",
                 attempt=attempt,
                 skill_id=skill_id,
                 intent=validated.intent,
@@ -620,29 +720,10 @@ class IntentRouter:
                 context_relation=state.get("context_relation"),
             )
 
-        _apply_retry_scope(
-            state,
-            evaluation.reject_scope,
-            skill_id=skill_id,
-            route_confidence=route_confidence,
-            intent=validated.intent,
-            code=validated.code,
-        )
-        _trace(
-            trace,
-            "retry",
-            attempt=attempt,
-            scope=evaluation.reject_scope,
-            skill_id=skill_id,
-            intent=validated.intent,
-            code=validated.code,
-            reason=evaluation.reason,
-            next_retry_scope=state.get("retry_scope"),
-        )
-        if self.intent_only and evaluation.reject_scope == "param_mismatch":
+        if evaluation.reject_scope == "param_mismatch":
             _trace(
                 trace,
-                "intent_only_accept_param_mismatch",
+                "accept_param_mismatch",
                 attempt=attempt,
                 skill_id=skill_id,
                 intent=validated.intent,
@@ -661,6 +742,23 @@ class IntentRouter:
                 context_relation=state.get("context_relation"),
             )
         if evaluation.reject_scope == "intent_mismatch":
+            _apply_retry_scope(
+                state,
+                evaluation.reject_scope,
+                skill_id=skill_id,
+                route_confidence=route_confidence,
+            )
+            _trace(
+                trace,
+                "retry",
+                attempt=attempt,
+                scope=evaluation.reject_scope,
+                skill_id=skill_id,
+                intent=validated.intent,
+                code=validated.code,
+                reason=evaluation.reason,
+                next_retry_scope=state.get("retry_scope"),
+            )
             _record_intent_rejection(
                 state,
                 skill_id,
@@ -670,15 +768,23 @@ class IntentRouter:
             )
             return None
 
-        if evaluation.reject_scope == "param_mismatch":
-            _record_param_rejection(
-                state,
-                skill_id,
-                validated.intent,
-                evaluation.reason,
-            )
-            return None
-
+        _apply_retry_scope(
+            state,
+            evaluation.reject_scope,
+            skill_id=skill_id,
+            route_confidence=route_confidence,
+        )
+        _trace(
+            trace,
+            "retry",
+            attempt=attempt,
+            scope=evaluation.reject_scope,
+            skill_id=skill_id,
+            intent=validated.intent,
+            code=validated.code,
+            reason=evaluation.reason,
+            next_retry_scope=state.get("retry_scope"),
+        )
         state.setdefault("rejections", []).append(
             {
                 "scope": "skill_mismatch",
@@ -751,7 +857,6 @@ class IntentRouter:
             rejected,
             contextualized_request,
             current_user_query,
-            intent_only=self.intent_only,
         )
         if context:
             prompt = json.dumps(
@@ -780,7 +885,6 @@ class IntentRouter:
             rejected,
             contextualized_request,
             current_user_query,
-            intent_only=self.intent_only,
         )
         if context:
             prompt = json.dumps(
@@ -799,7 +903,6 @@ class IntentRouter:
         resolved_query: str,
         skill_id: str,
         rejected_intents: list[dict[str, str]],
-        param_rejections: list[dict[str, str]] | None = None,
         contextualized_request: ContextualizedRequest | None = None,
         current_user_query: str | None = None,
     ) -> IntentDecision:
@@ -810,10 +913,8 @@ class IntentRouter:
                 resolved_query,
                 skill,
                 rejected_intents,
-                param_rejections,
                 contextualized_request,
                 current_user_query,
-                intent_only=self.intent_only,
             ),
             response_model=IntentDecision,
         )
@@ -823,7 +924,6 @@ class IntentRouter:
         resolved_query: str,
         skill_id: str,
         rejected_intents: list[dict[str, str]],
-        param_rejections: list[dict[str, str]] | None = None,
         contextualized_request: ContextualizedRequest | None = None,
         current_user_query: str | None = None,
         *,
@@ -837,42 +937,14 @@ class IntentRouter:
                     resolved_query,
                     skill,
                     rejected_intents,
-                    param_rejections,
                     contextualized_request,
                     current_user_query,
-                    intent_only=self.intent_only,
                 ),
                 suppressed,
             ),
             response_model=IntentDecisionNoClarify,
         )
         return IntentDecision.model_validate(decision.model_dump())
-
-    async def _repair_params(
-        self,
-        resolved_query: str,
-        skill_id: str,
-        locked_intent: str,
-        locked_code: str,
-        param_rejections: list[dict[str, str]],
-        contextualized_request: ContextualizedRequest | None = None,
-        current_user_query: str | None = None,
-    ) -> IntentDecision:
-        skill = self.registry.get(skill_id)
-        return await self.model_client.structured(
-            system_prompt=PARAM_REPAIR_SYSTEM_PROMPT,
-            user_prompt=build_param_repair_prompt(
-                resolved_query,
-                skill,
-                locked_intent,
-                locked_code,
-                param_rejections,
-                contextualized_request,
-                current_user_query,
-                intent_only=self.intent_only,
-            ),
-            response_model=IntentDecision,
-        )
 
     async def _evaluate(
         self,
@@ -893,7 +965,6 @@ class IntentRouter:
                 decision.model_dump(),
                 contextualized_request=contextualized_request,
                 current_user_query=current_user_query,
-                intent_only=self.intent_only,
             ),
             response_model=EvaluationDecision,
         )
@@ -918,33 +989,6 @@ class IntentRouter:
             ),
             response_model=ContextualizedRequest,
         )
-
-    async def _contextualize_no_clarify(
-        self,
-        query: str,
-        dialogue_history: DialogueHistory,
-        *,
-        suppressed: ContextualizedRequest,
-    ) -> ContextualizedRequest:
-        if not dialogue_history.turns:
-            return ContextualizedRequest(
-                status="resolved",
-                resolved_query=query,
-                relation_to_history="new_request",
-            )
-        request = await self.model_client.structured(
-            system_prompt=CONTEXTUALIZER_SYSTEM_PROMPT,
-            user_prompt=_with_no_clarify_policy(
-                build_contextualizer_prompt(
-                    query,
-                    dialogue_history,
-                    history_limit=self.dialogue_history_limit,
-                ),
-                suppressed,
-            ),
-            response_model=ContextualizedRequestNoClarify,
-        )
-        return ContextualizedRequest.model_validate(request.model_dump())
 
     async def _clarify_loop_exhausted(
         self,
@@ -1006,7 +1050,6 @@ def _new_state(query: str) -> dict[str, Any]:
         "visited_skills": [],
         "rejected_skills": [],
         "rejected_intents": {},
-        "param_rejections": {},
         "locked_skill_id": None,
         "locked_skill_confidence": None,
         "locked_intent": None,
@@ -1016,14 +1059,12 @@ def _new_state(query: str) -> dict[str, Any]:
     }
 
 
-def _should_suppress_clarify(intent_only: bool, decision: Any) -> bool:
-    if not intent_only:
-        return False
+def _should_suppress_clarify(stage: str, decision: Any) -> bool:
     status = getattr(decision, "status", None)
     verdict = getattr(decision, "verdict", None)
     if status != "clarify" and verdict != "clarify":
         return False
-    return getattr(decision, "clarify_scope", None) not in ALLOWED_INTENT_ONLY_CLARIFY_SCOPES
+    return getattr(decision, "clarify_scope", None) not in ALLOWED_CLARIFY_SCOPES_BY_STAGE[stage]
 
 
 def _with_no_clarify_policy(prompt: str, suppressed: Any) -> str:
@@ -1032,7 +1073,7 @@ def _with_no_clarify_policy(prompt: str, suppressed: Any) -> str:
         "mode": "no_clarify_retry",
         "instruction": (
             "本次重试禁止输出 clarify。若缺少主体、关键词、联系人、主题、"
-            "真实文件/图片/邮件句柄或唯一资源选择，但 skill/intent/code 可判断，"
+            "操作对象、参数对象、真实文件/图片/邮件句柄或唯一资源选择，但 skill/intent/code 可判断，"
             "必须输出最可能的可路由结果；只有能力不支持时输出 no_match。"
         ),
         "suppressed_clarify": {
@@ -1096,7 +1137,7 @@ def _loop_exhausted_attempts(
                     registry.get(skill_id).name if registry.has(skill_id) else skill_id
                 )
 
-        elif event_name in {"intent_select", "param_repair"}:
+        elif event_name == "intent_select":
             decision = event.get("decision") or {}
             item["intent_status"] = decision.get("status")
             item["intent"] = decision.get("intent")
@@ -1114,10 +1155,6 @@ def _loop_exhausted_attempts(
 
         elif event_name == "validation_error":
             item["reject_scope"] = event.get("correction_scope")
-            item["reject_reason"] = event.get("reason")
-
-        elif event_name == "invalid_param_repair":
-            item["reject_scope"] = "param_mismatch"
             item["reject_reason"] = event.get("reason")
 
         elif event_name == "evaluation_invalid":
@@ -1181,8 +1218,6 @@ def _correction_scopes(trace: list[dict[str, Any]]) -> list[str]:
             scope = event.get("correction_scope")
         elif event.get("event") == "evaluation_invalid":
             scope = "invalid_evaluation"
-        elif event.get("event") == "invalid_param_repair":
-            scope = "invalid_param_repair"
         if scope and scope not in scopes:
             scopes.append(scope)
     return scopes
@@ -1194,8 +1229,6 @@ def _apply_retry_scope(
     *,
     skill_id: str,
     route_confidence: float,
-    intent: str | None,
-    code: str | None,
 ) -> None:
     if scope == "skill_mismatch":
         state["locked_skill_id"] = None
@@ -1211,14 +1244,6 @@ def _apply_retry_scope(
         state["locked_intent"] = None
         state["locked_code"] = None
         state["retry_scope"] = "retry_intent"
-        return
-
-    if scope == "param_mismatch":
-        state["locked_skill_id"] = skill_id
-        state["locked_skill_confidence"] = route_confidence
-        state["locked_intent"] = intent
-        state["locked_code"] = code
-        state["retry_scope"] = "retry_params"
         return
 
     raise ValueError(f"unsupported retry scope: {scope}")
@@ -1247,70 +1272,3 @@ def _record_intent_rejection(
         },
     )
 
-
-def _record_param_rejection(
-    state: dict[str, Any],
-    skill_id: str,
-    intent: str | None,
-    reason: str,
-) -> None:
-    rejection = {
-        "scope": "param_mismatch",
-        "skill_id": skill_id,
-        "intent": intent or "",
-        "reason": reason,
-    }
-    state.setdefault("rejections", []).append(rejection)
-    key = _param_rejection_key(skill_id, intent or "")
-    state.setdefault("param_rejections", {}).setdefault(key, []).append(
-        {
-            "intent": intent or "",
-            "reason": reason,
-            "scope": "param_mismatch",
-        },
-    )
-
-
-def _param_rejection_key(skill_id: str, intent: str) -> str:
-    return f"{skill_id}:{intent}"
-
-
-def _skill_param_rejections(
-    param_rejections: dict[str, list[dict[str, str]]],
-    skill_id: str,
-) -> list[dict[str, str]]:
-    prefix = f"{skill_id}:"
-    merged: list[dict[str, str]] = []
-    for key, rejections in param_rejections.items():
-        if key.startswith(prefix):
-            merged.extend(rejections)
-    return merged
-
-
-def _looks_like_param_error(
-    skill: Any,
-    decision: IntentDecision,
-) -> bool:
-    if decision.status != "matched" or not decision.intent:
-        return False
-    if decision.intent not in skill.intents:
-        return False
-    schema = skill.intents[decision.intent]
-    return decision.code == schema.code
-
-
-def _validate_locked_param_repair(
-    decision: IntentDecision,
-    locked_intent: str | None,
-    locked_code: str | None,
-) -> None:
-    if decision.status != "matched":
-        return
-    if decision.intent != locked_intent:
-        raise ValidationError(
-            f"param repair must keep intent {locked_intent!r}, got {decision.intent!r}",
-        )
-    if decision.code != locked_code:
-        raise ValidationError(
-            f"param repair must keep code {locked_code!r}, got {decision.code!r}",
-        )

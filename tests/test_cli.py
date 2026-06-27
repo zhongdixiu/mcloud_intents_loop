@@ -59,11 +59,11 @@ async def test_eval_xlsx_passes_end_to_end_flag(monkeypatch, capsys) -> None:
         None,
         trace_enabled=False,
         if_end2end=True,
-        intent_only=True,
+        compare_no_loop=True,
     )
 
     assert captured["kwargs"]["if_end2end"] is True
-    assert captured["kwargs"]["intent_only"] is True
+    assert captured["kwargs"]["compare_no_loop"] is True
     assert "评测模式: end2end" in capsys.readouterr().out
 
 
@@ -87,9 +87,9 @@ async def test_eval_format_xlsx_passes_end_to_end_flag(monkeypatch, capsys) -> N
         None,
         trace_enabled=False,
         if_end2end=True,
-        intent_only=True,
+        compare_no_loop=True,
     )
 
     assert captured["kwargs"]["if_end2end"] is True
-    assert captured["kwargs"]["intent_only"] is True
+    assert captured["kwargs"]["compare_no_loop"] is True
     assert "评测模式: end2end" in capsys.readouterr().out

@@ -49,10 +49,10 @@ def main() -> None:
         help="按端到端多轮对话模拟执行历史轮次，默认使用表格期望意图构造历史",
     )
     eval_xlsx_parser.add_argument(
-        "--intent-only",
+        "--compare-no-loop",
         action="store_true",
-        dest="intent_only",
-        help="仅评估 skill/intent/code 调度，忽略不影响意图的实体参数缺失",
+        dest="compare_no_loop",
+        help="同时执行无 evaluator/无修正 loop 的一级+二级路由链路并写入对比结果",
     )
 
     eval_format_xlsx_parser = subparsers.add_parser("eval-format-xlsx")
@@ -72,10 +72,10 @@ def main() -> None:
         help="按端到端多轮对话模拟执行历史轮次，默认使用表格期望意图构造历史",
     )
     eval_format_xlsx_parser.add_argument(
-        "--intent-only",
+        "--compare-no-loop",
         action="store_true",
-        dest="intent_only",
-        help="仅评估 skill/intent/code 调度，忽略不影响意图的实体参数缺失",
+        dest="compare_no_loop",
+        help="同时执行无 evaluator/无修正 loop 的一级+二级路由链路并写入对比结果",
     )
 
     args = parser.parse_args()
@@ -98,7 +98,7 @@ def main() -> None:
                 args.trace,
                 args.history_limit,
                 args.if_end2end,
-                args.intent_only,
+                args.compare_no_loop,
             ),
         )
     elif args.command == "eval-format-xlsx":
@@ -111,7 +111,7 @@ def main() -> None:
                 args.trace,
                 args.history_limit,
                 args.if_end2end,
-                args.intent_only,
+                args.compare_no_loop,
             ),
         )
 
@@ -310,12 +310,12 @@ async def _eval_xlsx(
     trace_enabled: bool,
     history_limit: int = 5,
     if_end2end: bool = False,
-    intent_only: bool = False,
+    compare_no_loop: bool = False,
 ) -> None:
     print("开始执行 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
     print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
-    print(f"意图评测模式: {'intent_only' if intent_only else 'strict'}")
+    print(f"无 loop 对比: {'on' if compare_no_loop else 'off'}")
     summary = await evaluate_xlsx_cases(
         cases_path,
         skills_path=skills,
@@ -323,7 +323,7 @@ async def _eval_xlsx(
         trace_enabled=trace_enabled,
         dialogue_history_limit=history_limit,
         if_end2end=if_end2end,
-        intent_only=intent_only,
+        compare_no_loop=compare_no_loop,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -337,12 +337,12 @@ async def _eval_format_xlsx(
     trace_enabled: bool,
     history_limit: int = 5,
     if_end2end: bool = False,
-    intent_only: bool = False,
+    compare_no_loop: bool = False,
 ) -> None:
     print("开始执行重构格式 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
     print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
-    print(f"意图评测模式: {'intent_only' if intent_only else 'strict'}")
+    print(f"无 loop 对比: {'on' if compare_no_loop else 'off'}")
     summary = await evaluate_format_xlsx_cases(
         cases_path,
         skills_path=skills,
@@ -350,7 +350,7 @@ async def _eval_format_xlsx(
         trace_enabled=trace_enabled,
         dialogue_history_limit=history_limit,
         if_end2end=if_end2end,
-        intent_only=intent_only,
+        compare_no_loop=compare_no_loop,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -370,7 +370,7 @@ def _print_eval_xlsx_progress(
         or record.get("expected_codes")
         or record.get("expected_code")
     )
-    print(
+    message = (
         "[{processed}/{total}] row={row} {status} "
         "expected={expected} predicted={predicted} "
         "loop={loop} elapsed_ms={elapsed} acc={accuracy:.2%}".format(
@@ -379,13 +379,22 @@ def _print_eval_xlsx_progress(
             row=record.get("row_index"),
             status=status,
             expected=expected,
-            predicted=record.get("predicted_code"),
+            predicted=record.get("predicted_code") or record.get("predicted_status"),
             loop=record.get("loop_count"),
             elapsed=record.get("elapsed_ms"),
             accuracy=accuracy,
-        ),
-        flush=True,
+        )
     )
+    if "no_loop_matched" in record:
+        no_loop_status = "OK" if record.get("no_loop_matched") else "FAIL"
+        message += (
+            " no_loop={status}/{predicted}".format(
+                status=no_loop_status,
+                predicted=record.get("no_loop_predicted_code")
+                or record.get("no_loop_predicted_status"),
+            )
+        )
+    print(message, flush=True)
 
 
 def _result_matches_expected(result: object, expected: dict) -> bool:
@@ -437,7 +446,7 @@ def _route_result_data(result: object) -> dict:
 
 def _first_candidate(trace: list[dict]) -> dict | None:
     for event in trace:
-        if event.get("event") not in {"intent_select", "param_repair"}:
+        if event.get("event") != "intent_select":
             continue
         decision = event.get("decision") or {}
         if decision.get("status") != "matched":
@@ -482,15 +491,13 @@ def _correction_scopes(trace: list[dict]) -> list[str]:
             scope = event.get("correction_scope")
         elif event.get("event") == "evaluation_invalid":
             scope = "invalid_evaluation"
-        elif event.get("event") == "invalid_param_repair":
-            scope = "invalid_param_repair"
         if scope and scope not in scopes:
             scopes.append(scope)
     return scopes
 
 
 def _has_repeated_model_stage(trace: list[dict]) -> bool:
-    counted_events = {"skill_route", "intent_select", "param_repair"}
+    counted_events = {"skill_route", "intent_select"}
     counts: dict[str, int] = {}
     for event in trace:
         event_name = event.get("event")

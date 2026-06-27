@@ -165,44 +165,6 @@ class EvaluationDecisionNoClarify(StrictOutputModel):
 
 
 class ContextualizedRequest(StrictOutputModel):
-    status: Literal["resolved", "clarify"]
-    resolved_query: str | None = None
-    relation_to_history: Literal[
-        "new_request",
-        "continuation",
-        "revision",
-        "answer_to_previous",
-        "ambiguous",
-    ] = "new_request"
-    used_history_turns: list[int] = Field(default_factory=list)
-    reason: str = ""
-    question: str | None = None
-    options: list[dict[str, str]] = Field(default_factory=list)
-    clarify_scope: ClarifyScope | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_status_relation_mixup(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        status = data.get("status")
-        if status not in CONTEXT_RELATION_VALUES:
-            return data
-
-        normalized = dict(data)
-        normalized.setdefault("relation_to_history", status)
-        if status == "ambiguous":
-            normalized["status"] = (
-                "clarify"
-                if normalized.get("question") or normalized.get("options")
-                else "resolved"
-            )
-        else:
-            normalized["status"] = "resolved"
-        return normalized
-
-
-class ContextualizedRequestNoClarify(StrictOutputModel):
     status: Literal["resolved"]
     resolved_query: str | None = None
     relation_to_history: Literal[
@@ -220,7 +182,7 @@ class ContextualizedRequestNoClarify(StrictOutputModel):
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_no_clarify_status(cls, data: Any) -> Any:
+    def normalize_status_relation_mixup(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
         status = data.get("status")

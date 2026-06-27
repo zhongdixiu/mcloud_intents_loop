@@ -500,6 +500,83 @@ async def test_evaluate_xlsx_cases_records_row_exception_and_continues(
     assert rows[1]["matched"] is True
 
 
+async def test_evaluate_xlsx_cases_compares_no_loop_results(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cases.xlsx"
+    output = tmp_path / "result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["当前对话", "当前预期意图"])
+    sheet.append(["闲聊一下", "000"])
+    sheet.append(["搜合同", "018"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RouteResult(
+                status="matched",
+                intent="普通对话",
+                code="000",
+                loop_count=1,
+            ),
+            RouteResult(
+                status="matched",
+                intent="普通对话",
+                code="000",
+                loop_count=1,
+            ),
+        ],
+        no_loop_results=[
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜综合",
+                code="018",
+                loop_count=1,
+            ),
+            RouteResult(
+                status="matched",
+                skill=SkillRef(id="mcloud_search_skill", name="云盘搜索"),
+                intent="搜综合",
+                code="018",
+                loop_count=1,
+            ),
+        ],
+    )
+
+    summary = await evaluate_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+        compare_no_loop=True,
+    )
+
+    assert summary["passed"] == 1
+    assert summary["no_loop_passed"] == 1
+    assert summary["loop_only_passed"] == 1
+    assert summary["no_loop_only_passed"] == 1
+    assert summary["both_passed"] == 0
+    assert summary["both_failed"] == 0
+    assert router.queries == ["闲聊一下", "搜合同"]
+    assert router.no_loop_queries == ["闲聊一下", "搜合同"]
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    rows = [
+        dict(zip(headers, [cell.value for cell in row], strict=True))
+        for row in result_sheet.iter_rows(min_row=2, max_row=3)
+    ]
+    assert rows[0]["matched"] is True
+    assert rows[0]["no_loop_matched"] is False
+    assert rows[0]["no_loop_predicted_code"] == "018"
+    assert rows[1]["matched"] is False
+    assert rows[1]["no_loop_matched"] is True
+    assert rows[1]["no_loop_match_reason"] == "exact_code"
+
+
 async def test_evaluate_xlsx_cases_end_to_end_routes_history_before_current(
     tmp_path: Path,
 ) -> None:
@@ -546,7 +623,7 @@ async def test_evaluate_xlsx_cases_end_to_end_routes_history_before_current(
     assert summary["passed"] == 1
     assert summary["accuracy"] == 1.0
     assert summary["eval_mode"] == "end2end"
-    assert summary["intent_only"] is False
+    assert "intent_only" not in summary
     assert router.queries == ["推荐刘德华的歌曲", "有没有电影", "找图片"]
     assert [len(history.turns) for history in router.histories] == [0, 1, 2]
 
@@ -555,7 +632,7 @@ async def test_evaluate_xlsx_cases_end_to_end_routes_history_before_current(
     headers = [cell.value for cell in result_sheet[1]]
     row = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
     assert row["eval_mode"] == "end2end"
-    assert row["intent_only"] is False
+    assert "intent_only" not in row
     assert row["history_predicted_codes"] == '["000", "000"]'
     assert row["history_loop_counts"] == "[1, 2]"
     assert row["matched"] is True
@@ -623,7 +700,7 @@ async def test_evaluate_format_xlsx_cases_end_to_end_records_each_turn(
     assert turn_results[1]["is_scored"] is True
 
 
-async def test_evaluate_xlsx_cases_records_intent_only_mode(tmp_path: Path) -> None:
+async def test_evaluate_xlsx_cases_omits_intent_only_mode(tmp_path: Path) -> None:
     path = tmp_path / "cases.xlsx"
     output = tmp_path / "result.xlsx"
     workbook = Workbook()
@@ -649,23 +726,29 @@ async def test_evaluate_xlsx_cases_records_intent_only_mode(tmp_path: Path) -> N
         skills_path="skills",
         output_path=output,
         router=router,  # type: ignore[arg-type]
-        intent_only=True,
     )
 
-    assert summary["intent_only"] is True
+    assert "intent_only" not in summary
 
     workbook = load_workbook(output)
     result_sheet = workbook["results"]
     headers = [cell.value for cell in result_sheet[1]]
     row = dict(zip(headers, [cell.value for cell in result_sheet[2]], strict=True))
-    assert row["intent_only"] is True
+    assert "intent_only" not in row
 
 
 class FakeRouter:
-    def __init__(self, results: list[RouteResult | Exception]) -> None:
+    def __init__(
+        self,
+        results: list[RouteResult | Exception],
+        no_loop_results: list[RouteResult | Exception] | None = None,
+    ) -> None:
         self.results = results
+        self.no_loop_results = no_loop_results or []
         self.histories: list[DialogueHistory] = []
+        self.no_loop_histories: list[DialogueHistory] = []
         self.queries: list[str] = []
+        self.no_loop_queries: list[str] = []
 
     async def route(
         self,
@@ -682,6 +765,25 @@ class FakeRouter:
         if trace is not None:
             trace.append({"event": "fake"})
         result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def route_no_loop(
+        self,
+        query: str,
+        *,
+        dialogue_history: DialogueHistory | None = None,
+        context: dict[str, Any] | None = None,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> RouteResult:
+        self.no_loop_queries.append(query)
+        self.no_loop_histories.append(
+            (dialogue_history or DialogueHistory()).model_copy(deep=True),
+        )
+        if trace is not None:
+            trace.append({"event": "fake_no_loop"})
+        result = self.no_loop_results.pop(0)
         if isinstance(result, Exception):
             raise result
         return result

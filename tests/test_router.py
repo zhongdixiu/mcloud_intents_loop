@@ -5,7 +5,6 @@ from intent_router.model_client import FakeStructuredClient
 from intent_router.router import IntentRouter
 from intent_router.types import (
     ContextualizedRequest,
-    ContextualizedRequestNoClarify,
     DialogueHistory,
     DialogueRouteSummary,
     DialogueTurn,
@@ -354,8 +353,8 @@ async def test_intent_reject_records_rejected_intent_even_with_low_confidence() 
     ]
 
 
-async def test_router_retries_after_param_mismatch() -> None:
-    """ Evaluator 判断 param_mismatch 后，锁定 skill / intent / code，只进入参数修正流程。"""
+async def test_router_accepts_param_mismatch_for_code_evaluation() -> None:
+    """Evaluator 判断 param_mismatch 时，当前 code 仍作为有效意图结果返回。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -379,14 +378,6 @@ async def test_router_retries_after_param_mismatch() -> None:
                 confidence=0.8,
                 reason="用户未明确 mp3 后缀，suffixList 存在过度补全",
             ),
-            IntentDecision(
-                status="matched",
-                intent="搜音频",
-                code="015",
-                params={"metadataList": ["周杰伦", "歌"]},
-                confidence=0.8,
-            ),
-            EvaluationDecision(verdict="accept", confidence=0.8),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
@@ -395,21 +386,11 @@ async def test_router_retries_after_param_mismatch() -> None:
 
     assert result.status == "matched"
     assert result.intent == "搜音频"
-    assert "suffixList" not in result.params
-    assert result.loop_count == 2
-    assert result.correction_scopes == ["param_mismatch"]
+    assert result.code == "015"
+    assert result.params["suffixList"] == ["mp3"]
+    assert result.loop_count == 1
+    assert result.correction_scopes == []
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
-
-    param_repair_prompt = json.loads(model.calls[3][1])
-    assert param_repair_prompt["locked_intent"] == "搜音频"
-    assert param_repair_prompt["locked_code"] == "015"
-    assert param_repair_prompt["param_rejections"] == [
-        {
-            "intent": "搜音频",
-            "reason": "用户未明确 mp3 后缀，suffixList 存在过度补全",
-            "scope": "param_mismatch",
-        },
-    ]
 
 
 async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
@@ -432,13 +413,6 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
                 intent="搜图片",
                 code="012",
                 params={"suffixList": ["jpg"]},
-                confidence=0.8,
-            ),
-            IntentDecision(
-                status="matched",
-                intent="搜图片",
-                code="012",
-                params={"metadataList": ["猫"]},
                 confidence=0.8,
             ),
             EvaluationDecision(verdict="accept", confidence=0.8),
@@ -501,7 +475,7 @@ async def test_router_injects_dialogue_history_into_all_model_prompts() -> None:
 
     assert "上下文语义归一节点" in model.calls[0][0]
     assert "不要伪造 image/content/file" in model.calls[1][0]
-    assert "执行载体缺失不算 param_mismatch" in model.calls[-1][0]
+    assert "评估目标只包含 skill/intent/code" in model.calls[-1][0]
 
 
 async def test_router_uses_configured_dialogue_history_limit() -> None:
@@ -582,8 +556,8 @@ async def test_router_allows_disabling_dialogue_history_injection() -> None:
     assert contextualizer_prompt["dialogue_history"] == []
 
 
-async def test_param_reject_records_param_rejection_even_with_low_confidence() -> None:
-    """ 即使 confidence 低，param_mismatch 也会记录参数拒绝原因，并传给参数修正 prompt；修正失败时返回普通对话兜底。"""
+async def test_param_reject_with_low_confidence_accepts_candidate_code() -> None:
+    """即使 confidence 低，param_mismatch 也不会触发参数修正或澄清。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -608,7 +582,6 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
                 reason="可能过度补全 mp3",
                 clarity_reason="用户没有明确文件后缀",
             ),
-            IntentDecision(status="no_match", reason="cannot repair params"),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
@@ -616,21 +589,13 @@ async def test_param_reject_records_param_rejection_even_with_low_confidence() -
     result = await router.route("帮我找周杰伦的歌")
 
     assert result.status == "matched"
-    assert result.skill is None
-    assert result.intent == "普通对话"
-    assert result.code == "000"
-    assert result.reason == "cannot repair params"
-    param_repair_prompt = json.loads(model.calls[3][1])
-    assert param_repair_prompt["param_rejections"] == [
-        {
-            "intent": "搜音频",
-            "reason": "可能过度补全 mp3",
-            "scope": "param_mismatch",
-        },
-    ]
+    assert result.skill is not None
+    assert result.intent == "搜音频"
+    assert result.code == "015"
+    assert len(model.calls) == 3
 
 
-async def test_intent_only_accepts_evaluator_param_mismatch() -> None:
+async def test_accepts_evaluator_param_mismatch() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -659,7 +624,6 @@ async def test_intent_only_accepts_evaluator_param_mismatch() -> None:
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     trace: list[dict] = []
 
@@ -671,21 +635,21 @@ async def test_intent_only_accepts_evaluator_param_mismatch() -> None:
     assert result.intent == "搜音频"
     assert result.code == "015"
     assert result.loop_count == 1
-    assert result.correction_scopes == ["param_mismatch"]
+    assert result.correction_scopes == []
     assert any(
-        event["event"] == "intent_only_accept_param_mismatch"
+        event["event"] == "accept_param_mismatch"
         for event in trace
     )
     assert len(model.calls) == 3
     router_prompt = json.loads(model.calls[0][1])
     intent_prompt = json.loads(model.calls[1][1])
     evaluator_prompt = json.loads(model.calls[2][1])
-    assert router_prompt["intent_only"] is True
-    assert intent_prompt["intent_only"] is True
-    assert evaluator_prompt["intent_only"] is True
+    assert "intent_only" not in router_prompt
+    assert "intent_only" not in intent_prompt
+    assert "intent_only" not in evaluator_prompt
 
 
-async def test_intent_only_retries_intent_clarify_for_missing_entity() -> None:
+async def test_retries_intent_clarify_for_missing_entity() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -711,7 +675,6 @@ async def test_intent_only_retries_intent_clarify_for_missing_entity() -> None:
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     trace: list[dict] = []
 
@@ -731,82 +694,14 @@ async def test_intent_only_retries_intent_clarify_for_missing_entity() -> None:
     assert retry_prompt["clarify_policy"]["mode"] == "no_clarify_retry"
 
 
-async def test_intent_only_retries_contextualizer_clarify_for_missing_entity() -> None:
+async def test_contextualizer_residual_clarify_is_normalized_and_routed() -> None:
     model = FakeStructuredClient(
         [
-            ContextualizedRequest(
-                status="clarify",
-                question="请问您想总结什么内容？",
-                clarify_scope="missing_entity",
-            ),
-            {
-                "status": "resolved",
-                "resolved_query": "总结概括上一轮文档",
-                "relation_to_history": "continuation",
-                "used_history_turns": [0],
-            },
-            SkillRouteDecision(
-                status="route",
-                skill_id="work_skill",
-                confidence=0.9,
-            ),
-            IntentDecision(
-                status="matched",
-                intent="总结概括",
-                code="036011",
-                params={},
-                confidence=0.8,
-            ),
-            EvaluationDecision(verdict="accept", confidence=0.7),
-        ],
-    )
-    router = IntentRouter.from_config(
-        "skills",
-        model_client=model,
-        intent_only=True,
-    )
-    history = DialogueHistory(
-        turns=[
-            DialogueTurn(
-                user_query="搜索AI助手的测评报告文档",
-                result=DialogueRouteSummary(
-                    status="matched",
-                    skill_id="mcloud_search_skill",
-                    skill_name="云盘搜索",
-                    intent="搜文档",
-                    code="013",
-                    resolved_query="搜索AI助手的测评报告文档",
-                ),
-            ),
-        ],
-    )
-    trace: list[dict] = []
-
-    result = await router.route("总结概括", dialogue_history=history, trace=trace)
-
-    assert result.status == "matched"
-    assert result.intent == "总结概括"
-    assert result.resolved_query == "总结概括上一轮文档"
-    assert any(
-        event["event"] == "clarify_suppressed"
-        and event["stage"] == "contextualizer"
-        for event in trace
-    )
-    assert model.calls[1][2] is ContextualizedRequestNoClarify
-
-
-async def test_intent_only_contextualizer_no_clarify_tolerates_residual_clarify() -> None:
-    model = FakeStructuredClient(
-        [
-            ContextualizedRequest(
-                status="clarify",
-                question="请问您想总结什么内容？",
-                clarify_scope="missing_entity",
-            ),
             {
                 "status": "clarify",
                 "resolved_query": "总结概括上一轮文档",
                 "relation_to_history": "continuation",
+                "used_history_turns": [0],
                 "question": "请问您想总结什么内容？",
                 "clarify_scope": "missing_entity",
             },
@@ -828,7 +723,6 @@ async def test_intent_only_contextualizer_no_clarify_tolerates_residual_clarify(
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     history = DialogueHistory(
         turns=[
@@ -852,11 +746,75 @@ async def test_intent_only_contextualizer_no_clarify_tolerates_residual_clarify(
     assert result.status == "matched"
     assert result.intent == "总结概括"
     assert result.resolved_query == "总结概括上一轮文档"
-    assert model.calls[1][2] is ContextualizedRequestNoClarify
-    assert any(event["event"] == "contextualize_no_clarify" for event in trace)
+    assert not any(event["event"] == "clarify_suppressed" for event in trace)
+    assert [call[2] for call in model.calls] == [
+        ContextualizedRequest,
+        SkillRouteDecision,
+        IntentDecision,
+        EvaluationDecision,
+    ]
 
 
-async def test_intent_only_keeps_true_route_boundary_clarify() -> None:
+async def test_contextualizer_ambiguous_relation_continues_to_downstream_router() -> None:
+    model = FakeStructuredClient(
+        [
+            {
+                "status": "ambiguous",
+                "resolved_query": "总结概括",
+                "reason": "可能是新请求，也可能承接上一轮文档",
+                "question": "请问您想总结什么内容？",
+            },
+            SkillRouteDecision(
+                status="route",
+                skill_id="work_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="总结概括",
+                code="036011",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.7),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+    )
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜索AI助手的测评报告文档",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    resolved_query="搜索AI助手的测评报告文档",
+                ),
+            ),
+        ],
+    )
+    trace: list[dict] = []
+
+    result = await router.route("总结概括", dialogue_history=history, trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "总结概括"
+    assert result.resolved_query == "总结概括"
+    assert result.context_relation == "ambiguous"
+    assert [call[2] for call in model.calls] == [
+        ContextualizedRequest,
+        SkillRouteDecision,
+        IntentDecision,
+        EvaluationDecision,
+    ]
+
+
+async def test_keeps_true_route_boundary_clarify() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -869,7 +827,6 @@ async def test_intent_only_keeps_true_route_boundary_clarify() -> None:
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     trace: list[dict] = []
 
@@ -881,7 +838,7 @@ async def test_intent_only_keeps_true_route_boundary_clarify() -> None:
     assert len(model.calls) == 1
 
 
-async def test_intent_only_accepts_evaluator_non_boundary_clarify() -> None:
+async def test_accepts_evaluator_non_boundary_clarify() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -907,7 +864,6 @@ async def test_intent_only_accepts_evaluator_non_boundary_clarify() -> None:
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     trace: list[dict] = []
 
@@ -922,7 +878,7 @@ async def test_intent_only_accepts_evaluator_non_boundary_clarify() -> None:
     )
 
 
-async def test_intent_only_accepts_same_code_intent_mismatch() -> None:
+async def test_accepts_same_code_intent_mismatch() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -953,7 +909,6 @@ async def test_intent_only_accepts_same_code_intent_mismatch() -> None:
     router = IntentRouter.from_config(
         "skills",
         model_client=model,
-        intent_only=True,
     )
     trace: list[dict] = []
 
@@ -964,7 +919,7 @@ async def test_intent_only_accepts_same_code_intent_mismatch() -> None:
     assert result.code == "013"
     assert result.correction_scopes == []
     assert any(
-        event["event"] == "intent_only_accept_same_code_intent_mismatch"
+        event["event"] == "accept_same_code_intent_mismatch"
         for event in trace
     )
 
@@ -979,56 +934,56 @@ async def test_max_attempts_reject_returns_guided_clarify() -> None:
             ),
             IntentDecision(
                 status="matched",
-                intent="搜音频",
-                code="015",
-                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["周杰伦"]},
                 confidence=0.8,
             ),
             EvaluationDecision(
                 verdict="reject",
-                reject_scope="param_mismatch",
+                reject_scope="intent_mismatch",
                 skill_check="pass",
-                intent_check="pass",
-                params_check="fail",
-                reason="用户未明确 mp3 后缀",
+                intent_check="fail",
+                params_check="pass",
+                reason="应该选择搜音频",
             ),
             IntentDecision(
                 status="matched",
-                intent="搜音频",
-                code="015",
-                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["周杰伦"]},
                 confidence=0.8,
             ),
             EvaluationDecision(
                 verdict="reject",
-                reject_scope="param_mismatch",
+                reject_scope="intent_mismatch",
                 skill_check="pass",
-                intent_check="pass",
-                params_check="fail",
-                reason="仍然过度补全 mp3 后缀",
+                intent_check="fail",
+                params_check="pass",
+                reason="仍然应该选择搜音频",
             ),
             IntentDecision(
                 status="matched",
-                intent="搜音频",
-                code="015",
-                params={"metadataList": ["周杰伦"], "suffixList": ["mp3"]},
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["周杰伦"]},
                 confidence=0.8,
             ),
             EvaluationDecision(
                 verdict="reject",
-                reject_scope="param_mismatch",
+                reject_scope="intent_mismatch",
                 skill_check="pass",
-                intent_check="pass",
-                params_check="fail",
-                reason="仍然无法确认文件后缀",
+                intent_check="fail",
+                params_check="pass",
+                reason="仍然无法确认具体二级意图",
             ),
             LoopExhaustedClarification(
-                question="您想按哪些关键词或文件类型搜索这首歌？",
+                question="您想搜索音频还是综合文件？",
                 options=[
-                    {"label": "只按关键词搜索", "value": "只按关键词搜索"},
-                    {"label": "指定音频格式", "value": "指定音频格式"},
+                    {"label": "搜索音频", "value": "搜索音频"},
+                    {"label": "综合搜索", "value": "综合搜索"},
                 ],
-                reason="多次卡在搜索条件是否包含文件格式",
+                reason="多次卡在二级意图选择",
             ),
         ],
     )
@@ -1037,18 +992,18 @@ async def test_max_attempts_reject_returns_guided_clarify() -> None:
     result = await router.route("帮我找周杰伦的歌")
 
     assert result.status == "clarify"
-    assert result.question == "您想按哪些关键词或文件类型搜索这首歌？"
+    assert result.question == "您想搜索音频还是综合文件？"
     assert result.termination_reason == "loop_exhausted"
-    assert result.reason == "多次卡在搜索条件是否包含文件格式"
+    assert result.reason == "多次卡在二级意图选择"
     assert result.loop_count == 3
-    assert result.correction_scopes == ["param_mismatch"]
+    assert result.correction_scopes == ["intent_mismatch"]
     assert model.calls[-1][2] is LoopExhaustedClarification
 
     clarifier_prompt = json.loads(model.calls[-1][1])
     assert clarifier_prompt["resolved_query"] == "帮我找周杰伦的歌"
     assert len(clarifier_prompt["attempts"]) == 3
-    assert clarifier_prompt["attempts"][-1]["reject_scope"] == "param_mismatch"
-    assert clarifier_prompt["attempts"][-1]["reject_reason"] == "仍然无法确认文件后缀"
+    assert clarifier_prompt["attempts"][-1]["reject_scope"] == "intent_mismatch"
+    assert clarifier_prompt["attempts"][-1]["reject_reason"] == "仍然无法确认具体二级意图"
 
 
 async def test_router_reject_without_scope_returns_stable_no_match() -> None:
@@ -1120,6 +1075,110 @@ async def test_router_can_use_separate_evaluator_client() -> None:
         IntentDecision,
     ]
     assert [call[2] for call in evaluator_model.calls] == [EvaluationDecision]
+
+
+async def test_no_loop_returns_first_intent_without_evaluator() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["合同"]},
+                confidence=0.8,
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    trace: list[dict] = []
+
+    result = await router.route_no_loop("搜索合同文件", trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "搜综合"
+    assert result.code == "018"
+    assert result.loop_count == 1
+    assert result.correction_scopes == []
+    assert [call[2] for call in model.calls] == [
+        SkillRouteDecision,
+        IntentDecision,
+    ]
+    assert not any(event["event"] == "evaluation" for event in trace)
+
+
+async def test_no_loop_retries_non_boundary_intent_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="route",
+                skill_id="work_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="clarify",
+                question="请问您想总结哪份文件？",
+                clarify_scope="missing_entity",
+            ),
+            {
+                "status": "matched",
+                "intent": "总结概括",
+                "code": "036011",
+                "params": {},
+                "confidence": 0.8,
+            },
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+    )
+    trace: list[dict] = []
+
+    result = await router.route_no_loop("总结概括", trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "总结概括"
+    assert result.code == "036011"
+    assert result.loop_count == 1
+    assert result.correction_scopes == []
+    assert [call[2] for call in model.calls] == [
+        SkillRouteDecision,
+        IntentDecision,
+        IntentDecisionNoClarify,
+    ]
+    assert any(
+        event["event"] == "clarify_suppressed"
+        and event["stage"] == "intent"
+        and event["mode"] == "no_loop"
+        for event in trace
+    )
+
+
+async def test_no_loop_keeps_route_boundary_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(
+                status="clarify",
+                question="您是想搜索已有图片，还是生成新图片？",
+                clarify_scope="route_boundary",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+    )
+
+    result = await router.route_no_loop("图片")
+
+    assert result.status == "clarify"
+    assert result.question == "您是想搜索已有图片，还是生成新图片？"
+    assert [call[2] for call in model.calls] == [SkillRouteDecision]
 
 
 async def test_router_returns_dialogue_fallback_for_unsupported_capability() -> None:
@@ -1317,6 +1376,7 @@ async def test_dialogue_agent_returns_clarification_and_uses_history() -> None:
                     {"label": "搜索资源", "value": "search"},
                     {"label": "打开入口", "value": "open"},
                 ],
+                clarify_scope="route_boundary",
             ),
             ContextualizedRequest(
                 status="resolved",
@@ -1577,7 +1637,7 @@ async def test_router_tolerates_contextualizer_status_relation_mixup() -> None:
 
     contextualizer_system_prompt = model.calls[0][0]
     router_prompt = json.loads(model.calls[1][1])
-    assert "status 只能是 resolved 或 clarify" in contextualizer_system_prompt
+    assert "status 只能是 resolved" in contextualizer_system_prompt
     assert "禁止把 status 写成 new_request" in contextualizer_system_prompt
     assert router_prompt["resolved_query"] == "项目进展如何"
 
@@ -1912,6 +1972,7 @@ async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> N
                     {"label": "搜文档", "value": "搜文档"},
                     {"label": "搜图片", "value": "搜图片"},
                 ],
+                clarify_scope="intent_code_boundary",
             ),
             ContextualizedRequest(
                 status="resolved",
@@ -1954,7 +2015,7 @@ async def test_dialogue_agent_contextualizes_short_followup_after_clarify() -> N
     assert "dialogue_history" not in second_router_prompt
 
 
-async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> None:
+async def test_dialogue_agent_routes_ambiguous_context_without_contextualizer_clarify() -> None:
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -1972,6 +2033,7 @@ async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> Non
             EvaluationDecision(verdict="accept", confidence=0.8),
             ContextualizedRequest(
                 status="clarify",
+                resolved_query="搜蓝色的图片",
                 relation_to_history="ambiguous",
                 used_history_turns=[0],
                 question="“蓝色”是指搜索蓝色的图片，还是蓝色的合同文件？",
@@ -1979,13 +2041,6 @@ async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> Non
                     {"label": "搜蓝色的图片", "value": "搜蓝色的图片"},
                     {"label": "搜蓝色的合同文件", "value": "搜蓝色的合同文件"},
                 ],
-            ),
-            ContextualizedRequest(
-                status="resolved",
-                resolved_query="搜蓝色的图片",
-                relation_to_history="answer_to_previous",
-                used_history_turns=[1],
-                reason="当前输入是在回答上一轮澄清的对象类型维度",
             ),
             SkillRouteDecision(
                 status="route",
@@ -2007,54 +2062,58 @@ async def test_dialogue_agent_resolves_clarify_answer_to_complete_query() -> Non
 
     first = await agent.send("搜合同文件")
     second = await agent.send("蓝色")
-    third = await agent.send("图片")
 
     assert first.status == "matched"
     assert first.resolved_query == "搜合同文件"
-    assert second.status == "clarify"
-    assert second.resolved_query == "蓝色"
+    assert second.status == "matched"
+    assert second.intent == "搜图片"
+    assert second.params == {"metadataList": ["蓝色"]}
+    assert second.resolved_query == "搜蓝色的图片"
     assert second.context_relation == "ambiguous"
-    assert third.status == "matched"
-    assert third.intent == "搜图片"
-    assert third.params == {"metadataList": ["蓝色"]}
-    assert third.resolved_query == "搜蓝色的图片"
-    assert third.context_relation == "answer_to_previous"
-
-    third_context_prompt = json.loads(model.calls[4][1])
-    clarify_result = third_context_prompt["dialogue_history"][-1]["assistant_result"]
-    clarify_state = third_context_prompt["dialogue_history"][-1]["semantic_state"]
-    assert clarify_result["status"] == "clarify"
-    assert clarify_result["question"] == (
-        "“蓝色”是指搜索蓝色的图片，还是蓝色的合同文件？"
-    )
-    assert clarify_result["options"] == [
-        {"label": "搜蓝色的图片", "value": "搜蓝色的图片"},
-        {"label": "搜蓝色的合同文件", "value": "搜蓝色的合同文件"},
+    assert [call[2] for call in model.calls] == [
+        SkillRouteDecision,
+        IntentDecision,
+        EvaluationDecision,
+        ContextualizedRequest,
+        SkillRouteDecision,
+        IntentDecision,
+        EvaluationDecision,
     ]
-    assert "resolved_query" not in clarify_result
-    assert "context_relation" not in clarify_result
-    assert clarify_state["resolved_query"] == "蓝色"
-    assert clarify_state["relation_to_previous"] == "ambiguous"
 
-    third_router_prompt = json.loads(model.calls[5][1])
-    assert third_router_prompt["resolved_query"] == "搜蓝色的图片"
-    assert "dialogue_history" not in third_router_prompt
+    second_router_prompt = json.loads(model.calls[4][1])
+    assert second_router_prompt["resolved_query"] == "搜蓝色的图片"
+    assert second_router_prompt["contextualized_request"]["status"] == "resolved"
+    assert "dialogue_history" not in second_router_prompt
 
 
-async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
+async def test_contextualizer_ambiguous_search_refinement_continues_routing() -> None:
     model = FakeStructuredClient(
         [
-            ContextualizedRequest(
-                status="clarify",
-                relation_to_history="ambiguous",
-                used_history_turns=[0],
-                reason="无法判断蓝色是在替换历史关键词还是追加筛选合同文件",
-                question="您是要重新搜索蓝色相关内容，还是搜索蓝色合同文件？",
-                options=[
+            {
+                "status": "clarify",
+                "resolved_query": "搜蓝色",
+                "relation_to_history": "ambiguous",
+                "used_history_turns": [0],
+                "reason": "无法判断蓝色是在替换历史关键词还是追加筛选合同文件",
+                "question": "您是要重新搜索蓝色相关内容，还是搜索蓝色合同文件？",
+                "options": [
                     {"label": "重新搜索蓝色相关内容", "value": "new_blue_search"},
                     {"label": "搜索蓝色合同文件", "value": "blue_contract_files"},
                 ],
+            },
+            SkillRouteDecision(
+                status="route",
+                skill_id="mcloud_search_skill",
+                confidence=0.9,
             ),
+            IntentDecision(
+                status="matched",
+                intent="搜综合",
+                code="018",
+                params={"metadataList": ["蓝色"]},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.8),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
@@ -2076,10 +2135,16 @@ async def test_contextualizer_clarifies_ambiguous_search_refinement() -> None:
 
     result = await router.route("搜蓝色", dialogue_history=history)
 
-    assert result.status == "clarify"
+    assert result.status == "matched"
     assert result.context_relation == "ambiguous"
-    assert "蓝色合同文件" in (result.question or "")
-    assert [call[2] for call in model.calls] == [ContextualizedRequest]
+    assert result.intent == "搜综合"
+    assert result.code == "018"
+    assert [call[2] for call in model.calls] == [
+        ContextualizedRequest,
+        SkillRouteDecision,
+        IntentDecision,
+        EvaluationDecision,
+    ]
 
     system_prompt = model.calls[0][0]
     contextualizer_prompt = json.loads(model.calls[0][1])
@@ -2202,8 +2267,8 @@ async def test_dialogue_history_does_not_inject_loop_exhausted_internal_state() 
     assert "param_mismatch" not in model.calls[0][1]
 
 
-async def test_router_rejects_invalid_candidate_and_returns_dialogue_fallback() -> None:
-    """ intent 输出结构不合法参数时，进入参数修正；修正失败后返回普通对话兜底，不重新误伤 skill。"""
+async def test_router_accepts_invalid_params_when_code_is_valid() -> None:
+    """intent/code 合法时，参数不合法不再触发参数修正或兜底。"""
     model = FakeStructuredClient(
         [
             SkillRouteDecision(
@@ -2218,7 +2283,7 @@ async def test_router_rejects_invalid_candidate_and_returns_dialogue_fallback() 
                 params={"suffixList": ["jpg"]},
                 confidence=0.8,
             ),
-            IntentDecision(status="no_match", reason="cannot repair params"),
+            EvaluationDecision(verdict="accept", confidence=0.8),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
@@ -2226,10 +2291,11 @@ async def test_router_rejects_invalid_candidate_and_returns_dialogue_fallback() 
     result = await router.route("找猫照片")
 
     assert result.status == "matched"
-    assert result.skill is None
-    assert result.intent == "普通对话"
-    assert result.code == "000"
-    assert result.reason == "cannot repair params"
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.intent == "搜图片"
+    assert result.code == "012"
+    assert result.params == {"suffixList": ["jpg"]}
     assert "mcloud_search_skill" in result.visited_skills
     assert [call[2] for call in model.calls].count(SkillRouteDecision) == 1
 
@@ -2250,6 +2316,7 @@ async def test_router_returns_clarification_for_overlapping_baby_intents() -> No
                     {"label": "父母双方照片", "value": "parents_photo"},
                 ],
                 reason="宝宝时光机和宝宝长相预测依赖不同输入来源",
+                clarify_scope="intent_code_boundary",
             ),
         ],
     )
@@ -2281,6 +2348,7 @@ async def test_dialogue_agent_uses_baby_clarification_for_time_machine() -> None
                     {"label": "已出生宝宝照片", "value": "baby_photo"},
                     {"label": "父母双方照片", "value": "parents_photo"},
                 ],
+                clarify_scope="intent_code_boundary",
             ),
             ContextualizedRequest(
                 status="resolved",
@@ -2337,6 +2405,7 @@ async def test_dialogue_agent_uses_baby_clarification_for_appearance_prediction(
                     {"label": "已出生宝宝照片", "value": "baby_photo"},
                     {"label": "父母双方照片", "value": "parents_photo"},
                 ],
+                clarify_scope="intent_code_boundary",
             ),
             ContextualizedRequest(
                 status="resolved",
@@ -2390,6 +2459,7 @@ async def test_router_clarifies_ambiguous_photo_repair() -> None:
                     {"label": "提升清晰度", "value": "quality"},
                 ],
                 reason="修复照片未说明处理对象或目标",
+                clarify_scope="intent_code_boundary",
             ),
         ],
     )

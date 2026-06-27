@@ -63,14 +63,13 @@ async def evaluate_xlsx_cases(
     router: IntentRouter | None = None,
     dialogue_history_limit: int | None = 5,
     if_end2end: bool = False,
-    intent_only: bool = False,
+    compare_no_loop: bool = False,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
-        intent_only=intent_only,
     )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -81,7 +80,7 @@ async def evaluate_xlsx_cases(
         output_path=output_path,
         trace_enabled=trace_enabled,
         if_end2end=if_end2end,
-        intent_only=intent_only,
+        compare_no_loop=compare_no_loop,
         progress_callback=progress_callback,
     )
 
@@ -95,14 +94,13 @@ async def evaluate_format_xlsx_cases(
     router: IntentRouter | None = None,
     dialogue_history_limit: int | None = 5,
     if_end2end: bool = False,
-    intent_only: bool = False,
+    compare_no_loop: bool = False,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
-        intent_only=intent_only,
     )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -113,7 +111,7 @@ async def evaluate_format_xlsx_cases(
         output_path=output_path,
         trace_enabled=trace_enabled,
         if_end2end=if_end2end,
-        intent_only=intent_only,
+        compare_no_loop=compare_no_loop,
         progress_callback=progress_callback,
     )
 
@@ -126,7 +124,7 @@ async def _evaluate_loaded_cases(
     output_path: Path,
     trace_enabled: bool,
     if_end2end: bool,
-    intent_only: bool,
+    compare_no_loop: bool,
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None,
 ) -> dict[str, Any]:
     code_index = _build_code_index(registry)
@@ -138,30 +136,29 @@ async def _evaluate_loaded_cases(
     total_elapsed_values: list[float] = []
     loop_counts: list[int] = []
     status_counts: dict[str, int] = {}
+    no_loop_passed = 0
+    no_loop_elapsed_values: list[float] = []
+    no_loop_total_elapsed_values: list[float] = []
+    no_loop_status_counts: dict[str, int] = {}
+    both_passed = 0
+    both_failed = 0
+    loop_only_passed = 0
+    no_loop_only_passed = 0
     records: list[dict[str, Any]] = []
 
     for case in cases:
         total += 1
         case_started = time.perf_counter()
         try:
-            if if_end2end:
-                evaluation = await _run_end_to_end_case(
-                    case,
-                    router=router,
-                    trace_enabled=trace_enabled,
-                )
-            else:
-                history = build_gold_dialogue_history(
-                    case.history_turns,
-                    registry,
-                    code_index,
-                )
-                evaluation = await _run_gold_history_case(
-                    case,
-                    router=router,
-                    history=history,
-                    trace_enabled=trace_enabled,
-                )
+            evaluation = await _run_eval_case(
+                case,
+                registry=registry,
+                code_index=code_index,
+                router=router,
+                trace_enabled=trace_enabled,
+                if_end2end=if_end2end,
+                no_loop=False,
+            )
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - case_started) * 1000
             elapsed_values.append(elapsed_ms)
@@ -174,8 +171,69 @@ async def _evaluate_loaded_cases(
                 elapsed_ms=elapsed_ms,
                 total_elapsed_ms=elapsed_ms,
                 eval_mode="end2end" if if_end2end else "gold_history",
-                intent_only=intent_only,
             )
+            if compare_no_loop:
+                no_loop_started = time.perf_counter()
+                try:
+                    no_loop_evaluation = await _run_eval_case(
+                        case,
+                        registry=registry,
+                        code_index=code_index,
+                        router=router,
+                        trace_enabled=trace_enabled,
+                        if_end2end=if_end2end,
+                        no_loop=True,
+                    )
+                except Exception as no_loop_exc:
+                    no_loop_elapsed_ms = (
+                        time.perf_counter() - no_loop_started
+                    ) * 1000
+                    no_loop_elapsed_values.append(no_loop_elapsed_ms)
+                    no_loop_total_elapsed_values.append(no_loop_elapsed_ms)
+                    no_loop_status_counts["error"] = (
+                        no_loop_status_counts.get("error", 0) + 1
+                    )
+                    no_loop_matched = False
+                    record.update(
+                        _build_no_loop_error_fields(
+                            error=no_loop_exc,
+                            elapsed_ms=no_loop_elapsed_ms,
+                            total_elapsed_ms=no_loop_elapsed_ms,
+                        ),
+                    )
+                else:
+                    no_loop_result = no_loop_evaluation["result"]
+                    no_loop_elapsed_ms = no_loop_evaluation["elapsed_ms"]
+                    no_loop_total_elapsed_ms = no_loop_evaluation["total_elapsed_ms"]
+                    no_loop_elapsed_values.append(no_loop_elapsed_ms)
+                    no_loop_total_elapsed_values.append(no_loop_total_elapsed_ms)
+                    no_loop_status_counts[no_loop_result.status] = (
+                        no_loop_status_counts.get(no_loop_result.status, 0) + 1
+                    )
+                    no_loop_match = result_matches_expected_codes(
+                        no_loop_result,
+                        expected_code=case.expected_code,
+                        alternate_codes=case.alternate_codes,
+                        search_equivalent_codes=search_equivalent_codes,
+                        allow_022_search_equivalence=case.allow_022_search_equivalence,
+                    )
+                    no_loop_matched = bool(no_loop_match["matched"])
+                    no_loop_passed += int(no_loop_matched)
+                    record.update(
+                        _build_no_loop_record_fields(
+                            result=no_loop_result,
+                            matched=no_loop_matched,
+                            match_reason=no_loop_match["reason"],
+                            elapsed_ms=no_loop_elapsed_ms,
+                            total_elapsed_ms=no_loop_total_elapsed_ms,
+                            turn_results=no_loop_evaluation["turn_results"],
+                            trace=(
+                                no_loop_evaluation["trace"] if trace_enabled else None
+                            ),
+                        ),
+                    )
+                both_failed += int(not no_loop_matched)
+                no_loop_only_passed += int(no_loop_matched)
             records.append(record)
             if progress_callback is not None:
                 progress_callback(total, len(cases), record, passed)
@@ -196,21 +254,82 @@ async def _evaluate_loaded_cases(
             search_equivalent_codes=search_equivalent_codes,
             allow_022_search_equivalence=case.allow_022_search_equivalence,
         )
-        passed += int(match["matched"])
+        loop_matched = bool(match["matched"])
+        passed += int(loop_matched)
 
         record = _build_record(
             case=case,
             result=result,
-            matched=match["matched"],
+            matched=loop_matched,
             match_reason=match["reason"],
             elapsed_ms=elapsed_ms,
             total_elapsed_ms=total_elapsed_ms,
             eval_mode="end2end" if if_end2end else "gold_history",
-            intent_only=intent_only,
             turn_results=evaluation["turn_results"],
         )
         if trace_enabled:
             record["trace"] = evaluation["trace"]
+        if compare_no_loop:
+            no_loop_started = time.perf_counter()
+            try:
+                no_loop_evaluation = await _run_eval_case(
+                    case,
+                    registry=registry,
+                    code_index=code_index,
+                    router=router,
+                    trace_enabled=trace_enabled,
+                    if_end2end=if_end2end,
+                    no_loop=True,
+                )
+            except Exception as exc:
+                no_loop_elapsed_ms = (time.perf_counter() - no_loop_started) * 1000
+                no_loop_elapsed_values.append(no_loop_elapsed_ms)
+                no_loop_total_elapsed_values.append(no_loop_elapsed_ms)
+                no_loop_status_counts["error"] = (
+                    no_loop_status_counts.get("error", 0) + 1
+                )
+                no_loop_matched = False
+                record.update(
+                    _build_no_loop_error_fields(
+                        error=exc,
+                        elapsed_ms=no_loop_elapsed_ms,
+                        total_elapsed_ms=no_loop_elapsed_ms,
+                    ),
+                )
+            else:
+                no_loop_result = no_loop_evaluation["result"]
+                no_loop_elapsed_ms = no_loop_evaluation["elapsed_ms"]
+                no_loop_total_elapsed_ms = no_loop_evaluation["total_elapsed_ms"]
+                no_loop_elapsed_values.append(no_loop_elapsed_ms)
+                no_loop_total_elapsed_values.append(no_loop_total_elapsed_ms)
+                no_loop_status_counts[no_loop_result.status] = (
+                    no_loop_status_counts.get(no_loop_result.status, 0) + 1
+                )
+                no_loop_match = result_matches_expected_codes(
+                    no_loop_result,
+                    expected_code=case.expected_code,
+                    alternate_codes=case.alternate_codes,
+                    search_equivalent_codes=search_equivalent_codes,
+                    allow_022_search_equivalence=case.allow_022_search_equivalence,
+                )
+                no_loop_matched = bool(no_loop_match["matched"])
+                no_loop_passed += int(no_loop_matched)
+                record.update(
+                    _build_no_loop_record_fields(
+                        result=no_loop_result,
+                        matched=no_loop_matched,
+                        match_reason=no_loop_match["reason"],
+                        elapsed_ms=no_loop_elapsed_ms,
+                        total_elapsed_ms=no_loop_total_elapsed_ms,
+                        turn_results=no_loop_evaluation["turn_results"],
+                        trace=no_loop_evaluation["trace"] if trace_enabled else None,
+                    ),
+                )
+
+            both_passed += int(loop_matched and no_loop_matched)
+            both_failed += int(not loop_matched and not no_loop_matched)
+            loop_only_passed += int(loop_matched and not no_loop_matched)
+            no_loop_only_passed += int(not loop_matched and no_loop_matched)
         records.append(record)
         if progress_callback is not None:
             progress_callback(total, len(cases), record, passed)
@@ -222,7 +341,6 @@ async def _evaluate_loaded_cases(
         "failed": failed,
         "accuracy": (passed / total) if total else 0.0,
         "eval_mode": "end2end" if if_end2end else "gold_history",
-        "intent_only": intent_only,
         "avg_elapsed_ms": _average(elapsed_values),
         "avg_total_elapsed_ms": _average(total_elapsed_values),
         "avg_loop_count": _average(loop_counts),
@@ -232,8 +350,62 @@ async def _evaluate_loaded_cases(
         "error_count": status_counts.get("error", 0),
         "output_path": str(output_path),
     }
+    if compare_no_loop:
+        no_loop_failed = total - no_loop_passed
+        summary.update(
+            {
+                "compare_no_loop": True,
+                "no_loop_passed": no_loop_passed,
+                "no_loop_failed": no_loop_failed,
+                "no_loop_accuracy": (no_loop_passed / total) if total else 0.0,
+                "no_loop_avg_elapsed_ms": _average(no_loop_elapsed_values),
+                "no_loop_avg_total_elapsed_ms": _average(
+                    no_loop_total_elapsed_values,
+                ),
+                "no_loop_matched_count": no_loop_status_counts.get("matched", 0),
+                "no_loop_clarify_count": no_loop_status_counts.get("clarify", 0),
+                "no_loop_no_match_count": no_loop_status_counts.get("no_match", 0),
+                "no_loop_error_count": no_loop_status_counts.get("error", 0),
+                "both_passed": both_passed,
+                "both_failed": both_failed,
+                "loop_only_passed": loop_only_passed,
+                "no_loop_only_passed": no_loop_only_passed,
+            },
+        )
     write_xlsx_result(output_path, records, summary)
     return summary
+
+
+async def _run_eval_case(
+    case: XlsxEvalCase,
+    *,
+    registry: SkillRegistry,
+    code_index: dict[str, tuple[SkillDefinition, str]],
+    router: IntentRouter,
+    trace_enabled: bool,
+    if_end2end: bool,
+    no_loop: bool,
+) -> dict[str, Any]:
+    if if_end2end:
+        return await _run_end_to_end_case(
+            case,
+            router=router,
+            trace_enabled=trace_enabled,
+            no_loop=no_loop,
+        )
+
+    history = build_gold_dialogue_history(
+        case.history_turns,
+        registry,
+        code_index,
+    )
+    return await _run_gold_history_case(
+        case,
+        router=router,
+        history=history,
+        trace_enabled=trace_enabled,
+        no_loop=no_loop,
+    )
 
 
 async def _run_gold_history_case(
@@ -242,14 +414,12 @@ async def _run_gold_history_case(
     router: IntentRouter,
     history: DialogueHistory,
     trace_enabled: bool,
+    no_loop: bool = False,
 ) -> dict[str, Any]:
     trace: list[dict[str, Any]] | None = [] if trace_enabled else None
     started = time.perf_counter()
-    result = await router.route(
-        case.query,
-        dialogue_history=history,
-        trace=trace,
-    )
+    route_func = router.route_no_loop if no_loop else router.route
+    result = await route_func(case.query, dialogue_history=history, trace=trace)
     elapsed_ms = (time.perf_counter() - started) * 1000
     turn_results = [
         _build_turn_result(
@@ -275,6 +445,7 @@ async def _run_end_to_end_case(
     *,
     router: IntentRouter,
     trace_enabled: bool,
+    no_loop: bool = False,
 ) -> dict[str, Any]:
     agent = IntentDialogueAgent(router)
     turn_results: list[dict[str, Any]] = []
@@ -302,7 +473,8 @@ async def _run_end_to_end_case(
     for index, turn in enumerate(turns, start=1):
         trace: list[dict[str, Any]] | None = [] if trace_enabled else None
         started = time.perf_counter()
-        result = await agent.send(turn["query"], trace=trace)
+        send_func = agent.send_no_loop if no_loop else agent.send
+        result = await send_func(turn["query"], trace=trace)
         elapsed_ms = (time.perf_counter() - started) * 1000
         if turn["is_scored"]:
             final_elapsed_ms = elapsed_ms
@@ -571,7 +743,6 @@ def write_xlsx_result(
     headers = [
         "row_index",
         "eval_mode",
-        "intent_only",
         "history_turn_count",
         "query",
         "expected_code",
@@ -600,6 +771,25 @@ def write_xlsx_result(
         "error",
         "turn_results",
         "trace",
+        "no_loop_predicted_status",
+        "no_loop_predicted_skill_id",
+        "no_loop_predicted_intent",
+        "no_loop_predicted_code",
+        "no_loop_matched",
+        "no_loop_match_reason",
+        "no_loop_elapsed_ms",
+        "no_loop_total_elapsed_ms",
+        "no_loop_loop_count",
+        "no_loop_correction_scopes",
+        "no_loop_resolved_query",
+        "no_loop_context_relation",
+        "no_loop_question",
+        "no_loop_options",
+        "no_loop_reason",
+        "no_loop_error_type",
+        "no_loop_error",
+        "no_loop_turn_results",
+        "no_loop_trace",
     ]
     result_sheet.append(headers)
     for record in records:
@@ -729,7 +919,6 @@ def _build_record(
     elapsed_ms: float,
     total_elapsed_ms: float,
     eval_mode: str,
-    intent_only: bool,
     turn_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
     skill_id = result.skill.id if result.skill else None
@@ -739,7 +928,6 @@ def _build_record(
     return {
         "row_index": case.row_index,
         "eval_mode": eval_mode,
-        "intent_only": intent_only,
         "history_turn_count": len(case.history_turns),
         "query": case.query,
         "expected_code": case.expected_code,
@@ -780,12 +968,10 @@ def _build_error_record(
     elapsed_ms: float,
     total_elapsed_ms: float,
     eval_mode: str,
-    intent_only: bool,
 ) -> dict[str, Any]:
     return {
         "row_index": case.row_index,
         "eval_mode": eval_mode,
-        "intent_only": intent_only,
         "history_turn_count": len(case.history_turns),
         "query": case.query,
         "expected_code": case.expected_code,
@@ -814,6 +1000,69 @@ def _build_error_record(
         "error_type": type(error).__name__,
         "error": str(error),
         "turn_results": [],
+    }
+
+
+def _build_no_loop_record_fields(
+    *,
+    result: RouteResult,
+    matched: bool,
+    match_reason: str,
+    elapsed_ms: float,
+    total_elapsed_ms: float,
+    turn_results: list[dict[str, Any]],
+    trace: Any,
+) -> dict[str, Any]:
+    skill_id = result.skill.id if result.skill else None
+    return {
+        "no_loop_predicted_status": result.status,
+        "no_loop_predicted_skill_id": skill_id,
+        "no_loop_predicted_intent": result.intent,
+        "no_loop_predicted_code": result.code,
+        "no_loop_matched": matched,
+        "no_loop_match_reason": match_reason,
+        "no_loop_elapsed_ms": round(elapsed_ms, 3),
+        "no_loop_total_elapsed_ms": round(total_elapsed_ms, 3),
+        "no_loop_loop_count": result.loop_count,
+        "no_loop_correction_scopes": result.correction_scopes,
+        "no_loop_resolved_query": result.resolved_query,
+        "no_loop_context_relation": result.context_relation,
+        "no_loop_question": result.question,
+        "no_loop_options": result.options,
+        "no_loop_reason": result.reason,
+        "no_loop_error_type": None,
+        "no_loop_error": None,
+        "no_loop_turn_results": turn_results,
+        "no_loop_trace": trace,
+    }
+
+
+def _build_no_loop_error_fields(
+    *,
+    error: Exception,
+    elapsed_ms: float,
+    total_elapsed_ms: float,
+) -> dict[str, Any]:
+    return {
+        "no_loop_predicted_status": "error",
+        "no_loop_predicted_skill_id": None,
+        "no_loop_predicted_intent": None,
+        "no_loop_predicted_code": None,
+        "no_loop_matched": False,
+        "no_loop_match_reason": "exception",
+        "no_loop_elapsed_ms": round(elapsed_ms, 3),
+        "no_loop_total_elapsed_ms": round(total_elapsed_ms, 3),
+        "no_loop_loop_count": 0,
+        "no_loop_correction_scopes": [],
+        "no_loop_resolved_query": None,
+        "no_loop_context_relation": None,
+        "no_loop_question": None,
+        "no_loop_options": [],
+        "no_loop_reason": None,
+        "no_loop_error_type": type(error).__name__,
+        "no_loop_error": str(error),
+        "no_loop_turn_results": [],
+        "no_loop_trace": None,
     }
 
 

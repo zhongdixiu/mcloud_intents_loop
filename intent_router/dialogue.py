@@ -52,6 +52,33 @@ class IntentDialogueAgent:
         )
         return result
 
+    async def send_no_loop(
+        self,
+        query: str,
+        *,
+        context: dict[str, Any] | None = None,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> RouteResult:
+        result = await self.router.route_no_loop(
+            query,
+            dialogue_history=self.history,
+            context=context,
+            trace=trace,
+        )
+        self.history.turns.append(
+            DialogueTurn(
+                user_query=query,
+                result=summarize_route_result(result),
+                metadata={
+                    "loop_count": result.loop_count,
+                    "correction_scopes": list(result.correction_scopes),
+                    "visited_skills": list(result.visited_skills),
+                    "route_mode": "no_loop",
+                },
+            ),
+        )
+        return result
+
 def summarize_route_result(result: RouteResult) -> DialogueRouteSummary:
     skill_id = result.skill.id if result.skill else None
     skill_name = result.skill.name if result.skill else None
