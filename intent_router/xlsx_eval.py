@@ -29,6 +29,12 @@ SEARCH_SKILL_ID = "mcloud_search_skill"
 SEARCH_022_CODE = "022"
 ORDINARY_DIALOGUE_CODE = "000"
 LEGACY_999_EQUIVALENT_CODE = "018"
+LEGACY_CODE_EQUIVALENTS = {
+    "001": "036006",
+    "028": "040001",
+    "032": "040003",
+    "999": LEGACY_999_EQUIVALENT_CODE,
+}
 
 
 @dataclass(frozen=True)
@@ -136,24 +142,44 @@ async def _evaluate_loaded_cases(
 
     for case in cases:
         total += 1
-        if if_end2end:
-            evaluation = await _run_end_to_end_case(
-                case,
-                router=router,
-                trace_enabled=trace_enabled,
+        case_started = time.perf_counter()
+        try:
+            if if_end2end:
+                evaluation = await _run_end_to_end_case(
+                    case,
+                    router=router,
+                    trace_enabled=trace_enabled,
+                )
+            else:
+                history = build_gold_dialogue_history(
+                    case.history_turns,
+                    registry,
+                    code_index,
+                )
+                evaluation = await _run_gold_history_case(
+                    case,
+                    router=router,
+                    history=history,
+                    trace_enabled=trace_enabled,
+                )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - case_started) * 1000
+            elapsed_values.append(elapsed_ms)
+            total_elapsed_values.append(elapsed_ms)
+            loop_counts.append(0)
+            status_counts["error"] = status_counts.get("error", 0) + 1
+            record = _build_error_record(
+                case=case,
+                error=exc,
+                elapsed_ms=elapsed_ms,
+                total_elapsed_ms=elapsed_ms,
+                eval_mode="end2end" if if_end2end else "gold_history",
+                intent_only=intent_only,
             )
-        else:
-            history = build_gold_dialogue_history(
-                case.history_turns,
-                registry,
-                code_index,
-            )
-            evaluation = await _run_gold_history_case(
-                case,
-                router=router,
-                history=history,
-                trace_enabled=trace_enabled,
-            )
+            records.append(record)
+            if progress_callback is not None:
+                progress_callback(total, len(cases), record, passed)
+            continue
 
         result = evaluation["result"]
         elapsed_ms = evaluation["elapsed_ms"]
@@ -203,6 +229,7 @@ async def _evaluate_loaded_cases(
         "matched_count": status_counts.get("matched", 0),
         "clarify_count": status_counts.get("clarify", 0),
         "no_match_count": status_counts.get("no_match", 0),
+        "error_count": status_counts.get("error", 0),
         "output_path": str(output_path),
     }
     write_xlsx_result(output_path, records, summary)
@@ -569,6 +596,8 @@ def write_xlsx_result(
         "question",
         "options",
         "reason",
+        "error_type",
+        "error",
         "turn_results",
         "trace",
     ]
@@ -592,15 +621,13 @@ def normalize_code(value: Any) -> str | None:
             return str(value).strip()
         value = int(value)
     if isinstance(value, int):
-        if value == 999:
-            return LEGACY_999_EQUIVALENT_CODE
         if value == 0:
             return ORDINARY_DIALOGUE_CODE
         if 0 < value < 1000:
-            return f"{value:03d}"
+            return _equivalent_code(f"{value:03d}")
         if 10000 <= value < 100000:
-            return f"{value:06d}"
-        return str(value)
+            return _equivalent_code(f"{value:06d}")
+        return _equivalent_code(str(value))
 
     text = str(value).strip()
     if not text:
@@ -611,16 +638,18 @@ def normalize_code(value: Any) -> str | None:
     if re.fullmatch(r"\d+", text) or decimal_integer_match:
         digits = decimal_integer_match.group(1) if decimal_integer_match else text
         number = int(digits)
-        if number == 999:
-            return LEGACY_999_EQUIVALENT_CODE
         if number == 0:
             return ORDINARY_DIALOGUE_CODE
         if len(digits) < 3 and number < 1000:
-            return f"{number:03d}"
+            return _equivalent_code(f"{number:03d}")
         if len(digits) == 5 and 10000 <= number < 100000:
-            return f"{number:06d}"
-        return digits
-    return text
+            return _equivalent_code(f"{number:06d}")
+        return _equivalent_code(digits)
+    return _equivalent_code(text)
+
+
+def _equivalent_code(code: str) -> str:
+    return LEGACY_CODE_EQUIVALENTS.get(code, code)
 
 
 def _summary_for_expected_code(
@@ -741,6 +770,50 @@ def _build_record(
         "options": result.options,
         "reason": result.reason,
         "turn_results": turn_results,
+    }
+
+
+def _build_error_record(
+    *,
+    case: XlsxEvalCase,
+    error: Exception,
+    elapsed_ms: float,
+    total_elapsed_ms: float,
+    eval_mode: str,
+    intent_only: bool,
+) -> dict[str, Any]:
+    return {
+        "row_index": case.row_index,
+        "eval_mode": eval_mode,
+        "intent_only": intent_only,
+        "history_turn_count": len(case.history_turns),
+        "query": case.query,
+        "expected_code": case.expected_code,
+        "alternate_codes": case.alternate_codes,
+        "expected_codes": case.source_expected_codes
+        or [case.expected_code, *case.alternate_codes],
+        "effective_expected_codes": [case.expected_code, *case.alternate_codes],
+        "history_codes": [turn.expected_code for turn in case.history_turns],
+        "history_predicted_codes": [],
+        "history_loop_counts": [],
+        "predicted_status": "error",
+        "predicted_skill_id": None,
+        "predicted_intent": None,
+        "predicted_code": None,
+        "matched": False,
+        "match_reason": "exception",
+        "elapsed_ms": round(elapsed_ms, 3),
+        "total_elapsed_ms": round(total_elapsed_ms, 3),
+        "loop_count": 0,
+        "correction_scopes": [],
+        "resolved_query": None,
+        "context_relation": None,
+        "question": None,
+        "options": [],
+        "reason": None,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "turn_results": [],
     }
 
 

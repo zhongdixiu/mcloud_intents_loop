@@ -28,15 +28,23 @@ def test_normalize_and_split_codes() -> None:
     assert normalize_code("0000") == "000"
     assert normalize_code(999) == "018"
     assert normalize_code("999") == "018"
+    assert normalize_code(1) == "036006"
+    assert normalize_code("001") == "036006"
+    assert normalize_code(28) == "040001"
+    assert normalize_code("028") == "040001"
+    assert normalize_code(32) == "040003"
+    assert normalize_code("032") == "040003"
     assert normalize_code(22) == "022"
     assert normalize_code("22") == "022"
     assert normalize_code(36006) == "036006"
-    assert split_codes("012、22, 036006/0/999") == [
+    assert split_codes("012、22, 036006/0/999/001/028/032") == [
         "012",
         "022",
         "036006",
         "000",
         "018",
+        "040001",
+        "040003",
     ]
 
 
@@ -440,6 +448,58 @@ async def test_evaluate_xlsx_cases_reports_progress(tmp_path: Path) -> None:
     assert progress_events == [(1, 1, True, 1)]
 
 
+async def test_evaluate_xlsx_cases_records_row_exception_and_continues(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cases.xlsx"
+    output = tmp_path / "result.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["当前对话", "当前预期意图"])
+    sheet.append(["会触发异常", "000"])
+    sheet.append(["闲聊一下", "000"])
+    workbook.save(path)
+
+    router = FakeRouter(
+        [
+            RuntimeError("structured output validation failed"),
+            RouteResult(
+                status="matched",
+                intent="普通对话",
+                code="000",
+                loop_count=1,
+            ),
+        ],
+    )
+
+    summary = await evaluate_xlsx_cases(
+        path,
+        skills_path="skills",
+        output_path=output,
+        router=router,  # type: ignore[arg-type]
+    )
+
+    assert summary["total"] == 2
+    assert summary["passed"] == 1
+    assert summary["failed"] == 1
+    assert summary["error_count"] == 1
+
+    workbook = load_workbook(output)
+    result_sheet = workbook["results"]
+    headers = [cell.value for cell in result_sheet[1]]
+    rows = [
+        dict(zip(headers, [cell.value for cell in row], strict=True))
+        for row in result_sheet.iter_rows(min_row=2, max_row=3)
+    ]
+    assert rows[0]["predicted_status"] == "error"
+    assert rows[0]["matched"] is False
+    assert rows[0]["match_reason"] == "exception"
+    assert rows[0]["error_type"] == "RuntimeError"
+    assert rows[0]["error"] == "structured output validation failed"
+    assert rows[1]["predicted_status"] == "matched"
+    assert rows[1]["matched"] is True
+
+
 async def test_evaluate_xlsx_cases_end_to_end_routes_history_before_current(
     tmp_path: Path,
 ) -> None:
@@ -602,7 +662,7 @@ async def test_evaluate_xlsx_cases_records_intent_only_mode(tmp_path: Path) -> N
 
 
 class FakeRouter:
-    def __init__(self, results: list[RouteResult]) -> None:
+    def __init__(self, results: list[RouteResult | Exception]) -> None:
         self.results = results
         self.histories: list[DialogueHistory] = []
         self.queries: list[str] = []
@@ -621,4 +681,7 @@ class FakeRouter:
         )
         if trace is not None:
             trace.append({"event": "fake"})
-        return self.results.pop(0)
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result

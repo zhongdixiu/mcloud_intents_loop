@@ -43,6 +43,15 @@ class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+CONTEXT_RELATION_VALUES = {
+    "new_request",
+    "continuation",
+    "revision",
+    "answer_to_previous",
+    "ambiguous",
+}
+
+
 ClarifyScope = Literal[
     "route_boundary",
     "intent_code_boundary",
@@ -72,6 +81,15 @@ class SkillRouteDecisionNoClarify(StrictOutputModel):
     options: list[dict[str, str]] = Field(default_factory=list)
     clarify_scope: ClarifyScope | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_clarify_status(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("status") != "clarify":
+            return data
+        normalized = dict(data)
+        normalized["status"] = "route" if normalized.get("skill_id") else "no_match"
+        return normalized
+
 
 class IntentDecision(StrictOutputModel):
     status: Literal["matched", "clarify", "no_match"]
@@ -95,6 +113,19 @@ class IntentDecisionNoClarify(StrictOutputModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
     clarify_scope: ClarifyScope | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_clarify_status(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("status") != "clarify":
+            return data
+        normalized = dict(data)
+        normalized["status"] = (
+            "matched"
+            if normalized.get("intent") or normalized.get("code")
+            else "no_match"
+        )
+        return normalized
 
 
 class EvaluationDecision(StrictOutputModel):
@@ -155,14 +186,7 @@ class ContextualizedRequest(StrictOutputModel):
         if not isinstance(data, dict):
             return data
         status = data.get("status")
-        relation_values = {
-            "new_request",
-            "continuation",
-            "revision",
-            "answer_to_previous",
-            "ambiguous",
-        }
-        if status not in relation_values:
+        if status not in CONTEXT_RELATION_VALUES:
             return data
 
         normalized = dict(data)
@@ -193,6 +217,21 @@ class ContextualizedRequestNoClarify(StrictOutputModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
     clarify_scope: ClarifyScope | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_no_clarify_status(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        status = data.get("status")
+        if status != "clarify" and status not in CONTEXT_RELATION_VALUES:
+            return data
+
+        normalized = dict(data)
+        if status in CONTEXT_RELATION_VALUES:
+            normalized.setdefault("relation_to_history", status)
+        normalized["status"] = "resolved"
+        return normalized
 
 
 class LoopExhaustedClarification(StrictOutputModel):

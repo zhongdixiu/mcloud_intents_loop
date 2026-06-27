@@ -795,6 +795,67 @@ async def test_intent_only_retries_contextualizer_clarify_for_missing_entity() -
     assert model.calls[1][2] is ContextualizedRequestNoClarify
 
 
+async def test_intent_only_contextualizer_no_clarify_tolerates_residual_clarify() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                status="clarify",
+                question="请问您想总结什么内容？",
+                clarify_scope="missing_entity",
+            ),
+            {
+                "status": "clarify",
+                "resolved_query": "总结概括上一轮文档",
+                "relation_to_history": "continuation",
+                "question": "请问您想总结什么内容？",
+                "clarify_scope": "missing_entity",
+            },
+            SkillRouteDecision(
+                status="route",
+                skill_id="work_skill",
+                confidence=0.9,
+            ),
+            IntentDecision(
+                status="matched",
+                intent="总结概括",
+                code="036011",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(verdict="accept", confidence=0.7),
+        ],
+    )
+    router = IntentRouter.from_config(
+        "skills",
+        model_client=model,
+        intent_only=True,
+    )
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜索AI助手的测评报告文档",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    skill_name="云盘搜索",
+                    intent="搜文档",
+                    code="013",
+                    resolved_query="搜索AI助手的测评报告文档",
+                ),
+            ),
+        ],
+    )
+    trace: list[dict] = []
+
+    result = await router.route("总结概括", dialogue_history=history, trace=trace)
+
+    assert result.status == "matched"
+    assert result.intent == "总结概括"
+    assert result.resolved_query == "总结概括上一轮文档"
+    assert model.calls[1][2] is ContextualizedRequestNoClarify
+    assert any(event["event"] == "contextualize_no_clarify" for event in trace)
+
+
 async def test_intent_only_keeps_true_route_boundary_clarify() -> None:
     model = FakeStructuredClient(
         [

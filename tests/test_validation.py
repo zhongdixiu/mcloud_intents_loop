@@ -4,9 +4,12 @@ from pydantic import ValidationError as PydanticValidationError
 from intent_router.skills import SkillRegistry
 from intent_router.types import (
     ContextualizedRequest,
+    ContextualizedRequestNoClarify,
     EvaluationDecision,
     IntentDecision,
+    IntentDecisionNoClarify,
     SkillRouteDecision,
+    SkillRouteDecisionNoClarify,
 )
 from intent_router.validation import (
     ValidationError,
@@ -141,6 +144,59 @@ def test_contextualized_request_normalizes_ambiguous_status_to_clarify() -> None
     assert request.status == "clarify"
     assert request.relation_to_history == "ambiguous"
     assert request.question == "您是要搜索蓝色图片还是蓝色文档？"
+
+
+def test_contextualized_request_no_clarify_normalizes_clarify_to_resolved() -> None:
+    request = ContextualizedRequestNoClarify.model_validate(
+        {
+            "status": "clarify",
+            "resolved_query": "总结概括上一轮文档",
+            "relation_to_history": "continuation",
+            "question": "请问您想总结什么内容？",
+            "clarify_scope": "missing_entity",
+        },
+    )
+
+    assert request.status == "resolved"
+    assert request.relation_to_history == "continuation"
+    assert request.resolved_query == "总结概括上一轮文档"
+
+
+def test_contextualized_request_no_clarify_normalizes_relation_status() -> None:
+    request = ContextualizedRequestNoClarify.model_validate(
+        {
+            "status": "continuation",
+            "resolved_query": "搜索AI助手测评报告PPT",
+        },
+    )
+
+    assert request.status == "resolved"
+    assert request.relation_to_history == "continuation"
+
+
+def test_no_clarify_route_and_intent_models_normalize_residual_clarify() -> None:
+    route = SkillRouteDecisionNoClarify.model_validate(
+        {
+            "status": "clarify",
+            "skill_id": "work_skill",
+            "question": "您想处理哪份文件？",
+            "clarify_scope": "missing_entity",
+        },
+    )
+    intent = IntentDecisionNoClarify.model_validate(
+        {
+            "status": "clarify",
+            "intent": "总结概括",
+            "code": "036011",
+            "question": "您想总结哪份文件？",
+            "clarify_scope": "missing_entity",
+        },
+    )
+
+    assert route.status == "route"
+    assert route.skill_id == "work_skill"
+    assert intent.status == "matched"
+    assert intent.code == "036011"
 
 
 def test_structured_output_models_reject_unknown_fields() -> None:
