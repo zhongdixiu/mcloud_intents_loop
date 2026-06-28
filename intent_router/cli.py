@@ -125,6 +125,7 @@ async def _route(
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        mode="production",
     )
     trace: list[dict] | None = [] if trace_enabled else None
     result = await router.route(query, trace=trace)
@@ -147,6 +148,7 @@ async def _chat(skills: str, trace_enabled: bool, history_limit: int = 5) -> Non
     agent = IntentDialogueAgent.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        mode="production",
     )
     _print_chat_help()
     while True:
@@ -250,6 +252,7 @@ async def _eval(
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        mode="code_eval",
     )
     total = 0
     passed = 0

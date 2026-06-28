@@ -59,6 +59,14 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+`IntentRouter.from_config(..., mode="production")` is the default for SDK and
+interactive usage. Excel evaluation commands construct the router with
+`mode="code_eval"` so the loop only evaluates `skill/intent/code`: missing
+entities, resource handles, operation objects, and parameters do not trigger
+clarification or retries. In `code_eval`, evaluator rejects are conservative:
+they are applied only when a high-confidence `preferred_code` is provided;
+otherwise the original candidate is accepted or used as the fallback candidate.
+
 Multi-turn dialogue routing:
 
 ```python
@@ -95,9 +103,9 @@ python -m intent_router chat --skills skills
 The `chat` command keeps dialogue history in the terminal process. The router
 first injects the latest 5 turns into a contextualizer prompt: user query plus
 the final route result. The contextualizer produces `resolved_query`, and skill
-routing, intent selection, parameter repair, and evaluation all use that unified
-request. Later prompts keep `current_user_query` only for audit context and do
-not receive `dialogue_history` directly. Clarification options are semantic
+routing, intent selection, and evaluation all use that unified request. Later
+prompts keep `current_user_query` only for audit context and do not receive
+`dialogue_history` directly. Clarification options are semantic
 anchors rather than closed enums: a follow-up can select an option, provide a
 new valid direction, or start a new request. If a turn is resolved as an answer
 to a previous clarification, `resolved_query` must be a complete routeable

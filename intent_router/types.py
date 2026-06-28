@@ -142,8 +142,10 @@ class EvaluationDecision(StrictOutputModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
     clarify_scope: ClarifyScope | None = None
+    preferred_skill_id: str | None = None
     preferred_intent: str | None = None
     preferred_code: str | None = None
+    is_code_blocking: bool = False
 
 
 class EvaluationDecisionNoClarify(StrictOutputModel):
@@ -160,8 +162,10 @@ class EvaluationDecisionNoClarify(StrictOutputModel):
     question: str | None = None
     options: list[dict[str, str]] = Field(default_factory=list)
     clarify_scope: ClarifyScope | None = None
+    preferred_skill_id: str | None = None
     preferred_intent: str | None = None
     preferred_code: str | None = None
+    is_code_blocking: bool = False
 
 
 class ContextualizedRequest(StrictOutputModel):

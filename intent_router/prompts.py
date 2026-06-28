@@ -185,8 +185,11 @@ EVALUATOR_EXTRA_RULES = """Evaluator 额外规则：
 2. 对总结、润色、翻译、配文、识别、编辑、生成等处理型意图，resolved_query 中的自然语言对象来源可作为语义证据；不要因为缺 file_id、image_id、真实文件名或唯一资源选择而 clarify。
 3. 若候选结果满足的是历史搜索动作，但 current_user_query 明确表达推荐、问答、生成、创作、编辑、处理或总结等非搜索形态，应按错误层级 reject；不要接受被历史污染成搜索的结果。
 4. 只要 skill/intent/code 正确，不要因为主体、关键词、联系人、文件句柄、图片句柄、操作对象或唯一资源选择缺失而 reject 或 clarify；这类问题不影响意图 code 评测。
-5. verdict=clarify 时必须填写 clarify_scope；仅当缺失信息会改变 skill 或 code 才可 clarify。
-6. 若判定 candidate 的 intent 名称不是最佳，但最佳 intent 与 candidate 的 code 相同，应填写 preferred_intent/preferred_code；不要因此 reject。
+5. 本项目默认按 code_eval 评测：不确定时接受 candidate，不要用 clarify 作为安全出口。
+6. 只有你确信 candidate 的 code 错误，且能填写真实存在的 preferred_code 时，才允许 verdict=reject；同时必须设置 is_code_blocking=true，confidence 必须 >= 0.8。
+7. reject 时必须填写 preferred_code；若知道 preferred_skill_id 或 preferred_intent 也一并填写。没有 preferred_code 时必须 accept。
+8. 若判定 candidate 的 intent 名称不是最佳，但最佳 intent 与 candidate 的 code 相同，应填写 preferred_intent/preferred_code；不要因此 reject。
+9. 参数缺失、实体缺失、资源句柄缺失、唯一资源选择缺失、联系人/主体对象缺失，均不是 code_blocking 错误。
 """
 
 LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的澄清问题生成节点。
@@ -219,8 +222,8 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级路由�
 9. 只有多个 skill 都可满足且用户补充会改变 skill 选择时，才输出 clarify。
 10. 若用户明确查找某个移动云盘功能、AI工具或入口，应优先选择对应功能/工具 skill；不要仅因“推荐一下/有没有/如何使用”就直接归普通对话。
 11. 若用户明确询问云盘中是否有某类资源，或要求把资源找出来，应按资源搜索理解，不要当作纯语言问答。
-12. 不要选择未提供的 skill id，不要选择 current_loop_rejected_skill_ids。
-13. current_loop_rejected_skill_ids 只表示本次 route 内已经确认不适合的 skill，用于避免重复尝试，不是跨轮历史事实。
+12. 不要选择未提供的 skill id。
+13. current_loop_rejected_skill_ids 只是历史尝试参考，不是硬禁止列表；若它仍是最优 skill，可以重新选择。
 14. 遵守以下上下文语义使用规则。
 {contextualized_request_rules}
 15. status=clarify 时必须填写 clarify_scope；只有用户补充会改变一级 skill 时使用 route_boundary。
@@ -235,10 +238,10 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级意图�
 3. params 只能包含 Tools Schema 声明的字段，且只能抽取用户明确出现或可直接确定的信息，禁止常识补全。
 4. 具体操作类能力优先于入口类能力；入口类 intent 只在用户明确要求打开、进入、使用该入口时选择。
 5. 专用 intent 优先于通用兜底 intent；兜底 intent 只在没有更专用工具覆盖时选择。
-6. 必须做竞争意图检查：若同一 skill 内多个 intent 都可满足用户目标，但依赖不同输入来源、处理对象、输出形态或操作方式，且用户未给出关键区分信息，输出 clarify，不要猜测。
+6. 必须做竞争意图检查：若同一 skill 内多个 intent 都可满足用户目标，优先选择最贴近 code 的一个，不要因为输入来源、处理对象、输出形态或操作方式不完整而澄清。
 7. 若用户明确点名某工具，但实际诉求更符合本 skill 内其他具体 intent，应选择更合适的具体 intent；若本 skill 无法承接该诉求，输出 no_match。
 8. 对处理型 intent，若 resolved_query 已包含自然语言处理对象、主题或来源，可以据此选择 intent；不要因缺外层业务资源句柄而澄清。
-9. 若 rejected_intents 中已有被拒绝的 intent，除非用户澄清明确要求它，否则不要重复选择。
+9. rejected_intents 只是历史尝试参考，不是硬禁止列表；若某 intent 仍是最优 code，可以重新选择。
 10. 若该 skill 不支持用户请求，输出 no_match。
 11. 明确不具备的能力不要用 clarify 兜底。
 12. 若多个搜索类 intent 都可满足同一资源检索请求且当前只能输出单 intent，按对象类型优先级选择最贴近的一个，不要仅因同时出现多种资源类型而澄清。
@@ -253,17 +256,17 @@ EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的结果评�
 判断候选 skill/intent/code 是否真正满足用户请求。
 {output_contract}
 必须按顺序检查并输出 skill_check、intent_check；params_check 可固定为 pass 或留空：
-1. 先检查当前 skill 能否承接用户请求；若当前 skill 能力边界冲突，输出 reject 且 reject_scope=skill_mismatch，skill_check=fail。
-2. skill 通过后，检查当前 intent 是否是该 skill 内最佳二级意图；若存在更专用或更符合用户目标的 intent，输出 reject 且 reject_scope=intent_mismatch，intent_check=fail。
+1. 先检查当前 skill 能否承接用户请求；只有当前 skill 明确错误且你能给出 preferred_code 时，才输出 reject 且 reject_scope=skill_mismatch，skill_check=fail。
+2. skill 通过后，检查当前 intent 是否是该 skill 内最佳二级意图；只有当前 code 明确错误且你能给出 preferred_code 时，才输出 reject 且 reject_scope=intent_mismatch，intent_check=fail。
 3. 不检查 params 是否完整或语义最优，不要输出 reject_scope=param_mismatch。
 4. 代码已负责 intent/code 字段硬约束；你只负责语义与规则复核，不要重复进行纯结构校验。
-5. 若当前 intent 与其他 intent 都可满足，且缺少会改变最终 code 的区分信息，输出 clarify，并给出需用户补充的信息和可选方向。
-6. 澄清只用于已支持能力中的歧义或缺少关键信息；明确不具备能力时不要澄清。
+5. 若当前 intent 与其他 intent 都可满足，优先接受 candidate 或给出 preferred_code，不要输出 clarify。
+6. 澄清不是 code_eval 的安全出口；除非系统另行要求生产态澄清，否则不要输出 clarify。
 7. verdict=reject 时必须填写 reject_scope；只有 skill_check、intent_check 都通过时才允许 accept。
-8. 不要输出或暗示推荐 skill_id、intent 或 code；你只负责判断当前候选是否正确以及错在哪一层。
-9. 若确信当前候选正确，输出 accept；若不确定，输出 clarify；若明确错误，输出 reject。
+8. reject 时必须输出 preferred_code；若能确定 preferred_skill_id 或 preferred_intent，也必须输出。
+9. 若确信当前候选正确，输出 accept；若不确定，输出 accept；若明确错误且有 preferred_code，输出 reject。
 10. verdict=reject 时，只要你能判断错误层级，就必须填写 reject_scope。
-11. 若无法判断错误层级，应输出 clarify，而不是 reject。
+11. 若无法判断错误层级，应输出 accept，而不是 reject 或 clarify。
 12. 遵守以下上下文语义和评估规则。
 {contextualized_request_rules}
 {evaluator_extra_rules}

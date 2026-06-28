@@ -254,6 +254,77 @@ async def test_skill_reject_records_rejected_skill_even_with_low_confidence() ->
     assert second_router_prompt["current_loop_rejected_skill_ids"] == ["file_skill"]
 
 
+async def test_code_eval_accepts_low_confidence_reject_without_preferred_code() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(status="route", skill_id="file_skill", confidence=0.9),
+            IntentDecision(
+                status="matched",
+                intent="文件",
+                code="021",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="skill_mismatch",
+                skill_check="fail",
+                confidence=0.4,
+                reason="可能应该搜索",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model, mode="code_eval")
+    trace: list[dict] = []
+
+    result = await router.route("搜索合同文件", trace=trace)
+
+    assert result.status == "matched"
+    assert result.skill is not None
+    assert result.skill.id == "file_skill"
+    assert result.code == "021"
+    assert len(model.calls) == 3
+    assert any(event["event"] == "invalid_reject_accept" for event in trace)
+
+
+async def test_code_eval_accepts_high_confidence_preferred_code() -> None:
+    model = FakeStructuredClient(
+        [
+            SkillRouteDecision(status="route", skill_id="file_skill", confidence=0.9),
+            IntentDecision(
+                status="matched",
+                intent="文件",
+                code="021",
+                params={},
+                confidence=0.8,
+            ),
+            EvaluationDecision(
+                verdict="reject",
+                reject_scope="skill_mismatch",
+                skill_check="fail",
+                confidence=0.9,
+                reason="资源搜索应使用综合搜索",
+                preferred_skill_id="mcloud_search_skill",
+                preferred_intent="搜综合",
+                preferred_code="018",
+                is_code_blocking=True,
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model, mode="code_eval")
+    trace: list[dict] = []
+
+    result = await router.route("搜索合同文件", trace=trace)
+
+    assert result.status == "matched"
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.intent == "搜综合"
+    assert result.code == "018"
+    assert len(model.calls) == 3
+    assert any(event["event"] == "accept_preferred_code" for event in trace)
+
+
 async def test_router_retries_same_skill_after_intent_mismatch() -> None:
     """ Evaluator 判断 intent_mismatch 后，锁定当前 skill，只重新选择二级 intent，不重新 route skill。"""
     model = FakeStructuredClient(

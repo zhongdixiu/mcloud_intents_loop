@@ -70,6 +70,7 @@ async def evaluate_xlsx_cases(
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
+        mode="code_eval",
     )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -101,6 +102,7 @@ async def evaluate_format_xlsx_cases(
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
+        mode="code_eval",
     )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -230,6 +232,7 @@ async def _evaluate_loaded_cases(
                             trace=(
                                 no_loop_evaluation["trace"] if trace_enabled else None
                             ),
+                            trace_summary=no_loop_evaluation["trace_summary"],
                         ),
                     )
                 both_failed += int(not no_loop_matched)
@@ -266,6 +269,7 @@ async def _evaluate_loaded_cases(
             total_elapsed_ms=total_elapsed_ms,
             eval_mode="end2end" if if_end2end else "gold_history",
             turn_results=evaluation["turn_results"],
+            trace_summary=evaluation["trace_summary"],
         )
         if trace_enabled:
             record["trace"] = evaluation["trace"]
@@ -323,6 +327,7 @@ async def _evaluate_loaded_cases(
                         total_elapsed_ms=no_loop_total_elapsed_ms,
                         turn_results=no_loop_evaluation["turn_results"],
                         trace=no_loop_evaluation["trace"] if trace_enabled else None,
+                        trace_summary=no_loop_evaluation["trace_summary"],
                     ),
                 )
 
@@ -349,6 +354,7 @@ async def _evaluate_loaded_cases(
         "no_match_count": status_counts.get("no_match", 0),
         "error_count": status_counts.get("error", 0),
         "output_path": str(output_path),
+        "router_mode": router.mode,
     }
     if compare_no_loop:
         no_loop_failed = total - no_loop_passed
@@ -416,7 +422,7 @@ async def _run_gold_history_case(
     trace_enabled: bool,
     no_loop: bool = False,
 ) -> dict[str, Any]:
-    trace: list[dict[str, Any]] | None = [] if trace_enabled else None
+    trace: list[dict[str, Any]] = []
     started = time.perf_counter()
     route_func = router.route_no_loop if no_loop else router.route
     result = await route_func(case.query, dialogue_history=history, trace=trace)
@@ -436,7 +442,8 @@ async def _run_gold_history_case(
         "elapsed_ms": elapsed_ms,
         "total_elapsed_ms": elapsed_ms,
         "turn_results": turn_results,
-        "trace": trace,
+        "trace": trace if trace_enabled else None,
+        "trace_summary": _trace_summary(trace),
     }
 
 
@@ -471,7 +478,7 @@ async def _run_end_to_end_case(
     result: RouteResult | None = None
     final_elapsed_ms = 0.0
     for index, turn in enumerate(turns, start=1):
-        trace: list[dict[str, Any]] | None = [] if trace_enabled else None
+        trace: list[dict[str, Any]] = []
         started = time.perf_counter()
         send_func = agent.send_no_loop if no_loop else agent.send
         result = await send_func(turn["query"], trace=trace)
@@ -507,6 +514,7 @@ async def _run_end_to_end_case(
         "total_elapsed_ms": total_elapsed_ms,
         "turn_results": turn_results,
         "trace": turn_traces if trace_enabled else None,
+        "trace_summary": _trace_summary(trace or []),
     }
 
 
@@ -770,6 +778,10 @@ def write_xlsx_result(
         "error_type",
         "error",
         "turn_results",
+        "first_candidate_code",
+        "final_candidate_code",
+        "evaluator_verdicts",
+        "fallback_used",
         "trace",
         "no_loop_predicted_status",
         "no_loop_predicted_skill_id",
@@ -789,6 +801,10 @@ def write_xlsx_result(
         "no_loop_error_type",
         "no_loop_error",
         "no_loop_turn_results",
+        "no_loop_first_candidate_code",
+        "no_loop_final_candidate_code",
+        "no_loop_evaluator_verdicts",
+        "no_loop_fallback_used",
         "no_loop_trace",
     ]
     result_sheet.append(headers)
@@ -920,6 +936,7 @@ def _build_record(
     total_elapsed_ms: float,
     eval_mode: str,
     turn_results: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
 ) -> dict[str, Any]:
     skill_id = result.skill.id if result.skill else None
     history_turn_results = [
@@ -958,6 +975,10 @@ def _build_record(
         "options": result.options,
         "reason": result.reason,
         "turn_results": turn_results,
+        "first_candidate_code": trace_summary.get("first_candidate_code"),
+        "final_candidate_code": trace_summary.get("final_candidate_code"),
+        "evaluator_verdicts": trace_summary.get("evaluator_verdicts", []),
+        "fallback_used": trace_summary.get("fallback_used", False),
     }
 
 
@@ -1000,6 +1021,10 @@ def _build_error_record(
         "error_type": type(error).__name__,
         "error": str(error),
         "turn_results": [],
+        "first_candidate_code": None,
+        "final_candidate_code": None,
+        "evaluator_verdicts": [],
+        "fallback_used": False,
     }
 
 
@@ -1012,8 +1037,10 @@ def _build_no_loop_record_fields(
     total_elapsed_ms: float,
     turn_results: list[dict[str, Any]],
     trace: Any,
+    trace_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     skill_id = result.skill.id if result.skill else None
+    trace_summary = trace_summary or {}
     return {
         "no_loop_predicted_status": result.status,
         "no_loop_predicted_skill_id": skill_id,
@@ -1033,6 +1060,10 @@ def _build_no_loop_record_fields(
         "no_loop_error_type": None,
         "no_loop_error": None,
         "no_loop_turn_results": turn_results,
+        "no_loop_first_candidate_code": trace_summary.get("first_candidate_code"),
+        "no_loop_final_candidate_code": trace_summary.get("final_candidate_code"),
+        "no_loop_evaluator_verdicts": trace_summary.get("evaluator_verdicts", []),
+        "no_loop_fallback_used": trace_summary.get("fallback_used", False),
         "no_loop_trace": trace,
     }
 
@@ -1062,7 +1093,56 @@ def _build_no_loop_error_fields(
         "no_loop_error_type": type(error).__name__,
         "no_loop_error": str(error),
         "no_loop_turn_results": [],
+        "no_loop_first_candidate_code": None,
+        "no_loop_final_candidate_code": None,
+        "no_loop_evaluator_verdicts": [],
+        "no_loop_fallback_used": False,
         "no_loop_trace": None,
+    }
+
+
+def _trace_summary(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_codes: list[str] = []
+    evaluator_verdicts: list[dict[str, Any]] = []
+    fallback_used = False
+    for event in trace:
+        event_name = event.get("event")
+        if event_name in {
+            "intent_select",
+            "intent_select_no_clarify",
+        }:
+            decision = event.get("decision") or {}
+            code = decision.get("code")
+            if code:
+                candidate_codes.append(code)
+        elif event_name == "evaluation":
+            evaluation = event.get("evaluation") or {}
+            evaluator_verdicts.append(
+                {
+                    "verdict": evaluation.get("verdict"),
+                    "reject_scope": evaluation.get("reject_scope"),
+                    "preferred_code": evaluation.get("preferred_code"),
+                    "confidence": evaluation.get("confidence"),
+                    "is_code_blocking": evaluation.get("is_code_blocking"),
+                },
+            )
+        elif event_name == "accept_preferred_code":
+            code = event.get("preferred_code")
+            if code:
+                candidate_codes.append(code)
+        elif event_name in {
+            "loop_exhausted_best_candidate",
+            "route_no_match_fallback_best_candidate",
+            "invalid_evaluation_accept_best_candidate",
+            "loop_exhausted_fallback_dialogue",
+        }:
+            fallback_used = True
+
+    return {
+        "first_candidate_code": candidate_codes[0] if candidate_codes else None,
+        "final_candidate_code": candidate_codes[-1] if candidate_codes else None,
+        "evaluator_verdicts": evaluator_verdicts,
+        "fallback_used": fallback_used,
     }
 
 
