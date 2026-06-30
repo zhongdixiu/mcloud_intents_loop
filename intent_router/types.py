@@ -46,6 +46,7 @@ class StrictOutputModel(BaseModel):
 
 KNOWN_STRUCTURED_EXTRA_FIELDS = {
     "risk_flags_detail",
+    "risk_flags_note",
     "analysis",
     "notes",
     "debug",
@@ -241,6 +242,7 @@ class RouteDiagnostics(BaseModel):
     expansion_rounds: int = 0
     risk_flags: list[str] = Field(default_factory=list)
     rerank_reason: str = ""
+    fallback_reason: str | None = None
 
 
 class SkillRef(BaseModel):

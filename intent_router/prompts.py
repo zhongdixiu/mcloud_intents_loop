@@ -133,12 +133,17 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
    - 无法判断属于继承还是替换时（没有追加词也没有修正词，单纯一个短语），默认采用继承式追加，并在 uncertainty_notes 中说明"采用默认继承策略"。
 4. 替换只作用于当前轮明确提到的维度：只提主体（人名/作品名等）就只替换 subjects；只提格式/时间/后缀等限定词就只替换 qualifiers；当前轮未提及 object_types 时，默认保持继承，不主动替换。
 5. 生成、创作、编辑、处理、配文、识别、翻译、总结、问答等"处理型"主动作与"搜索/查找"主动作语义不同；不要因为历史是搜索类请求，就把当前轮的处理型请求污染为搜索语义（也不要反过来污染）。
-6. 是否、有没有、有吗、还有吗、有哪些、如何、是什么、介绍下、推荐下、怎么看等是问句形态；当用户期望的是语言答案而非资源/操作时，semantic_frame.expected_result_type 应为 ordinary_answer。
-7. 当前轮只有一个实体名词（人名、作品名、IP名等），且没有问答类证据词时，semantic_frame.expected_result_type 默认设为 resource（资源搜索语义）；不要仅因实体类型像书、歌、人就改判为 ordinary_answer。具体应该搜索哪个细分类型（如综合搜索/分类搜索）由下游 Intent 节点决定，你只需要标注 expected_result_type=resource，不需要给出更具体的二级判断。
-8. 承接历史时优先继承最近一个有效业务轮（即上一个有 matched 结果的轮次），并在 semantic_frame.inherited_turns 中记录来源轮次编号；如果跳过了最近的有效业务轮（转而继承更早的轮次），必须在 uncertainty_notes 说明跳过原因。
-9. 不伪造 image_id、file_id、mail_id、真实文件句柄、图片句柄或任何外层业务执行结果；这些不存在就不要编造。
-10. 缺主体、缺主题、缺关键词、缺联系人、缺时间、缺真实资源句柄、缺唯一对象选择，都不影响你输出完整 semantic_frame；这些缺失信息不是阻塞输出的理由，也不是 intent/code 判断的阻塞条件（那是下游节点的职责）。
-11. 如果当前轮与历史的关系（继承/替换/无关）影响 skill/intent/code 判断且确实无法判断，relation_to_history 输出 ambiguous，并在 uncertainty_notes/reason 中记录原因；不得借此向用户追问或要求澄清。
+6. semantic_frame.expected_result_type 是下游 Evaluator 的权威诉求类型，必须谨慎裁决并在 reason/uncertainty_notes 中写明关键证据。不要把同一轮同时标成互相冲突的语义；若确有冲突，在 uncertainty_notes 说明。
+7. 问答/咨询诉求不能只靠短词表判断，要结合三类证据：
+   - 强问答形态：是什么、为什么、怎么、如何、吗、有没有、有哪些、区别、参数、介绍、推荐、评价、展开说说、讲讲等。
+   - 语义结构：主体 + 属性/观点/解释诉求，如"手机参数""人物介绍""这部剧立意""两者区别"。
+   - 历史延续：最近有效轮是普通问答、推荐、解释或泛写作，当前轮是短实体、短补充、代词追问时，默认延续 ordinary_answer。
+   泛写作/泛改写/泛翻译/读后感/影评/作文/人物传记等，如果没有明确要求进入产品工具或处理一个真实已选文件/笔记/图片对象，也按 ordinary_answer 处理。
+8. 当前轮只有一个实体名词或纯实体名（人名、作品名、IP名等），且没有问答/咨询证据，最近有效轮也不是 ordinary_answer 链路时，semantic_frame.expected_result_type 默认设为 resource（默认是资源搜索语义）；不要仅因实体类型像书、歌、人就改判为 ordinary_answer。具体应该搜索哪个细分类型（如综合搜索/分类搜索）由下游 Intent 节点决定，你只需要标注 expected_result_type=resource，不需要给出更具体的二级判断。
+9. 承接历史时优先继承最近有效业务轮（即上一个有 matched 结果的轮次），并在 semantic_frame.inherited_turns 中记录来源轮次编号；如果跳过了最近有效业务轮（转而继承更早的轮次），必须在 uncertainty_notes 说明跳过原因。
+10. 不伪造 image_id、file_id、mail_id、真实文件句柄、图片句柄或任何外层业务执行结果；这些不存在就不要编造。
+11. 缺主体、缺主题、缺关键词、缺联系人、缺时间、缺真实资源句柄、缺唯一对象选择，都不影响你输出完整 semantic_frame；这些缺失信息不是阻塞输出的理由，也不是 intent/code 判断的阻塞条件（那是下游节点的职责）。
+12. 如果当前轮与历史的关系（继承/替换/无关）影响 skill/intent/code 判断且确实无法判断，relation_to_history 输出 ambiguous，并在 uncertainty_notes/reason 中记录原因；不得借此向用户追问或要求澄清。
 """
 
 # ==================== 语义判断规则（给Router/Intent使用）====================
@@ -148,7 +153,7 @@ ROUTING_SEMANTIC_RULES = """语义判断规则（用于 Router / Intent 候选�
 2. 候选生成只判断 skill / intent / code 是否匹配语义，不需要评估参数是否完整。
 3. 参数缺失、实体缺失、主体对象缺失、真实文件/图片/邮件句柄缺失、唯一对象选择缺失，都不是不生成候选或降低候选优先级的理由。
 4. 当前轮明确表达搜索、查找、打开、入口、工具、发送、整理、筛选、生成、编辑、处理等业务动作时，必须给出对应的业务候选，不能仅给普通对话候选。
-5. 答案型问句（是什么/为什么/怎么看等）可以把普通对话排在较高位置；但不能仅因 query 中出现电影、图片、歌曲、文件等资源词，就强行判定为云盘搜索语义——要结合是否有问答类证据词综合判断。
+5. 答案型、咨询型、推荐型、解释型、泛写作型请求应保留普通对话高优先级；不能仅因 query 中出现电影、图片、歌曲、文件等资源词，就强行判定为云盘搜索语义——要以 contextualizer 的 expected_result_type 为准。
 6. 搜索类 skill 只承接查找、搜索、定位、获取已有资源载体类需求；处理型 skill 承接生成、创作、编辑、识别、翻译、总结等主动作类需求；两者不要混淆。
 7. 当前轮只有一个实体名词、纯作品名、人名或 IP 名，且没有明确问答类证据时，属于资源搜索语义；在云盘搜索 skill 内，如果没有更具体的类型词（图片/视频/文档等），优先给出综合搜索 intent 候选，同时也可以给出该实体最可能对应的细分类型 intent 候选（如人名更可能搜素材/视频，可同时给综合搜索和该细分类型两个候选，由候选集决定最终排序）。
 8. 比较或去重同 code 的不同 intent 时，不能只比较 code 是否相同，必须比较完整 route key（skill_id + intent + code）三者组合。
@@ -197,7 +202,7 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级 intent 
 # ==================== Evaluator专用语义规则（不重新做语义判断，仅辅助排序）====================
  
 EVALUATOR_SEMANTIC_RULES = """语义辅助规则（用于 Evaluator 排序，不用于重新判断语义）：
-1. resolved_query 和 semantic_frame 是理解候选集语义背景的参考信息，用于辅助你判断候选集中哪个 candidate 更贴近用户需求；你不需要、也不应该重新独立判断"这个 query 应该是什么 skill/intent"，那是 Router/Intent 节点已经做过的工作。
+1. semantic_frame.expected_result_type 是本轮诉求类型的权威裁决。你不允许推翻它，也不需要重新判断"这个 query 到底是问答、资源搜索还是工具入口"；只能判断候选与该诉求类型是否一致。
 2. 你的任务是比较候选集内已有的 candidate 之间谁更贴近语义，而不是评估某个 candidate 的参数是否完整——参数缺失、实体缺失、主体对象缺失、文件/图片/邮件句柄缺失、唯一对象选择缺失，都不能成为你降低某个 candidate 排名或拒绝整个候选集的理由。
 3. 比较或去重候选时，如果发现不同 skill_id 但 code 数值相同的情况（跨 skill 的 code 碰撞），必须按完整 route key（skill_id + intent + code）区分，不能仅凭 code 数值判断为同一候选。
 """
@@ -217,8 +222,8 @@ EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的候选集 r
    c. risk_flags（label_conflict / search_vs_tool_entry / answer_vs_resource / context_unclear）始终只作为排序参考和 reason 中的风险说明，不单独触发 expand，也不单独阻止 select——只有"候选集内没有语义匹配的候选"才能触发 expand。
 5. expand_scope=skill_recall_gap 表示一级 skill 方向存在明显漏召回（候选集中所有 skill 候选都不对）；expand_scope=intent_recall_gap 表示某个 skill 方向是对的，但该 skill 下的 intent 候选都不够贴切；expand_scope=context_unclear 仅用于在 reason/diagnostics 中记录上下文关系不确定，不能单独作为触发 expand 的理由（必须同时满足条件4b）。
 6. 不允许输出候选结构之外的任何字段，也不允许输出候选集之外的 code。
-7. 普通对话候选与业务候选冲突时，按 current_user_query 显式动作和 semantic_frame.expected_result_type 判断哪个更贴近语义，而不是按候选生成顺序或类型默认偏好判断。
-8. 工具入口类请求中，如果候选集内同时存在具体业务工具 intent 和通用入口/普通对话/通用搜索 intent，优先选择具体业务工具 intent（除非候选集中没有具体业务工具候选）；reason 中需要写明支持该选择的具体业务证据词。
+7. 普通对话候选与业务候选冲突时，必须优先按 semantic_frame.expected_result_type 排序：ordinary_answer 下普通对话优先；resource 下搜索候选优先；function_entry/content_processing 下业务候选优先。
+8. 工具入口类请求中，如果 expected_result_type=function_entry 且候选集内同时存在具体业务工具 intent 和通用入口/普通对话/通用搜索 intent，优先选择具体业务工具 intent。不要在 ordinary_answer 下仅因存在工具候选就选择工具。
 9. 遵守以下语义辅助规则。
 {contextualized_request_rules}
 """

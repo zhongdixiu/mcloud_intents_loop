@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError as PydanticValidationError
+
 from .model_client import AgentScopeStructuredClient, StructuredModelClient
 from .prompts import (
     CONTEXTUALIZER_SYSTEM_PROMPT,
@@ -48,8 +50,11 @@ BLOCKING_CONFLICT_RISK_FLAGS = {"label_conflict"}
 NON_BLOCKING_RISK_PENALTY_FLAGS = {
     "answer_vs_resource",
     "context_unclear",
+    "context_inheritance_risk",
+    "generic_content_vs_tool",
     "ontology_conflict",
     "search_vs_tool_entry",
+    "tool_entry_vs_consultation",
 }
 ORDINARY_ANSWER_CUES = (
     "是什么",
@@ -106,6 +111,7 @@ STRONG_BUSINESS_ACTIONS = (
     "总结",
     "识别",
 )
+SWITCH_SCORE_MARGIN = 0.05
 
 
 class IntentRouter:
@@ -214,18 +220,32 @@ class IntentRouter:
         first_candidate = intent_candidates[0]
         expansion_rounds = 0
         invalid_rerank_reason: str | None = None
-        rerank = await self._rerank_candidates(
-            resolved_query,
-            intent_candidates,
-            contextualized_request,
-            query,
-            expansion_round=expansion_rounds,
-        )
+        try:
+            rerank = await self._rerank_candidates(
+                resolved_query,
+                intent_candidates,
+                contextualized_request,
+                query,
+                expansion_round=expansion_rounds,
+            )
+        except PydanticValidationError as exc:
+            invalid_rerank_reason = f"invalid evaluator output: {exc}"
+            rerank = _fallback_rerank(
+                intent_candidates,
+                contextualized_request=contextualized_request,
+                current_user_query=query,
+                reason=invalid_rerank_reason,
+            )
         try:
             rerank = _validated_rerank(rerank, intent_candidates)
         except ValidationError as exc:
             invalid_rerank_reason = str(exc)
-            rerank = _fallback_rerank(first_candidate, str(exc))
+            rerank = _fallback_rerank(
+                intent_candidates,
+                contextualized_request=contextualized_request,
+                current_user_query=query,
+                reason=str(exc),
+            )
         _trace(
             trace,
             "rerank",
@@ -267,19 +287,33 @@ class IntentRouter:
             intent_candidates = _dedupe_intent_candidates(
                 [*intent_candidates, *new_candidates],
             )
-            rerank = await self._rerank_candidates(
-                resolved_query,
-                intent_candidates,
-                contextualized_request,
-                query,
-                expansion_round=expansion_rounds,
-            )
+            try:
+                rerank = await self._rerank_candidates(
+                    resolved_query,
+                    intent_candidates,
+                    contextualized_request,
+                    query,
+                    expansion_round=expansion_rounds,
+                )
+            except PydanticValidationError as exc:
+                invalid_rerank_reason = f"invalid evaluator output: {exc}"
+                rerank = _fallback_rerank(
+                    intent_candidates,
+                    contextualized_request=contextualized_request,
+                    current_user_query=query,
+                    reason=invalid_rerank_reason,
+                )
             try:
                 rerank = _validated_rerank(rerank, intent_candidates)
                 invalid_rerank_reason = None
             except ValidationError as exc:
                 invalid_rerank_reason = str(exc)
-                rerank = _fallback_rerank(first_candidate, str(exc))
+                rerank = _fallback_rerank(
+                    intent_candidates,
+                    contextualized_request=contextualized_request,
+                    current_user_query=query,
+                    reason=str(exc),
+                )
             _trace(
                 trace,
                 "rerank",
@@ -401,21 +435,24 @@ class IntentRouter:
         expansion_scope: str | None = None,
         expansion_hint: str | None = None,
     ) -> list[SkillCandidate]:
-        decision = await self.model_client.structured(
-            system_prompt=ROUTER_SYSTEM_PROMPT,
-            user_prompt=build_router_prompt(
-                resolved_query,
-                self.registry.cards(),
-                contextualized_request,
-                current_user_query,
-                top_n=self.top_skills,
-                existing_candidates=existing_candidates,
-                expansion_scope=expansion_scope,
-                expansion_hint=expansion_hint,
-                context=context,
-            ),
-            response_model=SkillCandidateSet,
-        )
+        try:
+            decision = await self.model_client.structured(
+                system_prompt=ROUTER_SYSTEM_PROMPT,
+                user_prompt=build_router_prompt(
+                    resolved_query,
+                    self.registry.cards(),
+                    contextualized_request,
+                    current_user_query,
+                    top_n=self.top_skills,
+                    existing_candidates=existing_candidates,
+                    expansion_scope=expansion_scope,
+                    expansion_hint=expansion_hint,
+                    context=context,
+                ),
+                response_model=SkillCandidateSet,
+            )
+        except PydanticValidationError:
+            decision = SkillCandidateSet(candidates=[])
         candidates = self._normalize_skill_candidates(decision.candidates)
         return self._complete_skill_candidates(
             candidates,
@@ -480,7 +517,13 @@ class IntentRouter:
             current_user_query,
         ):
             if not any(candidate.skill_id is None for candidate in completed):
-                completed.append(_ordinary_skill_candidate())
+                completed.append(
+                    _ordinary_skill_candidate(
+                        confidence=_ordinary_confidence(contextualized_request),
+                    ),
+                )
+            else:
+                _boost_ordinary_candidate(completed, contextualized_request)
             return completed
 
         specific_skill_id = _specific_business_skill_for_query(
@@ -518,7 +561,13 @@ class IntentRouter:
             )
 
         if not any(candidate.skill_id is None for candidate in completed):
-            completed.append(_ordinary_skill_candidate())
+            completed.append(
+                _ordinary_skill_candidate(
+                    confidence=_ordinary_confidence(contextualized_request),
+                ),
+            )
+        else:
+            _boost_ordinary_candidate(completed, contextualized_request)
 
         return completed
 
@@ -544,21 +593,30 @@ class IntentRouter:
                 continue
 
             skill = self.registry.get(skill_candidate.skill_id)
-            decision = await self.model_client.structured(
-                system_prompt=INTENT_SYSTEM_PROMPT,
-                user_prompt=build_intent_prompt(
-                    resolved_query,
-                    skill,
-                    contextualized_request,
-                    current_user_query,
-                    skill_candidate=skill_candidate,
-                    top_m=self.top_intents,
-                    existing_candidates=intent_candidates,
-                    expansion_scope=expansion_scope,
-                    expansion_hint=expansion_hint,
-                ),
-                response_model=IntentCandidateSet,
-            )
+            try:
+                decision = await self.model_client.structured(
+                    system_prompt=INTENT_SYSTEM_PROMPT,
+                    user_prompt=build_intent_prompt(
+                        resolved_query,
+                        skill,
+                        contextualized_request,
+                        current_user_query,
+                        skill_candidate=skill_candidate,
+                        top_m=self.top_intents,
+                        existing_candidates=intent_candidates,
+                        expansion_scope=expansion_scope,
+                        expansion_hint=expansion_hint,
+                    ),
+                    response_model=IntentCandidateSet,
+                )
+            except PydanticValidationError:
+                _trace(
+                    trace,
+                    "intent_candidate_set_error",
+                    skill_id=skill.id,
+                    reason="invalid structured intent candidate set",
+                )
+                continue
             _trace(
                 trace,
                 "intent_candidate_set",
@@ -727,16 +785,36 @@ class IntentRouter:
         )
 
 
-def _ordinary_skill_candidate() -> SkillCandidate:
+def _ordinary_skill_candidate(confidence: float = 0.15) -> SkillCandidate:
     return SkillCandidate(
         candidate_id="skill:ordinary_dialogue",
         skill_id=None,
         intent_domain=ORDINARY_INTENT,
-        confidence=0.15,
+        confidence=confidence,
         matched_cues=[],
         risk_flags=[],
         reason="ordinary dialogue fallback candidate",
     )
+
+
+def _ordinary_confidence(contextualized_request: ContextualizedRequest) -> float:
+    expected = contextualized_request.semantic_frame.expected_result_type
+    if expected == "ordinary_answer":
+        return 0.7
+    if expected == "content_generation":
+        return 0.55
+    return 0.15
+
+
+def _boost_ordinary_candidate(
+    candidates: list[SkillCandidate],
+    contextualized_request: ContextualizedRequest,
+) -> None:
+    confidence = _ordinary_confidence(contextualized_request)
+    for candidate in candidates:
+        if candidate.skill_id is None and candidate.confidence < confidence:
+            candidate.confidence = confidence
+            return
 
 
 def _synthetic_skill_candidate(
@@ -792,23 +870,51 @@ def _validated_rerank(
             )
             for candidate in candidates
         ]
+    ranked_ids = {score.candidate_id for score in rerank.ranking}
+    rerank.ranking.extend(
+        CandidateScore(
+            candidate_id=candidate.candidate_id,
+            score=_clamp_confidence(candidate.confidence),
+            reason="defaulted missing ranking from selector confidence",
+        )
+        for candidate in candidates
+        if candidate.candidate_id not in ranked_ids
+    )
     return validate_rerank_decision(
         rerank,
         {candidate.candidate_id for candidate in candidates},
     )
 
 
-def _fallback_rerank(first_candidate: IntentCandidate, reason: str) -> RerankDecision:
+def _fallback_rerank(
+    candidates: list[IntentCandidate],
+    *,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+    reason: str,
+) -> RerankDecision:
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: _combined_score(
+            candidate,
+            evaluator_score=0.0,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
+        ),
+        reverse=True,
+    )
+    selected = ordered[0]
     return RerankDecision(
         verdict="select",
-        selected_candidate_id=first_candidate.candidate_id,
+        selected_candidate_id=selected.candidate_id,
         confidence=0.0,
         ranking=[
             CandidateScore(
-                candidate_id=first_candidate.candidate_id,
-                score=_clamp_confidence(first_candidate.confidence),
-                reason="fallback to selector first candidate",
-            ),
+                candidate_id=candidate.candidate_id,
+                score=0.0,
+                reason="fallback without evaluator score",
+            )
+            for candidate in ordered
         ],
         reason=reason,
     )
@@ -829,13 +935,20 @@ def _apply_switch_gate(
     selected = candidate_by_id.get(rerank.selected_candidate_id or "")
 
     if invalid_rerank_reason:
-        return first_candidate, RouteDiagnostics(
+        fallback_candidate = _best_combined_candidate(
+            candidates,
+            rerank=rerank,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
+        )
+        return fallback_candidate, RouteDiagnostics(
             first_candidate_id=first_candidate.candidate_id,
-            final_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=fallback_candidate.candidate_id,
             evaluator_action="fallback",
             expansion_rounds=expansion_rounds,
-            risk_flags=_dedupe_strings(first_candidate.risk_flags),
+            risk_flags=_dedupe_strings(fallback_candidate.risk_flags),
             rerank_reason=invalid_rerank_reason,
+            fallback_reason=invalid_rerank_reason,
         )
 
     if rerank.verdict == "expand":
@@ -856,47 +969,72 @@ def _apply_switch_gate(
             rerank_reason=rerank.reason,
         )
 
-    selected = selected or first_candidate
-    if selected.candidate_id == first_candidate.candidate_id:
-        return selected, RouteDiagnostics(
-            first_candidate_id=first_candidate.candidate_id,
-            final_candidate_id=selected.candidate_id,
-            evaluator_action="select_top",
-            expansion_rounds=expansion_rounds,
-            risk_flags=_dedupe_strings(selected.risk_flags),
-            rerank_reason=rerank.reason,
-        )
-
-    selected_score = float(score_by_id.get(selected.candidate_id, 0.0))
-    first_score = float(score_by_id.get(first_candidate.candidate_id, 0.0))
-    margin = selected_score - first_score
-    risk_flags = _dedupe_strings([*first_candidate.risk_flags, *selected.risk_flags])
-    required_margin = _switch_margin_threshold(
-        first_candidate=first_candidate,
-        selected_candidate=selected,
+    scored_candidate = _best_combined_candidate(
+        candidates,
         rerank=rerank,
         contextualized_request=contextualized_request,
         current_user_query=current_user_query,
     )
+    selected = selected or scored_candidate
+    if (
+        selected.candidate_id != first_candidate.candidate_id
+        and set(selected.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS
+    ):
+        risk_flags = _dedupe_strings([*first_candidate.risk_flags, *selected.risk_flags])
+        return first_candidate, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=first_candidate.candidate_id,
+            evaluator_action="switch_blocked",
+            expansion_rounds=expansion_rounds,
+            risk_flags=risk_flags,
+            rerank_reason=(
+                f"blocked evaluator switch to {selected.candidate_id}; "
+                f"blocking_risk={sorted(set(selected.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)}. "
+                f"{rerank.reason}"
+            ).strip(),
+        )
+    final_candidate = scored_candidate
+    if final_candidate.candidate_id == first_candidate.candidate_id:
+        return final_candidate, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=final_candidate.candidate_id,
+            evaluator_action="select_top",
+            expansion_rounds=expansion_rounds,
+            risk_flags=_dedupe_strings(final_candidate.risk_flags),
+            rerank_reason=rerank.reason,
+        )
+
+    final_score = _combined_score(
+        final_candidate,
+        evaluator_score=float(score_by_id.get(final_candidate.candidate_id, 0.0)),
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
+    )
+    first_score = _combined_score(
+        first_candidate,
+        evaluator_score=float(score_by_id.get(first_candidate.candidate_id, 0.0)),
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
+    )
+    margin = final_score - first_score
+    risk_flags = _dedupe_strings([*first_candidate.risk_flags, *final_candidate.risk_flags])
 
     switch_allowed = (
-        rerank.confidence >= 0.85
-        and margin >= required_margin
-        and _has_route_critical_cue(
-            selected,
-            contextualized_request=contextualized_request,
-            current_user_query=current_user_query,
-        )
-        and not (set(risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)
+        margin >= SWITCH_SCORE_MARGIN
+        and not (set(final_candidate.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)
     )
     if switch_allowed:
-        return selected, RouteDiagnostics(
+        return final_candidate, RouteDiagnostics(
             first_candidate_id=first_candidate.candidate_id,
-            final_candidate_id=selected.candidate_id,
+            final_candidate_id=final_candidate.candidate_id,
             evaluator_action="switch",
             expansion_rounds=expansion_rounds,
             risk_flags=risk_flags,
-            rerank_reason=rerank.reason,
+            rerank_reason=(
+                f"{rerank.reason} final_score={final_score:.3f}, "
+                f"first_score={first_score:.3f}, evaluator_selected="
+                f"{selected.candidate_id}"
+            ).strip(),
         )
 
     return first_candidate, RouteDiagnostics(
@@ -906,10 +1044,10 @@ def _apply_switch_gate(
         expansion_rounds=expansion_rounds,
         risk_flags=risk_flags,
         rerank_reason=(
-            f"blocked evaluator switch to {selected.candidate_id}; "
-            f"confidence={rerank.confidence:.3f}, margin={margin:.3f}, "
-            f"required_margin={required_margin:.3f}. "
-            f"{rerank.reason}"
+            f"blocked score switch to {final_candidate.candidate_id}; "
+            f"final_score={final_score:.3f}, first_score={first_score:.3f}, "
+            f"margin={margin:.3f}, required_margin={SWITCH_SCORE_MARGIN:.3f}, "
+            f"evaluator_selected={selected.candidate_id}. {rerank.reason}"
         ).strip(),
     )
 
@@ -945,12 +1083,48 @@ def _combined_score(
         contextualized_request=contextualized_request,
         current_user_query=current_user_query,
     )
+    type_alignment = _type_alignment_score(candidate, contextualized_request)
     return (
-        0.45 * _clamp_confidence(candidate.confidence)
-        + 0.45 * _clamp_confidence(evaluator_score)
-        + 0.10 * cue_score
+        0.45 * _clamp_confidence(evaluator_score)
+        + 0.30 * _clamp_confidence(candidate.confidence)
+        + 0.20 * type_alignment
+        + 0.05 * cue_score
         - _candidate_penalty(candidate, contextualized_request, current_user_query)
     )
+
+
+def _type_alignment_score(
+    candidate: IntentCandidate,
+    contextualized_request: ContextualizedRequest,
+) -> float:
+    expected = contextualized_request.semantic_frame.expected_result_type
+    if expected == "ordinary_answer":
+        return 1.0 if candidate.code == ORDINARY_CODE else 0.0
+    if expected == "resource":
+        if candidate.skill_id == SEARCH_SKILL_ID:
+            return 1.0
+        return 0.35 if candidate.code == ORDINARY_CODE else 0.1
+    if expected == "function_entry":
+        if candidate.skill_id and candidate.skill_id not in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+            return 1.0
+        if candidate.skill_id == FUNCTION_SKILL_ID:
+            return 0.75
+        return 0.25 if candidate.code == ORDINARY_CODE else 0.1
+    if expected in {"content_processing", "mail_action", "social_share"}:
+        if candidate.skill_id and candidate.skill_id not in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+            return 1.0
+        return 0.35 if candidate.code == ORDINARY_CODE else 0.1
+    if expected == "content_generation":
+        if candidate.code == ORDINARY_CODE:
+            return 0.85
+        if candidate.skill_id and candidate.skill_id not in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+            return 0.65
+        return 0.1
+    if candidate.skill_id and candidate.skill_id not in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+        return 0.75
+    if candidate.skill_id in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+        return 0.5
+    return 0.5
 
 
 def _candidate_penalty(
@@ -960,8 +1134,26 @@ def _candidate_penalty(
 ) -> float:
     penalty = 0.0
     text = f"{current_user_query} {contextualized_request.resolved_query}".lower()
-    if candidate.code == ORDINARY_CODE and _has_strong_business_action(text):
+    expected = contextualized_request.semantic_frame.expected_result_type
+    if (
+        candidate.code == ORDINARY_CODE
+        and expected
+        in {
+            "resource",
+            "function_entry",
+            "content_processing",
+            "mail_action",
+            "social_share",
+        }
+        and _has_strong_business_action(text)
+    ):
         penalty += 0.2
+    if expected == "ordinary_answer" and candidate.code != ORDINARY_CODE:
+        penalty += 0.45
+    if expected == "resource" and candidate.skill_id not in {SEARCH_SKILL_ID, None}:
+        penalty += 0.25
+    if expected == "function_entry" and candidate.skill_id == SEARCH_SKILL_ID:
+        penalty += 0.25
     if candidate.skill_id == "function_skill" and any(
         flag in candidate.risk_flags for flag in ("specific_tool_available", "generic_entry")
     ):

@@ -112,7 +112,8 @@ def test_candidate_sets_accept_known_extra_fields_and_json_string_lists() -> Non
                 '[{"candidate_id":"skill:mcloud_search_skill",'
                 '"skill_id":"mcloud_search_skill",'
                 '"intent_domain":"搜索",'
-                '"risk_flags_detail":{"reason":"debug only"}}]'
+                '"risk_flags_detail":{"reason":"debug only"},'
+                '"risk_flags_note":"debug only"}]'
             ),
             "analysis": "debug only",
         },

@@ -468,59 +468,74 @@ async def test_evaluator_can_switch_to_candidate_when_gate_is_satisfied() -> Non
     assert result.diagnostics.first_candidate_id == "file_skill:文件:021:1"
 
 
-async def test_evaluator_switch_is_blocked_when_signal_is_weak() -> None:
+async def test_ordinary_answer_type_blocks_business_switch() -> None:
     model = FakeStructuredClient(
         [
+            ContextualizedRequest(
+                resolved_query="画质修复是修复哪些的",
+                relation_to_history="new_request",
+                semantic_frame=SemanticFrame(
+                    action="咨询",
+                    expected_result_type="ordinary_answer",
+                    subjects=["画质修复"],
+                ),
+                reason="用户询问功能说明，期望语言答案",
+            ),
             SkillCandidateSet(
                 candidates=[
-                    _skill_candidate("file_skill", confidence=0.9),
-                    _skill_candidate("mcloud_search_skill", confidence=0.88),
+                    _ordinary_skill_candidate(confidence=0.7),
+                    _skill_candidate("image_skill", confidence=0.9),
                 ],
             ),
             IntentCandidateSet(
                 candidates=[
                     _intent_candidate(
-                        skill_id="file_skill",
-                        intent="文件",
-                        code="021",
-                        cues=["文件"],
-                    ),
-                ],
-            ),
-            IntentCandidateSet(
-                candidates=[
-                    _intent_candidate(
-                        skill_id="mcloud_search_skill",
-                        intent="搜综合",
-                        code="018",
-                        cues=["搜索", "合同"],
+                        skill_id="image_skill",
+                        intent="画质修复",
+                        code="009",
+                        cues=["画质修复"],
                     ),
                 ],
             ),
             RerankDecision(
                 verdict="select",
-                selected_candidate_id="mcloud_search_skill:搜综合:018:1",
-                confidence=0.8,
+                selected_candidate_id="image_skill:画质修复:009:1",
+                confidence=0.95,
                 ranking=[
                     CandidateScore(
-                        candidate_id="mcloud_search_skill:搜综合:018:1",
+                        candidate_id="image_skill:画质修复:009:1",
                         score=0.95,
                     ),
-                    CandidateScore(candidate_id="file_skill:文件:021:1", score=0.5),
+                    CandidateScore(candidate_id="ordinary_dialogue:000", score=0.5),
                 ],
-                reason="证据不足",
+                reason="功能候选名称匹配",
             ),
         ],
     )
     router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="修复这张照片",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="image_skill",
+                    intent="画质修复",
+                    code="009",
+                ),
+            ),
+        ],
+    )
 
-    result = await router.route("搜索合同文件")
+    result = await router.route(
+        "画质修复是修复哪些的",
+        dialogue_history=history,
+    )
 
-    assert result.skill is not None
-    assert result.skill.id == "file_skill"
-    assert result.code == "021"
+    assert result.skill is None
+    assert result.code == "000"
     assert result.diagnostics is not None
-    assert result.diagnostics.evaluator_action == "switch_blocked"
+    assert result.diagnostics.evaluator_action == "select_top"
 
 
 async def test_expansion_adds_missing_skill_candidates_before_rerank() -> None:
@@ -721,3 +736,86 @@ async def test_empty_business_candidates_fall_back_to_ordinary_dialogue_candidat
         SkillCandidateSet,
         RerankDecision,
     ]
+
+
+async def test_invalid_skill_candidate_set_degrades_to_ordinary_dialogue() -> None:
+    model = FakeStructuredClient(
+        [
+            {"candidates": "not valid json"},
+            RerankDecision(
+                verdict="select",
+                selected_candidate_id="ordinary_dialogue:000",
+                confidence=0.5,
+                ranking=[
+                    CandidateScore(candidate_id="ordinary_dialogue:000", score=0.5),
+                ],
+                reason="fallback candidate",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+
+    result = await router.route("今天心情怎么样")
+
+    assert result.skill is None
+    assert result.code == "000"
+    assert result.diagnostics is not None
+    assert result.diagnostics.evaluator_action == "select_top"
+
+
+async def test_invalid_evaluator_output_uses_numeric_fallback() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                resolved_query="画质修复是修复哪些的",
+                relation_to_history="new_request",
+                semantic_frame=SemanticFrame(
+                    action="咨询",
+                    expected_result_type="ordinary_answer",
+                    subjects=["画质修复"],
+                ),
+                reason="用户询问功能说明，期望语言答案",
+            ),
+            SkillCandidateSet(
+                candidates=[
+                    _skill_candidate("image_skill", confidence=0.9),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="image_skill",
+                        intent="画质修复",
+                        code="009",
+                        cues=["画质修复"],
+                    ),
+                ],
+            ),
+            {"verdict": "select", "selected_candidate_id": "missing", "ranking": "bad"},
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="修复这张照片",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="image_skill",
+                    intent="画质修复",
+                    code="009",
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route(
+        "画质修复是修复哪些的",
+        dialogue_history=history,
+    )
+
+    assert result.skill is None
+    assert result.code == "000"
+    assert result.diagnostics is not None
+    assert result.diagnostics.evaluator_action == "fallback"
+    assert result.diagnostics.fallback_reason
