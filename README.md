@@ -59,13 +59,22 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`IntentRouter.from_config(..., mode="production")` is the default for SDK and
-interactive usage. Excel evaluation commands construct the router with
-`mode="code_eval"` so the loop only evaluates `skill/intent/code`: missing
-entities, resource handles, operation objects, and parameters do not trigger
-clarification or retries. In `code_eval`, evaluator rejects are conservative:
-they are applied only when a high-confidence `preferred_code` is provided;
-otherwise the original candidate is accepted or used as the fallback candidate.
+The router has a single routing philosophy for SDK, CLI, and Excel evaluation:
+predict the most likely `skill / intent / code`. Missing entities, resource
+handles, operation objects, and parameters do not trigger clarification or block
+intent-code prediction.
+
+The main chain is:
+
+```text
+Contextualizer -> Top-N skill candidates -> Top-M intent candidates
+-> candidate-set evaluator rerank -> optional targeted expansion -> switch gate
+```
+
+The evaluator can only select an existing `candidate_id` or request one targeted
+candidate expansion round. It cannot invent a new code. The controller applies a
+switch gate before replacing the selector's first candidate, so weak evaluator
+signals are recorded in diagnostics instead of overriding strong candidates.
 
 Multi-turn dialogue routing:
 
@@ -102,23 +111,15 @@ python -m intent_router chat --skills skills
 
 The `chat` command keeps dialogue history in the terminal process. The router
 first injects the latest 5 turns into a contextualizer prompt: user query plus
-the final route result. The contextualizer produces `resolved_query`, and skill
-routing, intent selection, and evaluation all use that unified request. Later
-prompts keep `current_user_query` only for audit context and do not receive
-`dialogue_history` directly. Clarification options are semantic
-anchors rather than closed enums: a follow-up can select an option, provide a
-new valid direction, or start a new request. If a turn is resolved as an answer
-to a previous clarification, `resolved_query` must be a complete routeable
-request rather than a short fragment such as "image" or "blue". Business
-execution results, loop rejection state, and historical no-match reasons are not
-injected as dialogue semantics. When no skill can execute the request, or when
-the user asks for small talk, public knowledge, current news, internet
-information, policies, markets, or other open-ended LLM dialogue, the router
-returns the fallback intent `普通对话` with `code="000"` and `skill=null`.
+the final route result. The contextualizer produces `resolved_query` and a
+structured `semantic_frame`; skill candidate generation, intent candidate
+generation, and evaluator rerank all use that unified request. Later prompts
+keep `current_user_query` only for audit context and do not receive
+`dialogue_history` directly. Business execution results and historical no-match
+reasons are not injected as dialogue semantics. Ordinary dialogue is represented
+as a normal candidate and final route: `普通对话`, `code="000"`, `skill=null`.
 Each turn prints the resolved query, final route result, `loop_count`, and
-`correction_scopes`. If one turn reaches the maximum loop count without a stable
-decision, the router returns a guided `clarify` result with
-`termination_reason="loop_exhausted"` instead of treating it as `no_match`.
+`correction_scopes`; targeted candidate expansion increments the loop count.
 Shortcuts are available in the prompt:
 
 - empty input: ignored, continue waiting for the next query

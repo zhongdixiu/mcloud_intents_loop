@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from .model_client import AgentScopeStructuredClient, StructuredModelClient
 from .prompts import (
@@ -10,39 +9,103 @@ from .prompts import (
     DIALOGUE_HISTORY_LIMIT,
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
-    LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     build_contextualizer_prompt,
     build_evaluator_prompt,
     build_intent_prompt,
-    build_loop_exhausted_clarifier_prompt,
     build_router_prompt,
 )
 from .skills import SkillRegistry
 from .types import (
+    CandidateScore,
     ContextualizedRequest,
     DialogueHistory,
-    EvaluationDecision,
-    IntentDecision,
-    IntentDecisionNoClarify,
-    LoopExhaustedClarification,
+    IntentCandidate,
+    IntentCandidateSet,
+    RerankDecision,
+    RouteDiagnostics,
     RouteResult,
+    SemanticFrame,
+    SkillCandidate,
+    SkillCandidateSet,
     SkillRef,
-    SkillRouteDecision,
-    SkillRouteDecisionNoClarify,
 )
 from .validation import (
     ValidationError,
-    validate_evaluation_decision,
-    validate_intent_decision,
+    validate_intent_candidate,
+    validate_rerank_decision,
 )
 
 
-ALLOWED_CLARIFY_SCOPES_BY_STAGE = {
-    "router": {"route_boundary"},
-    "intent": {"intent_code_boundary"},
-    "evaluator": {"route_boundary", "intent_code_boundary"},
+ORDINARY_CANDIDATE_ID = "ordinary_dialogue:000"
+ORDINARY_INTENT = "普通对话"
+ORDINARY_CODE = "000"
+SEARCH_SKILL_ID = "mcloud_search_skill"
+FUNCTION_SKILL_ID = "function_skill"
+GENERIC_SEARCH_INTENT = "搜综合"
+GENERIC_FUNCTION_INTENT = "AI超市"
+BLOCKING_CONFLICT_RISK_FLAGS = {"label_conflict"}
+NON_BLOCKING_RISK_PENALTY_FLAGS = {
+    "answer_vs_resource",
+    "context_unclear",
+    "ontology_conflict",
+    "search_vs_tool_entry",
 }
+ORDINARY_ANSWER_CUES = (
+    "是什么",
+    "为什么",
+    "哪里",
+    "怎么看",
+    "介绍",
+    "推荐",
+    "如何",
+    "怎么",
+    "讲讲",
+)
+ROUTE_CRITICAL_CUES = (
+    "入口",
+    "工具",
+    "功能",
+    "打开",
+    "进入",
+    "使用",
+    "开启",
+    "找出来",
+    "推荐入口",
+)
+SPECIFIC_BUSINESS_REASON_CUES = (
+    "具体业务",
+    "具体工具",
+    "专用",
+    "更具体",
+)
+GENERIC_ROUTE_REASON_CUES = (
+    "通用入口",
+    "通用搜索",
+    "普通对话",
+    "通用",
+    "搜索",
+)
+STRONG_BUSINESS_ACTIONS = (
+    "搜索",
+    "搜",
+    "查找",
+    "找",
+    "打开",
+    "进入",
+    "入口",
+    "工具",
+    "发送",
+    "整理",
+    "筛选",
+    "生成",
+    "创作",
+    "编辑",
+    "处理",
+    "翻译",
+    "总结",
+    "识别",
+)
 
 
 class IntentRouter:
@@ -52,9 +115,10 @@ class IntentRouter:
         model_client: StructuredModelClient | None = None,
         evaluator_client: StructuredModelClient | None = None,
         *,
-        max_attempts: int = 3,
+        max_expansion_rounds: int = 1,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
-        mode: Literal["code_eval", "production"] = "production",
+        top_skills: int = 3,
+        top_intents: int = 2,
     ) -> None:
         self.registry = registry
         self.model_client = model_client or AgentScopeStructuredClient.from_env()
@@ -67,9 +131,10 @@ class IntentRouter:
             )
             or self.model_client
         )
-        self.max_attempts = max_attempts
+        self.max_expansion_rounds = max_expansion_rounds
         self.dialogue_history_limit = dialogue_history_limit
-        self.mode = mode
+        self.top_skills = top_skills
+        self.top_intents = top_intents
 
     @classmethod
     def from_config(
@@ -78,17 +143,19 @@ class IntentRouter:
         model_client: StructuredModelClient | None = None,
         evaluator_client: StructuredModelClient | None = None,
         *,
-        max_attempts: int = 3,
+        max_expansion_rounds: int = 1,
         dialogue_history_limit: int | None = DIALOGUE_HISTORY_LIMIT,
-        mode: Literal["code_eval", "production"] = "production",
+        top_skills: int = 3,
+        top_intents: int = 2,
     ) -> "IntentRouter":
         return cls(
             SkillRegistry.from_path(skills_path),
             model_client=model_client,
             evaluator_client=evaluator_client,
-            max_attempts=max_attempts,
+            max_expansion_rounds=max_expansion_rounds,
             dialogue_history_limit=dialogue_history_limit,
-            mode=mode,
+            top_skills=top_skills,
+            top_intents=top_intents,
         )
 
     async def route(
@@ -100,429 +167,153 @@ class IntentRouter:
         trace: list[dict[str, Any]] | None = None,
     ) -> RouteResult:
         trace = [] if trace is None else trace
-        state = _new_state(query)
         history = _normalize_dialogue_history(dialogue_history)
-        _trace(
-            trace,
-            "route_start",
-            query=query,
-            dialogue_turns=len(history.turns),
-        )
-        rejected: list[str] = state.setdefault("rejected_skills", [])
-        rejected_intents: dict[str, list[dict[str, str]]] = state.setdefault(
-            "rejected_intents",
-            {},
-        )
-        visited: list[str] = state.setdefault("visited_skills", [])
         context = context or {}
+        _trace(trace, "route_start", query=query, dialogue_turns=len(history.turns))
+
         contextualized_request = await self._contextualize(query, history)
+        resolved_query = contextualized_request.resolved_query or query
         _trace(
             trace,
             "contextualize",
             current_user_query=query,
-            status=contextualized_request.status,
-            resolved_query=contextualized_request.resolved_query,
+            resolved_query=resolved_query,
             relation_to_history=contextualized_request.relation_to_history,
-            used_history_turns=list(contextualized_request.used_history_turns),
+            semantic_frame=contextualized_request.semantic_frame.model_dump(mode="json"),
             reason=contextualized_request.reason,
         )
-        state["resolved_query"] = contextualized_request.resolved_query or query
-        state["context_relation"] = contextualized_request.relation_to_history
-        resolved_query = contextualized_request.resolved_query or query
 
-        for _ in range(self.max_attempts):
-            attempt = _ + 1
-            retry_scope = state.get("retry_scope") or "reroute_skill"
-            locked_skill_id = state.get("locked_skill_id")
-            _trace(
-                trace,
-                "attempt_start",
-                attempt=attempt,
-                retry_scope=retry_scope,
-                locked_skill_id=locked_skill_id,
-            )
+        skill_candidates = await self._generate_skill_candidates(
+            resolved_query,
+            contextualized_request,
+            query,
+            context=context,
+        )
+        _trace(
+            trace,
+            "skill_candidates",
+            candidates=[candidate.model_dump(mode="json") for candidate in skill_candidates],
+        )
 
-            if retry_scope == "retry_intent" and locked_skill_id:
-                skill_id = locked_skill_id
-                route_confidence = float(state.get("locked_skill_confidence") or 1.0)
-                if not self.registry.has(skill_id) or (
-                    self.mode == "production" and skill_id in rejected
-                ):
-                    return _traced_result(
-                        trace,
-                        RouteResult(
-                            status="no_match",
-                            reason="Locked skill is not usable",
-                            visited_skills=visited,
-                        ),
-                    )
-                _trace(
-                    trace,
-                    "locked_skill",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    route_confidence=route_confidence,
-                    retry_scope=retry_scope,
-                )
-            else:
-                route_decision = await self._select_skills(
-                    resolved_query,
-                    rejected,
-                    context,
-                    contextualized_request,
-                    query,
-                )
-                _trace(
-                    trace,
-                    "skill_route",
-                    attempt=attempt,
-                    decision=route_decision.model_dump(mode="json"),
-                    rejected_skill_ids=list(rejected),
-                )
-                if route_decision.status == "clarify":
-                    if _should_suppress_clarify(
-                        "router",
-                        route_decision,
-                        mode=self.mode,
-                    ):
-                        _trace(
-                            trace,
-                            "clarify_suppressed",
-                            attempt=attempt,
-                            stage="router",
-                            clarify_scope=route_decision.clarify_scope,
-                            reason=route_decision.reason,
-                            question=route_decision.question,
-                        )
-                        route_decision = await self._select_skills_no_clarify(
-                            resolved_query,
-                            rejected,
-                            context,
-                            contextualized_request,
-                            query,
-                            suppressed=route_decision,
-                        )
-                        _trace(
-                            trace,
-                            "skill_route_no_clarify",
-                            attempt=attempt,
-                            decision=route_decision.model_dump(mode="json"),
-                            rejected_skill_ids=list(rejected),
-                        )
-                    if route_decision.status == "clarify":
-                        return _traced_result(
-                            trace,
-                            self._clarify(
-                                route_decision.question,
-                                route_decision.options,
-                                state,
-                            ),
-                )
-                if route_decision.status == "no_match":
-                    fallback = (
-                        _best_candidate_result(state)
-                        if self.mode == "code_eval"
-                        else None
-                    )
-                    if fallback is not None:
-                        _trace(
-                            trace,
-                            "route_no_match_fallback_best_candidate",
-                            attempt=attempt,
-                            reason=route_decision.reason,
-                            candidate=fallback.model_dump(mode="json"),
-                        )
-                        return _traced_result(trace, fallback)
-                    if state.get("invalid_evaluation_retried"):
-                        return _traced_result(
-                            trace,
-                            RouteResult(
-                                status="no_match",
-                                reason=route_decision.reason or "No matching skill",
-                                visited_skills=visited,
-                                resolved_query=state.get("resolved_query"),
-                                context_relation=state.get("context_relation"),
-                            ),
-                        )
-                    return _traced_result(
-                        trace,
-                        _fallback_dialogue_result(
-                            state,
-                            route_decision.reason or "No matching skill",
-                        ),
-                    )
+        intent_candidates = await self._generate_intent_candidates(
+            resolved_query,
+            skill_candidates,
+            contextualized_request,
+            query,
+            trace=trace,
+        )
+        if not intent_candidates:
+            intent_candidates = [_ordinary_intent_candidate()]
+        intent_candidates = _dedupe_intent_candidates(intent_candidates)
+        _trace(
+            trace,
+            "intent_candidates",
+            candidates=[candidate.model_dump(mode="json") for candidate in intent_candidates],
+        )
 
-                skill_id = route_decision.skill_id
-                route_confidence = route_decision.confidence
-                if not skill_id or not self.registry.has(skill_id) or (
-                    self.mode == "production" and skill_id in rejected
-                ):
-                    return _traced_result(
-                        trace,
-                        RouteResult(
-                            status="no_match",
-                            reason="Router did not return a usable skill",
-                            visited_skills=visited,
-                            resolved_query=state.get("resolved_query"),
-                            context_relation=state.get("context_relation"),
-                        ),
-                    )
-                state["locked_skill_id"] = skill_id
-                state["locked_skill_confidence"] = route_confidence
+        first_candidate = intent_candidates[0]
+        expansion_rounds = 0
+        invalid_rerank_reason: str | None = None
+        rerank = await self._rerank_candidates(
+            resolved_query,
+            intent_candidates,
+            contextualized_request,
+            query,
+            expansion_round=expansion_rounds,
+        )
+        try:
+            rerank = _validated_rerank(rerank, intent_candidates)
+        except ValidationError as exc:
+            invalid_rerank_reason = str(exc)
+            rerank = _fallback_rerank(first_candidate, str(exc))
+        _trace(
+            trace,
+            "rerank",
+            expansion_round=expansion_rounds,
+            decision=rerank.model_dump(mode="json"),
+            invalid_reason=invalid_rerank_reason,
+        )
 
-            skill = self.registry.get(skill_id)
-            if skill_id not in visited:
-                visited.append(skill_id)
-
-            intent_decision = await self._select_intent(
+        expanded_scopes: list[str] = []
+        while (
+            rerank.verdict == "expand"
+            and expansion_rounds < self.max_expansion_rounds
+        ):
+            new_candidates = await self._expand_candidates(
                 resolved_query,
-                skill_id,
-                rejected_intents.get(skill_id, []),
+                skill_candidates,
+                intent_candidates,
+                rerank,
                 contextualized_request,
                 query,
+                context=context,
+                trace=trace,
             )
+            new_candidates = _new_route_candidates(intent_candidates, new_candidates)
             _trace(
                 trace,
-                "intent_select",
-                attempt=attempt,
-                skill_id=skill_id,
-                decision=intent_decision.model_dump(mode="json"),
-                rejected_intents=rejected_intents.get(skill_id, []),
+                "expansion",
+                expansion_round=expansion_rounds + 1,
+                expand_scope=rerank.expand_scope,
+                expansion_hint=rerank.expansion_hint,
+                new_candidate_count=len(new_candidates),
             )
-            if intent_decision.status == "clarify":
-                if _should_suppress_clarify(
-                    "intent",
-                    intent_decision,
-                    mode=self.mode,
-                ):
-                    _trace(
-                        trace,
-                        "clarify_suppressed",
-                        attempt=attempt,
-                        stage="intent",
-                        skill_id=skill_id,
-                        clarify_scope=intent_decision.clarify_scope,
-                        reason=intent_decision.reason,
-                        question=intent_decision.question,
-                    )
-                    intent_decision = await self._select_intent_no_clarify(
-                        resolved_query,
-                        skill_id,
-                        rejected_intents.get(skill_id, []),
-                        contextualized_request,
-                        query,
-                        suppressed=intent_decision,
-                    )
-                    _trace(
-                        trace,
-                        "intent_select_no_clarify",
-                        attempt=attempt,
-                        skill_id=skill_id,
-                        decision=intent_decision.model_dump(mode="json"),
-                        rejected_intents=rejected_intents.get(skill_id, []),
-                    )
-                if intent_decision.status == "clarify":
-                    return _traced_result(
-                        trace,
-                        self._clarify(intent_decision.question, intent_decision.options, state),
-                    )
-            if intent_decision.status == "no_match":
-                _trace(
-                    trace,
-                    "intent_no_match",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    retry_scope=retry_scope,
-                    reason=intent_decision.reason,
-                )
-                if (
-                    self.mode == "production"
-                    and retry_scope == "reroute_skill"
-                    and skill_id not in rejected
-                ):
-                    rejected.append(skill_id)
-                    state["retry_scope"] = "reroute_skill"
-                    state["locked_skill_id"] = None
-                    state["locked_skill_confidence"] = None
-                    _trace(
-                        trace,
-                        "retry",
-                        attempt=attempt,
-                        scope="skill_no_match",
-                        next_retry_scope="reroute_skill",
-                        rejected_skill_ids=list(rejected),
-                    )
-                    continue
-                return _traced_result(
-                    trace,
-                    _fallback_dialogue_result(
-                        state,
-                        intent_decision.reason or "No matching intent",
-                    ),
-                )
+            if not new_candidates:
+                break
 
-            try:
-                validated = validate_intent_decision(skill, intent_decision)
-            except ValidationError as exc:
-                state["locked_skill_id"] = skill_id
-                state["locked_skill_confidence"] = route_confidence
-                state["locked_intent"] = None
-                state["locked_code"] = None
-                state["retry_scope"] = "retry_intent"
-                _record_intent_rejection(
-                    state,
-                    skill_id,
-                    intent_decision.intent,
-                    str(exc),
-                )
-                correction_scope = "intent_mismatch"
-                _trace(
-                    trace,
-                    "validation_error",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    intent=intent_decision.intent,
-                    code=intent_decision.code,
-                    reason=str(exc),
-                    correction_scope=correction_scope,
-                    next_retry_scope=state.get("retry_scope"),
-                )
-                continue
-
-            _record_candidate_attempt(
-                state,
-                skill_id=skill_id,
-                skill_name=skill.name,
-                route_confidence=route_confidence,
-                decision=validated,
-                attempt=attempt,
-                source="intent_select",
+            expansion_rounds += 1
+            if rerank.expand_scope:
+                expanded_scopes.append(rerank.expand_scope)
+            intent_candidates = _dedupe_intent_candidates(
+                [*intent_candidates, *new_candidates],
             )
-
-            raw_evaluation = await self._evaluate(
+            rerank = await self._rerank_candidates(
                 resolved_query,
-                skill_id,
-                validated,
-                state,
+                intent_candidates,
                 contextualized_request,
                 query,
+                expansion_round=expansion_rounds,
             )
-            _trace(
-                trace,
-                "evaluation",
-                attempt=attempt,
-                skill_id=skill_id,
-                candidate=validated.model_dump(mode="json"),
-                evaluation=raw_evaluation.model_dump(mode="json"),
-            )
-            if _should_suppress_clarify(
-                "evaluator",
-                raw_evaluation,
-                mode=self.mode,
-            ):
-                _trace(
-                    trace,
-                    "clarify_suppressed",
-                    attempt=attempt,
-                    stage="evaluator",
-                    skill_id=skill_id,
-                    intent=validated.intent,
-                    code=validated.code,
-                    clarify_scope=raw_evaluation.clarify_scope,
-                    reason=raw_evaluation.reason or raw_evaluation.clarity_reason,
-                    question=raw_evaluation.question,
-                )
-                raw_evaluation = EvaluationDecision(
-                    verdict="accept",
-                    skill_check="pass",
-                    intent_check="pass",
-                    params_check="pass",
-                    confidence=raw_evaluation.confidence,
-                    reason=(
-                        "suppressed non-boundary evaluator clarify: "
-                        f"{raw_evaluation.reason or raw_evaluation.clarity_reason or ''}"
-                    ),
-                )
-                _trace(
-                    trace,
-                    "evaluation_no_clarify_accept",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    candidate=validated.model_dump(mode="json"),
-                    evaluation=raw_evaluation.model_dump(mode="json"),
-                )
             try:
-                evaluation = validate_evaluation_decision(raw_evaluation)
+                rerank = _validated_rerank(rerank, intent_candidates)
+                invalid_rerank_reason = None
             except ValidationError as exc:
-                if self.mode == "code_eval":
-                    fallback = _best_candidate_result(state)
-                    if fallback is not None:
-                        _trace(
-                            trace,
-                            "invalid_evaluation_accept_best_candidate",
-                            attempt=attempt,
-                            skill_id=skill_id,
-                            intent=validated.intent,
-                            reason=str(exc),
-                            candidate=fallback.model_dump(mode="json"),
-                        )
-                        return _traced_result(trace, fallback)
-                result = self._invalid_evaluation_result(
-                    state,
-                    skill_id,
-                    validated.intent,
-                    str(exc),
-                )
-                _trace(
-                    trace,
-                    "evaluation_invalid",
-                    attempt=attempt,
-                    skill_id=skill_id,
-                    intent=validated.intent,
-                    reason=str(exc),
-                    next_retry_scope=state.get("retry_scope"),
-                )
-                if result is not None:
-                    return _traced_result(trace, result)
-                continue
-
-            result = self._apply_evaluation_result(
-                evaluation,
-                skill_id=skill_id,
-                skill_name=skill.name,
-                validated=validated,
-                route_confidence=route_confidence,
-                state=state,
-                trace=trace,
-                attempt=attempt,
-            )
-            if result is not None:
-                return _traced_result(trace, result)
-            continue
-
-        result = _best_candidate_result(state) if self.mode == "code_eval" else None
-        if result is not None:
+                invalid_rerank_reason = str(exc)
+                rerank = _fallback_rerank(first_candidate, str(exc))
             _trace(
                 trace,
-                "loop_exhausted_best_candidate",
-                candidate=result.model_dump(mode="json"),
+                "rerank",
+                expansion_round=expansion_rounds,
+                decision=rerank.model_dump(mode="json"),
+                invalid_reason=invalid_rerank_reason,
             )
-            result.termination_reason = "loop_exhausted_best_candidate"
-        elif self.mode == "code_eval":
-            result = _fallback_dialogue_result(
-                state,
-                "Loop exhausted without a usable candidate",
-            )
-            result.termination_reason = "loop_exhausted_fallback"
-            _trace(trace, "loop_exhausted_fallback_dialogue")
-        else:
-            result = await self._clarify_loop_exhausted(
-                current_user_query=query,
-                resolved_query=resolved_query,
-                contextualized_request=contextualized_request,
-                state=state,
-                trace=trace,
-            )
+
+        final_candidate, diagnostics = _apply_switch_gate(
+            first_candidate=first_candidate,
+            candidates=intent_candidates,
+            rerank=rerank,
+            contextualized_request=contextualized_request,
+            current_user_query=query,
+            expansion_rounds=expansion_rounds,
+            invalid_rerank_reason=invalid_rerank_reason,
+        )
+        _trace(
+            trace,
+            "switch_gate",
+            final_candidate_id=final_candidate.candidate_id,
+            diagnostics=diagnostics.model_dump(mode="json"),
+        )
+
+        result = _result_from_candidate(
+            final_candidate,
+            resolved_query=resolved_query,
+            context_relation=contextualized_request.relation_to_history,
+            alternatives=intent_candidates,
+            diagnostics=diagnostics,
+            visited_skills=_visited_skills(skill_candidates, intent_candidates),
+            loop_count=1 + expansion_rounds,
+            correction_scopes=expanded_scopes,
+        )
         return _traced_result(trace, result)
 
     async def route_no_loop(
@@ -534,738 +325,385 @@ class IntentRouter:
         trace: list[dict[str, Any]] | None = None,
     ) -> RouteResult:
         trace = [] if trace is None else trace
-        state = _new_state(query)
         history = _normalize_dialogue_history(dialogue_history)
+        context = context or {}
         _trace(
             trace,
             "route_start",
-            mode="no_loop",
+            route_path="first_candidate",
             query=query,
             dialogue_turns=len(history.turns),
         )
-        context = context or {}
-        contextualized_request = await self._contextualize(query, history)
-        _trace(
-            trace,
-            "contextualize",
-            mode="no_loop",
-            current_user_query=query,
-            status=contextualized_request.status,
-            resolved_query=contextualized_request.resolved_query,
-            relation_to_history=contextualized_request.relation_to_history,
-            used_history_turns=list(contextualized_request.used_history_turns),
-            reason=contextualized_request.reason,
-        )
-        state["resolved_query"] = contextualized_request.resolved_query or query
-        state["context_relation"] = contextualized_request.relation_to_history
 
+        contextualized_request = await self._contextualize(query, history)
         resolved_query = contextualized_request.resolved_query or query
         _trace(
             trace,
-            "attempt_start",
-            mode="no_loop",
-            attempt=1,
-            retry_scope="no_loop",
-            locked_skill_id=None,
+            "contextualize",
+            route_path="first_candidate",
+            current_user_query=query,
+            resolved_query=resolved_query,
+            relation_to_history=contextualized_request.relation_to_history,
+            semantic_frame=contextualized_request.semantic_frame.model_dump(mode="json"),
+            reason=contextualized_request.reason,
         )
 
-        route_decision = await self._select_skills(
+        skill_candidates = await self._generate_skill_candidates(
             resolved_query,
-            [],
-            context,
             contextualized_request,
             query,
+            context=context,
         )
-        _trace(
-            trace,
-            "skill_route",
-            mode="no_loop",
-            attempt=1,
-            decision=route_decision.model_dump(mode="json"),
-            rejected_skill_ids=[],
-        )
-        if route_decision.status == "clarify":
-            if _should_suppress_clarify(
-                "router",
-                route_decision,
-                mode=self.mode,
-            ):
-                _trace(
-                    trace,
-                    "clarify_suppressed",
-                    mode="no_loop",
-                    attempt=1,
-                    stage="router",
-                    clarify_scope=route_decision.clarify_scope,
-                    reason=route_decision.reason,
-                    question=route_decision.question,
-                )
-                route_decision = await self._select_skills_no_clarify(
-                    resolved_query,
-                    [],
-                    context,
-                    contextualized_request,
-                    query,
-                    suppressed=route_decision,
-                )
-                _trace(
-                    trace,
-                    "skill_route_no_clarify",
-                    mode="no_loop",
-                    attempt=1,
-                    decision=route_decision.model_dump(mode="json"),
-                    rejected_skill_ids=[],
-                )
-            if route_decision.status == "clarify":
-                return _traced_result(
-                    trace,
-                    self._clarify(
-                        route_decision.question,
-                        route_decision.options,
-                        state,
-                    ),
-                )
-        if route_decision.status == "no_match":
-            return _traced_result(
-                trace,
-                _fallback_dialogue_result(
-                    state,
-                    route_decision.reason or "No matching skill",
-                ),
-            )
-
-        skill_id = route_decision.skill_id
-        route_confidence = route_decision.confidence
-        visited: list[str] = state.setdefault("visited_skills", [])
-        if not skill_id or not self.registry.has(skill_id):
-            return _traced_result(
-                trace,
-                RouteResult(
-                    status="no_match",
-                    reason="Router did not return a usable skill",
-                    visited_skills=visited,
-                    resolved_query=state.get("resolved_query"),
-                    context_relation=state.get("context_relation"),
-                ),
-            )
-        visited.append(skill_id)
-        skill = self.registry.get(skill_id)
-
-        intent_decision = await self._select_intent(
+        intent_candidates = await self._generate_intent_candidates(
             resolved_query,
-            skill_id,
-            [],
+            skill_candidates,
             contextualized_request,
             query,
+            trace=trace,
+        )
+        if not intent_candidates:
+            intent_candidates = [_ordinary_intent_candidate()]
+        intent_candidates = _dedupe_intent_candidates(intent_candidates)
+        first_candidate = intent_candidates[0]
+        diagnostics = RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=first_candidate.candidate_id,
+            evaluator_action="select_top",
+            expansion_rounds=0,
+            risk_flags=list(first_candidate.risk_flags),
+            rerank_reason="first candidate path",
         )
         _trace(
             trace,
-            "intent_select",
-            mode="no_loop",
-            attempt=1,
-            skill_id=skill_id,
-            decision=intent_decision.model_dump(mode="json"),
-            rejected_intents=[],
+            "first_candidate",
+            candidate=first_candidate.model_dump(mode="json"),
         )
-        if intent_decision.status == "clarify":
-            if _should_suppress_clarify(
-                "intent",
-                intent_decision,
-                mode=self.mode,
-            ):
-                _trace(
-                    trace,
-                    "clarify_suppressed",
-                    mode="no_loop",
-                    attempt=1,
-                    stage="intent",
-                    skill_id=skill_id,
-                    clarify_scope=intent_decision.clarify_scope,
-                    reason=intent_decision.reason,
-                    question=intent_decision.question,
-                )
-                intent_decision = await self._select_intent_no_clarify(
-                    resolved_query,
-                    skill_id,
-                    [],
-                    contextualized_request,
-                    query,
-                    suppressed=intent_decision,
-                )
-                _trace(
-                    trace,
-                    "intent_select_no_clarify",
-                    mode="no_loop",
-                    attempt=1,
-                    skill_id=skill_id,
-                    decision=intent_decision.model_dump(mode="json"),
-                    rejected_intents=[],
-                )
-            if intent_decision.status == "clarify":
-                return _traced_result(
-                    trace,
-                    self._clarify(
-                        intent_decision.question,
-                        intent_decision.options,
-                        state,
-                    ),
-                )
-        if intent_decision.status == "no_match":
-            return _traced_result(
-                trace,
-                _fallback_dialogue_result(
-                    state,
-                    intent_decision.reason or "No matching intent",
-                ),
-            )
-
-        return _traced_result(
-            trace,
-            RouteResult(
-                status="matched",
-                skill=SkillRef(id=skill_id, name=skill.name),
-                intent=intent_decision.intent,
-                code=intent_decision.code,
-                params=intent_decision.params,
-                confidence=min(route_confidence, intent_decision.confidence),
-                visited_skills=visited,
-                resolved_query=state.get("resolved_query"),
-                context_relation=state.get("context_relation"),
-            ),
+        result = _result_from_candidate(
+            first_candidate,
+            resolved_query=resolved_query,
+            context_relation=contextualized_request.relation_to_history,
+            alternatives=intent_candidates,
+            diagnostics=diagnostics,
+            visited_skills=_visited_skills(skill_candidates, intent_candidates),
+            loop_count=1,
+            correction_scopes=[],
         )
+        return _traced_result(trace, result)
 
-    def _apply_evaluation_result(
-        self,
-        evaluation: EvaluationDecision,
-        *,
-        skill_id: str,
-        skill_name: str,
-        validated: IntentDecision,
-        route_confidence: float,
-        state: dict[str, Any],
-        trace: list[dict[str, Any]] | None = None,
-        attempt: int | None = None,
-    ) -> RouteResult | None:
-        if self.mode == "code_eval":
-            return self._apply_code_eval_evaluation_result(
-                evaluation,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                validated=validated,
-                route_confidence=route_confidence,
-                state=state,
-                trace=trace,
-                attempt=attempt,
-            )
-
-        if evaluation.verdict == "clarify":
-            return self._clarify(
-                evaluation.question or evaluation.clarity_reason,
-                evaluation.options,
-                state,
-            )
-
-        if evaluation.verdict == "accept":
-            return RouteResult(
-                status="matched",
-                skill=SkillRef(id=skill_id, name=skill_name),
-                intent=validated.intent,
-                code=validated.code,
-                params=validated.params,
-                confidence=min(route_confidence, validated.confidence),
-                visited_skills=state.get("visited_skills", []),
-                resolved_query=state.get("resolved_query"),
-                context_relation=state.get("context_relation"),
-            )
-
-        if not evaluation.reject_scope:
-            return self._invalid_evaluation_result(
-                state,
-                skill_id,
-                validated.intent,
-                "rejected evaluation misses reject_scope",
-            )
-
-        if (
-            evaluation.reject_scope == "intent_mismatch"
-            and self._preferred_code_matches_candidate(
-                evaluation,
-                skill_id=skill_id,
-                candidate_code=validated.code,
-            )
-        ):
-            _trace(
-                trace,
-                "accept_same_code_intent_mismatch",
-                attempt=attempt,
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                preferred_intent=evaluation.preferred_intent,
-                preferred_code=evaluation.preferred_code,
-                reason=evaluation.reason,
-            )
-            return RouteResult(
-                status="matched",
-                skill=SkillRef(id=skill_id, name=skill_name),
-                intent=validated.intent,
-                code=validated.code,
-                params=validated.params,
-                confidence=min(route_confidence, validated.confidence),
-                visited_skills=state.get("visited_skills", []),
-                resolved_query=state.get("resolved_query"),
-                context_relation=state.get("context_relation"),
-            )
-
-        if evaluation.reject_scope == "param_mismatch":
-            _trace(
-                trace,
-                "accept_param_mismatch",
-                attempt=attempt,
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                reason=evaluation.reason,
-            )
-            return RouteResult(
-                status="matched",
-                skill=SkillRef(id=skill_id, name=skill_name),
-                intent=validated.intent,
-                code=validated.code,
-                params=validated.params,
-                confidence=min(route_confidence, validated.confidence),
-                visited_skills=state.get("visited_skills", []),
-                resolved_query=state.get("resolved_query"),
-                context_relation=state.get("context_relation"),
-            )
-        if evaluation.reject_scope == "intent_mismatch":
-            _apply_retry_scope(
-                state,
-                evaluation.reject_scope,
-                skill_id=skill_id,
-                route_confidence=route_confidence,
-            )
-            _trace(
-                trace,
-                "retry",
-                attempt=attempt,
-                scope=evaluation.reject_scope,
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                reason=evaluation.reason,
-                next_retry_scope=state.get("retry_scope"),
-            )
-            _record_intent_rejection(
-                state,
-                skill_id,
-                validated.intent,
-                evaluation.reason,
-                scope="intent_mismatch",
-            )
-            return None
-
-        _apply_retry_scope(
-            state,
-            evaluation.reject_scope,
-            skill_id=skill_id,
-            route_confidence=route_confidence,
-        )
-        _trace(
-            trace,
-            "retry",
-            attempt=attempt,
-            scope=evaluation.reject_scope,
-            skill_id=skill_id,
-            intent=validated.intent,
-            code=validated.code,
-            reason=evaluation.reason,
-            next_retry_scope=state.get("retry_scope"),
-        )
-        state.setdefault("rejections", []).append(
-            {
-                "scope": "skill_mismatch",
-                "skill_id": skill_id,
-                "reason": evaluation.reason,
-            },
-        )
-        rejected: list[str] = state.setdefault("rejected_skills", [])
-        if skill_id not in rejected:
-            rejected.append(skill_id)
-        return None
-
-    def _apply_code_eval_evaluation_result(
-        self,
-        evaluation: EvaluationDecision,
-        *,
-        skill_id: str,
-        skill_name: str,
-        validated: IntentDecision,
-        route_confidence: float,
-        state: dict[str, Any],
-        trace: list[dict[str, Any]] | None = None,
-        attempt: int | None = None,
-    ) -> RouteResult:
-        if evaluation.verdict == "accept":
-            return _candidate_result(
-                state,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                validated=validated,
-                route_confidence=route_confidence,
-            )
-
-        if evaluation.verdict == "clarify":
-            _trace(
-                trace,
-                "weak_evaluation_accept",
-                attempt=attempt,
-                verdict="clarify",
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                clarify_scope=evaluation.clarify_scope,
-                reason=evaluation.reason or evaluation.clarity_reason,
-            )
-            return _candidate_result(
-                state,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                validated=validated,
-                route_confidence=route_confidence,
-            )
-
-        if evaluation.reject_scope == "param_mismatch":
-            _trace(
-                trace,
-                "accept_param_mismatch",
-                attempt=attempt,
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                reason=evaluation.reason,
-            )
-            return _candidate_result(
-                state,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                validated=validated,
-                route_confidence=route_confidence,
-            )
-
-        if self._preferred_code_matches_candidate(
-            evaluation,
-            skill_id=skill_id,
-            candidate_code=validated.code,
-        ):
-            _trace(
-                trace,
-                "accept_same_code_intent_mismatch",
-                attempt=attempt,
-                skill_id=skill_id,
-                intent=validated.intent,
-                code=validated.code,
-                preferred_intent=evaluation.preferred_intent,
-                preferred_code=evaluation.preferred_code,
-                reason=evaluation.reason,
-            )
-            return _candidate_result(
-                state,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                validated=validated,
-                route_confidence=route_confidence,
-            )
-
-        preferred = self._result_for_preferred_code(
-            evaluation,
-            state=state,
-            route_confidence=route_confidence,
-        )
-        if (
-            preferred is not None
-            and evaluation.confidence >= 0.8
-            and evaluation.is_code_blocking
-        ):
-            _trace(
-                trace,
-                "accept_preferred_code",
-                attempt=attempt,
-                rejected_skill_id=skill_id,
-                rejected_intent=validated.intent,
-                rejected_code=validated.code,
-                preferred_skill_id=preferred.skill.id if preferred.skill else None,
-                preferred_intent=preferred.intent,
-                preferred_code=preferred.code,
-                confidence=evaluation.confidence,
-                reason=evaluation.reason,
-            )
-            state.setdefault("candidate_attempts", []).append(
-                {
-                    "attempt": attempt,
-                    "source": "evaluator_preferred_code",
-                    "skill_id": preferred.skill.id if preferred.skill else None,
-                    "skill_name": preferred.skill.name if preferred.skill else None,
-                    "intent": preferred.intent,
-                    "code": preferred.code,
-                    "params": preferred.params,
-                    "confidence": preferred.confidence,
-                    "evaluator_verdict": evaluation.verdict,
-                    "evaluator_reason": evaluation.reason,
-                },
-            )
-            return preferred
-
-        event = "invalid_reject_accept" if not preferred else "weak_evaluation_accept"
-        _trace(
-            trace,
-            event,
-            attempt=attempt,
-            skill_id=skill_id,
-            intent=validated.intent,
-            code=validated.code,
-            reject_scope=evaluation.reject_scope,
-            preferred_skill_id=evaluation.preferred_skill_id,
-            preferred_intent=evaluation.preferred_intent,
-            preferred_code=evaluation.preferred_code,
-            is_code_blocking=evaluation.is_code_blocking,
-            confidence=evaluation.confidence,
-            reason=evaluation.reason,
-        )
-        return _candidate_result(
-            state,
-            skill_id=skill_id,
-            skill_name=skill_name,
-            validated=validated,
-            route_confidence=route_confidence,
-        )
-
-    def _result_for_preferred_code(
-        self,
-        evaluation: EvaluationDecision,
-        *,
-        state: dict[str, Any],
-        route_confidence: float,
-    ) -> RouteResult | None:
-        if not evaluation.preferred_code:
-            return None
-
-        preferred_skill_id = evaluation.preferred_skill_id
-        if preferred_skill_id and self.registry.has(preferred_skill_id):
-            skill = self.registry.get(preferred_skill_id)
-            for intent_name, schema in skill.intents.items():
-                if schema.code == evaluation.preferred_code and (
-                    not evaluation.preferred_intent
-                    or evaluation.preferred_intent == intent_name
-                ):
-                    visited = state.setdefault("visited_skills", [])
-                    if skill.id not in visited:
-                        visited.append(skill.id)
-                    return RouteResult(
-                        status="matched",
-                        skill=SkillRef(id=skill.id, name=skill.name),
-                        intent=intent_name,
-                        code=schema.code,
-                        params={},
-                        confidence=route_confidence,
-                        visited_skills=visited,
-                        resolved_query=state.get("resolved_query"),
-                        context_relation=state.get("context_relation"),
-                    )
-
-        for skill in self.registry._skills.values():
-            for intent_name, schema in skill.intents.items():
-                if schema.code == evaluation.preferred_code and (
-                    not evaluation.preferred_intent
-                    or evaluation.preferred_intent == intent_name
-                ):
-                    visited = state.setdefault("visited_skills", [])
-                    if skill.id not in visited:
-                        visited.append(skill.id)
-                    return RouteResult(
-                        status="matched",
-                        skill=SkillRef(id=skill.id, name=skill.name),
-                        intent=intent_name,
-                        code=schema.code,
-                        params={},
-                        confidence=route_confidence,
-                        visited_skills=visited,
-                        resolved_query=state.get("resolved_query"),
-                        context_relation=state.get("context_relation"),
-                    )
-        return None
-
-    def _preferred_code_matches_candidate(
-        self,
-        evaluation: EvaluationDecision,
-        *,
-        skill_id: str,
-        candidate_code: str | None,
-    ) -> bool:
-        if not candidate_code:
-            return False
-        if evaluation.preferred_code:
-            return evaluation.preferred_code == candidate_code
-        if not evaluation.preferred_intent or not self.registry.has(skill_id):
-            return False
-        skill = self.registry.get(skill_id)
-        intent_schema = skill.intents.get(evaluation.preferred_intent)
-        return intent_schema is not None and intent_schema.code == candidate_code
-
-    def _invalid_evaluation_result(
-        self,
-        state: dict[str, Any],
-        skill_id: str,
-        intent: str | None,
-        reason: str,
-    ) -> RouteResult | None:
-        state.setdefault("rejections", []).append(
-            {
-                "scope": "invalid_evaluation",
-                "skill_id": skill_id,
-                "intent": intent or "",
-                "reason": reason,
-            },
-        )
-        if not state.get("invalid_evaluation_retried"):
-            state["invalid_evaluation_retried"] = True
-            state["retry_scope"] = "reroute_skill"
-            state["locked_skill_id"] = None
-            state["locked_skill_confidence"] = None
-            state["locked_intent"] = None
-            state["locked_code"] = None
-            return None
-        return RouteResult(
-            status="no_match",
-            reason="Evaluator produced inconsistent decision",
-            visited_skills=state.get("visited_skills", []),
-        )
-
-    async def _select_skills(
+    async def _generate_skill_candidates(
         self,
         resolved_query: str,
-        rejected: list[str],
-        context: dict[str, Any],
-        contextualized_request: ContextualizedRequest,
-        current_user_query: str,
-    ) -> SkillRouteDecision:
-        prompt = build_router_prompt(
-            resolved_query,
-            self.registry.cards(),
-            rejected,
-            contextualized_request,
-            current_user_query,
-        )
-        if context:
-            prompt = json.dumps(
-                {"routing_input": json.loads(prompt), "context": context},
-                ensure_ascii=False,
-            )
-        return await self.model_client.structured(
-            system_prompt=ROUTER_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            response_model=SkillRouteDecision,
-        )
-
-    async def _select_skills_no_clarify(
-        self,
-        resolved_query: str,
-        rejected: list[str],
-        context: dict[str, Any],
         contextualized_request: ContextualizedRequest,
         current_user_query: str,
         *,
-        suppressed: SkillRouteDecision,
-    ) -> SkillRouteDecision:
-        prompt = build_router_prompt(
-            resolved_query,
-            self.registry.cards(),
-            rejected,
-            contextualized_request,
-            current_user_query,
-        )
-        if context:
-            prompt = json.dumps(
-                {"routing_input": json.loads(prompt), "context": context},
-                ensure_ascii=False,
-            )
+        context: dict[str, Any],
+        existing_candidates: list[SkillCandidate] | None = None,
+        expansion_scope: str | None = None,
+        expansion_hint: str | None = None,
+    ) -> list[SkillCandidate]:
         decision = await self.model_client.structured(
             system_prompt=ROUTER_SYSTEM_PROMPT,
-            user_prompt=_with_no_clarify_policy(prompt, suppressed),
-            response_model=SkillRouteDecisionNoClarify,
-        )
-        return SkillRouteDecision.model_validate(decision.model_dump())
-
-    async def _select_intent(
-        self,
-        resolved_query: str,
-        skill_id: str,
-        rejected_intents: list[dict[str, str]],
-        contextualized_request: ContextualizedRequest | None = None,
-        current_user_query: str | None = None,
-    ) -> IntentDecision:
-        skill = self.registry.get(skill_id)
-        return await self.model_client.structured(
-            system_prompt=INTENT_SYSTEM_PROMPT,
-            user_prompt=build_intent_prompt(
+            user_prompt=build_router_prompt(
                 resolved_query,
-                skill,
-                rejected_intents,
+                self.registry.cards(),
                 contextualized_request,
                 current_user_query,
+                top_n=self.top_skills,
+                existing_candidates=existing_candidates,
+                expansion_scope=expansion_scope,
+                expansion_hint=expansion_hint,
+                context=context,
             ),
-            response_model=IntentDecision,
+            response_model=SkillCandidateSet,
+        )
+        candidates = self._normalize_skill_candidates(decision.candidates)
+        return self._complete_skill_candidates(
+            candidates,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
         )
 
-    async def _select_intent_no_clarify(
+    def _normalize_skill_candidates(
         self,
-        resolved_query: str,
-        skill_id: str,
-        rejected_intents: list[dict[str, str]],
-        contextualized_request: ContextualizedRequest | None = None,
-        current_user_query: str | None = None,
+        candidates: list[SkillCandidate],
+    ) -> list[SkillCandidate]:
+        normalized: list[SkillCandidate] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.skill_id or ORDINARY_CODE
+            if key in seen:
+                continue
+            if candidate.skill_id is not None and not self.registry.has(candidate.skill_id):
+                continue
+            seen.add(key)
+            normalized.append(candidate)
+            if len([item for item in normalized if item.skill_id is not None]) >= self.top_skills:
+                break
+
+        if not any(candidate.skill_id is None for candidate in normalized):
+            normalized.append(_ordinary_skill_candidate())
+        if not normalized:
+            normalized.append(_ordinary_skill_candidate())
+        return normalized
+
+    def _complete_skill_candidates(
+        self,
+        candidates: list[SkillCandidate],
         *,
-        suppressed: IntentDecision,
-    ) -> IntentDecision:
-        skill = self.registry.get(skill_id)
-        decision = await self.model_client.structured(
-            system_prompt=INTENT_SYSTEM_PROMPT,
-            user_prompt=_with_no_clarify_policy(
-                build_intent_prompt(
-                    resolved_query,
-                    skill,
-                    rejected_intents,
-                    contextualized_request,
-                    current_user_query,
-                ),
-                suppressed,
-            ),
-            response_model=IntentDecisionNoClarify,
-        )
-        return IntentDecision.model_validate(decision.model_dump())
-
-    async def _evaluate(
-        self,
-        resolved_query: str,
-        skill_id: str,
-        decision: IntentDecision,
-        state: dict[str, Any],
         contextualized_request: ContextualizedRequest,
         current_user_query: str,
-    ) -> EvaluationDecision:
+    ) -> list[SkillCandidate]:
+        completed = list(candidates)
+        seen = {candidate.skill_id for candidate in completed}
+
+        if (
+            _should_complete_search_for_single_entity(
+                contextualized_request,
+                current_user_query,
+            )
+            and self.registry.has(SEARCH_SKILL_ID)
+            and SEARCH_SKILL_ID not in seen
+        ):
+            completed.append(
+                _synthetic_skill_candidate(
+                    SEARCH_SKILL_ID,
+                    confidence=0.55,
+                    matched_cues=[current_user_query],
+                    risk_flags=[],
+                    reason="single entity resource query keeps generic search available",
+                ),
+            )
+            seen.add(SEARCH_SKILL_ID)
+
+        if not _has_route_critical_query(
+            contextualized_request,
+            current_user_query,
+        ):
+            if not any(candidate.skill_id is None for candidate in completed):
+                completed.append(_ordinary_skill_candidate())
+            return completed
+
+        specific_skill_id = _specific_business_skill_for_query(
+            self.registry,
+            contextualized_request,
+            current_user_query,
+        )
+        if specific_skill_id and specific_skill_id not in seen:
+            completed.append(
+                _synthetic_skill_candidate(
+                    specific_skill_id,
+                    confidence=0.62,
+                    matched_cues=_route_critical_matched_cues(
+                        contextualized_request,
+                        current_user_query,
+                    ),
+                    risk_flags=[],
+                    reason="route-critical cue matched a specific business skill",
+                ),
+            )
+            seen.add(specific_skill_id)
+
+        if self.registry.has(FUNCTION_SKILL_ID) and FUNCTION_SKILL_ID not in seen:
+            completed.append(
+                _synthetic_skill_candidate(
+                    FUNCTION_SKILL_ID,
+                    confidence=0.45,
+                    matched_cues=_route_critical_matched_cues(
+                        contextualized_request,
+                        current_user_query,
+                    ),
+                    risk_flags=["generic_entry"],
+                    reason="route-critical cue keeps generic function entry available",
+                ),
+            )
+
+        if not any(candidate.skill_id is None for candidate in completed):
+            completed.append(_ordinary_skill_candidate())
+
+        return completed
+
+    async def _generate_intent_candidates(
+        self,
+        resolved_query: str,
+        skill_candidates: list[SkillCandidate],
+        contextualized_request: ContextualizedRequest,
+        current_user_query: str,
+        *,
+        trace: list[dict[str, Any]] | None = None,
+        expansion_scope: str | None = None,
+        expansion_hint: str | None = None,
+    ) -> list[IntentCandidate]:
+        intent_candidates: list[IntentCandidate] = []
+        used_ids: set[str] = set()
+        for skill_candidate in skill_candidates:
+            if skill_candidate.skill_id is None:
+                candidate = _ordinary_intent_candidate(skill_candidate)
+                candidate.candidate_id = _unique_candidate_id(candidate.candidate_id, used_ids)
+                used_ids.add(candidate.candidate_id)
+                intent_candidates.append(candidate)
+                continue
+
+            skill = self.registry.get(skill_candidate.skill_id)
+            decision = await self.model_client.structured(
+                system_prompt=INTENT_SYSTEM_PROMPT,
+                user_prompt=build_intent_prompt(
+                    resolved_query,
+                    skill,
+                    contextualized_request,
+                    current_user_query,
+                    skill_candidate=skill_candidate,
+                    top_m=self.top_intents,
+                    existing_candidates=intent_candidates,
+                    expansion_scope=expansion_scope,
+                    expansion_hint=expansion_hint,
+                ),
+                response_model=IntentCandidateSet,
+            )
+            _trace(
+                trace,
+                "intent_candidate_set",
+                skill_id=skill.id,
+                candidates=[
+                    candidate.model_dump(mode="json")
+                    for candidate in decision.candidates
+                ],
+            )
+            for index, raw_candidate in enumerate(decision.candidates):
+                candidate = self._normalize_intent_candidate(
+                    raw_candidate,
+                    skill_candidate=skill_candidate,
+                    index=index,
+                    used_ids=used_ids,
+                )
+                if candidate is None:
+                    continue
+                used_ids.add(candidate.candidate_id)
+                intent_candidates.append(candidate)
+        return intent_candidates
+
+    def _normalize_intent_candidate(
+        self,
+        candidate: IntentCandidate,
+        *,
+        skill_candidate: SkillCandidate,
+        index: int,
+        used_ids: set[str],
+    ) -> IntentCandidate | None:
+        skill_id = skill_candidate.skill_id
+        if skill_id is None or not self.registry.has(skill_id):
+            return None
         skill = self.registry.get(skill_id)
+        candidate.skill_id = skill_id
+        candidate.skill_name = skill.name
+        candidate.confidence = min(
+            _clamp_confidence(skill_candidate.confidence),
+            _clamp_confidence(candidate.confidence),
+        )
+        candidate.matched_cues = _dedupe_strings(
+            [*skill_candidate.matched_cues, *candidate.matched_cues],
+        )
+        candidate.risk_flags = _dedupe_strings(
+            [*skill_candidate.risk_flags, *candidate.risk_flags],
+        )
+        candidate.candidate_id = _unique_candidate_id(
+            _canonical_candidate_id(candidate, index),
+            used_ids,
+        )
+        try:
+            return validate_intent_candidate(self.registry, candidate)
+        except ValidationError:
+            return None
+
+    async def _rerank_candidates(
+        self,
+        resolved_query: str,
+        candidates: list[IntentCandidate],
+        contextualized_request: ContextualizedRequest,
+        current_user_query: str,
+        *,
+        expansion_round: int,
+    ) -> RerankDecision:
         return await self.evaluator_client.structured(
             system_prompt=EVALUATOR_SYSTEM_PROMPT,
             user_prompt=build_evaluator_prompt(
                 resolved_query,
                 self.registry.cards(),
-                skill,
-                decision.model_dump(),
+                candidates,
                 contextualized_request=contextualized_request,
                 current_user_query=current_user_query,
+                expansion_round=expansion_round,
             ),
-            response_model=EvaluationDecision,
+            response_model=RerankDecision,
         )
+
+    async def _expand_candidates(
+        self,
+        resolved_query: str,
+        skill_candidates: list[SkillCandidate],
+        intent_candidates: list[IntentCandidate],
+        rerank: RerankDecision,
+        contextualized_request: ContextualizedRequest,
+        current_user_query: str,
+        *,
+        context: dict[str, Any],
+        trace: list[dict[str, Any]] | None,
+    ) -> list[IntentCandidate]:
+        if rerank.expand_scope == "skill_recall_gap":
+            expanded_skills = await self._generate_skill_candidates(
+                resolved_query,
+                contextualized_request,
+                current_user_query,
+                context=context,
+                existing_candidates=skill_candidates,
+                expansion_scope=rerank.expand_scope,
+                expansion_hint=rerank.expansion_hint,
+            )
+            new_skill_candidates = _new_skill_candidates(skill_candidates, expanded_skills)
+            skill_candidates.extend(new_skill_candidates)
+            _trace(
+                trace,
+                "skill_expansion_candidates",
+                candidates=[
+                    candidate.model_dump(mode="json")
+                    for candidate in new_skill_candidates
+                ],
+            )
+            return await self._generate_intent_candidates(
+                resolved_query,
+                new_skill_candidates,
+                contextualized_request,
+                current_user_query,
+                trace=trace,
+                expansion_scope=rerank.expand_scope,
+                expansion_hint=rerank.expansion_hint,
+            )
+
+        if rerank.expand_scope == "intent_recall_gap":
+            skill_candidates_by_id = {
+                candidate.skill_id: candidate
+                for candidate in skill_candidates
+                if candidate.skill_id is not None
+            }
+            target_skill_ids = _target_skill_ids_for_intent_expansion(
+                rerank,
+                intent_candidates,
+            )
+            target_skill_candidates = [
+                skill_candidates_by_id[skill_id]
+                for skill_id in target_skill_ids
+                if skill_id in skill_candidates_by_id
+            ]
+            return await self._generate_intent_candidates(
+                resolved_query,
+                target_skill_candidates,
+                contextualized_request,
+                current_user_query,
+                trace=trace,
+                expansion_scope=rerank.expand_scope,
+                expansion_hint=rerank.expansion_hint,
+            )
+
+        return []
 
     async def _contextualize(
         self,
@@ -1274,9 +712,9 @@ class IntentRouter:
     ) -> ContextualizedRequest:
         if not dialogue_history.turns:
             return ContextualizedRequest(
-                status="resolved",
                 resolved_query=query,
                 relation_to_history="new_request",
+                semantic_frame=SemanticFrame(),
             )
         return await self.model_client.structured(
             system_prompt=CONTEXTUALIZER_SYSTEM_PROMPT,
@@ -1288,258 +726,460 @@ class IntentRouter:
             response_model=ContextualizedRequest,
         )
 
-    async def _clarify_loop_exhausted(
-        self,
-        *,
-        current_user_query: str,
-        resolved_query: str,
-        contextualized_request: ContextualizedRequest,
-        state: dict[str, Any],
-        trace: list[dict[str, Any]],
-    ) -> RouteResult:
-        attempts = _loop_exhausted_attempts(trace, self.registry)
-        clarification = await self.model_client.structured(
-            system_prompt=LOOP_EXHAUSTED_CLARIFIER_SYSTEM_PROMPT,
-            user_prompt=build_loop_exhausted_clarifier_prompt(
-                current_user_query=current_user_query,
-                resolved_query=resolved_query,
-                contextualized_request=contextualized_request,
-                available_skills=self.registry.cards(),
-                attempts=attempts,
-            ),
-            response_model=LoopExhaustedClarification,
-        )
-        _trace(
-            trace,
-            "loop_exhausted_clarify",
-            attempts=attempts,
-            clarification=clarification.model_dump(mode="json"),
-        )
-        return RouteResult(
-            status="clarify",
-            question=clarification.question,
-            options=clarification.options,
-            reason=clarification.reason,
-            visited_skills=state.get("visited_skills", []),
-            resolved_query=state.get("resolved_query"),
-            context_relation=state.get("context_relation"),
-            termination_reason="loop_exhausted",
-        )
 
-    def _clarify(
-        self,
-        question: str | None,
-        options: list[dict[str, str]],
-        state: dict[str, Any],
-    ) -> RouteResult:
-        return RouteResult(
-            status="clarify",
-            question=question or "请补充更多信息，以便确定要使用的功能。",
-            options=options,
-            visited_skills=state.get("visited_skills", []),
-            resolved_query=state.get("resolved_query"),
-            context_relation=state.get("context_relation"),
-        )
+def _ordinary_skill_candidate() -> SkillCandidate:
+    return SkillCandidate(
+        candidate_id="skill:ordinary_dialogue",
+        skill_id=None,
+        intent_domain=ORDINARY_INTENT,
+        confidence=0.15,
+        matched_cues=[],
+        risk_flags=[],
+        reason="ordinary dialogue fallback candidate",
+    )
 
 
-def _new_state(query: str) -> dict[str, Any]:
-    return {
-        "original_query": query,
-        "visited_skills": [],
-        "rejected_skills": [],
-        "rejected_intents": {},
-        "locked_skill_id": None,
-        "locked_skill_confidence": None,
-        "locked_intent": None,
-        "locked_code": None,
-        "retry_scope": "reroute_skill",
-        "rejections": [],
-        "candidate_attempts": [],
-    }
-
-
-def _should_suppress_clarify(
-    stage: str,
-    decision: Any,
+def _synthetic_skill_candidate(
+    skill_id: str,
     *,
-    mode: str = "code_eval",
-) -> bool:
-    status = getattr(decision, "status", None)
-    verdict = getattr(decision, "verdict", None)
-    if status != "clarify" and verdict != "clarify":
-        return False
-    if mode == "code_eval":
-        return True
-    return getattr(decision, "clarify_scope", None) not in ALLOWED_CLARIFY_SCOPES_BY_STAGE[stage]
-
-
-def _with_no_clarify_policy(prompt: str, suppressed: Any) -> str:
-    payload = json.loads(prompt)
-    payload["clarify_policy"] = {
-        "mode": "no_clarify_retry",
-        "instruction": (
-            "本次重试禁止输出 clarify。若缺少主体、关键词、联系人、主题、"
-            "操作对象、参数对象、真实文件/图片/邮件句柄或唯一资源选择，但 skill/intent/code 可判断，"
-            "必须输出最可能的可路由结果；只有能力不支持时输出 no_match。"
-        ),
-        "suppressed_clarify": {
-            "scope": getattr(suppressed, "clarify_scope", None),
-            "reason": getattr(suppressed, "reason", None)
-            or getattr(suppressed, "clarity_reason", None),
-            "question": getattr(suppressed, "question", None),
-            "options": getattr(suppressed, "options", None) or [],
-        },
-    }
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def _fallback_dialogue_result(
-    state: dict[str, Any],
-    reason: str | None = None,
-) -> RouteResult:
-    return RouteResult(
-        status="matched",
-        skill=None,
-        intent="普通对话",
-        code="000",
-        params={},
-        confidence=0.0,
+    confidence: float,
+    matched_cues: list[str],
+    risk_flags: list[str],
+    reason: str,
+) -> SkillCandidate:
+    return SkillCandidate(
+        candidate_id=f"skill:{skill_id}:route_critical",
+        skill_id=skill_id,
+        intent_domain=skill_id,
+        confidence=confidence,
+        matched_cues=matched_cues,
+        risk_flags=risk_flags,
         reason=reason,
-        visited_skills=state.get("visited_skills", []),
-        resolved_query=state.get("resolved_query"),
-        context_relation=state.get("context_relation"),
     )
 
 
-def _candidate_result(
-    state: dict[str, Any],
+def _ordinary_intent_candidate(
+    skill_candidate: SkillCandidate | None = None,
+) -> IntentCandidate:
+    return IntentCandidate(
+        candidate_id=ORDINARY_CANDIDATE_ID,
+        skill_id=None,
+        skill_name=None,
+        intent=ORDINARY_INTENT,
+        code=ORDINARY_CODE,
+        params={},
+        confidence=(
+            _clamp_confidence(skill_candidate.confidence)
+            if skill_candidate is not None
+            else 0.15
+        ),
+        matched_cues=list(skill_candidate.matched_cues) if skill_candidate else [],
+        risk_flags=list(skill_candidate.risk_flags) if skill_candidate else [],
+        reason=skill_candidate.reason if skill_candidate else "ordinary dialogue fallback",
+    )
+
+
+def _validated_rerank(
+    rerank: RerankDecision,
+    candidates: list[IntentCandidate],
+) -> RerankDecision:
+    if not rerank.ranking:
+        rerank.ranking = [
+            CandidateScore(
+                candidate_id=candidate.candidate_id,
+                score=_clamp_confidence(candidate.confidence),
+                reason="defaulted from selector confidence",
+            )
+            for candidate in candidates
+        ]
+    return validate_rerank_decision(
+        rerank,
+        {candidate.candidate_id for candidate in candidates},
+    )
+
+
+def _fallback_rerank(first_candidate: IntentCandidate, reason: str) -> RerankDecision:
+    return RerankDecision(
+        verdict="select",
+        selected_candidate_id=first_candidate.candidate_id,
+        confidence=0.0,
+        ranking=[
+            CandidateScore(
+                candidate_id=first_candidate.candidate_id,
+                score=_clamp_confidence(first_candidate.confidence),
+                reason="fallback to selector first candidate",
+            ),
+        ],
+        reason=reason,
+    )
+
+
+def _apply_switch_gate(
     *,
-    skill_id: str,
-    skill_name: str,
-    validated: IntentDecision,
-    route_confidence: float,
-) -> RouteResult:
-    return RouteResult(
-        status="matched",
-        skill=SkillRef(id=skill_id, name=skill_name),
-        intent=validated.intent,
-        code=validated.code,
-        params=validated.params,
-        confidence=min(route_confidence, validated.confidence),
-        visited_skills=state.get("visited_skills", []),
-        resolved_query=state.get("resolved_query"),
-        context_relation=state.get("context_relation"),
+    first_candidate: IntentCandidate,
+    candidates: list[IntentCandidate],
+    rerank: RerankDecision,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+    expansion_rounds: int,
+    invalid_rerank_reason: str | None,
+) -> tuple[IntentCandidate, RouteDiagnostics]:
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    score_by_id = {score.candidate_id: score.score for score in rerank.ranking}
+    selected = candidate_by_id.get(rerank.selected_candidate_id or "")
+
+    if invalid_rerank_reason:
+        return first_candidate, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=first_candidate.candidate_id,
+            evaluator_action="fallback",
+            expansion_rounds=expansion_rounds,
+            risk_flags=_dedupe_strings(first_candidate.risk_flags),
+            rerank_reason=invalid_rerank_reason,
+        )
+
+    if rerank.verdict == "expand":
+        fallback_candidate = _best_combined_candidate(
+            candidates,
+            rerank=rerank,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
+        )
+        return fallback_candidate, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=fallback_candidate.candidate_id,
+            evaluator_action="expand",
+            expansion_rounds=expansion_rounds,
+            risk_flags=_dedupe_strings(
+                [*first_candidate.risk_flags, *fallback_candidate.risk_flags],
+            ),
+            rerank_reason=rerank.reason,
+        )
+
+    selected = selected or first_candidate
+    if selected.candidate_id == first_candidate.candidate_id:
+        return selected, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=selected.candidate_id,
+            evaluator_action="select_top",
+            expansion_rounds=expansion_rounds,
+            risk_flags=_dedupe_strings(selected.risk_flags),
+            rerank_reason=rerank.reason,
+        )
+
+    selected_score = float(score_by_id.get(selected.candidate_id, 0.0))
+    first_score = float(score_by_id.get(first_candidate.candidate_id, 0.0))
+    margin = selected_score - first_score
+    risk_flags = _dedupe_strings([*first_candidate.risk_flags, *selected.risk_flags])
+    required_margin = _switch_margin_threshold(
+        first_candidate=first_candidate,
+        selected_candidate=selected,
+        rerank=rerank,
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
+    )
+
+    switch_allowed = (
+        rerank.confidence >= 0.85
+        and margin >= required_margin
+        and _has_route_critical_cue(
+            selected,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
+        )
+        and not (set(risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)
+    )
+    if switch_allowed:
+        return selected, RouteDiagnostics(
+            first_candidate_id=first_candidate.candidate_id,
+            final_candidate_id=selected.candidate_id,
+            evaluator_action="switch",
+            expansion_rounds=expansion_rounds,
+            risk_flags=risk_flags,
+            rerank_reason=rerank.reason,
+        )
+
+    return first_candidate, RouteDiagnostics(
+        first_candidate_id=first_candidate.candidate_id,
+        final_candidate_id=first_candidate.candidate_id,
+        evaluator_action="switch_blocked",
+        expansion_rounds=expansion_rounds,
+        risk_flags=risk_flags,
+        rerank_reason=(
+            f"blocked evaluator switch to {selected.candidate_id}; "
+            f"confidence={rerank.confidence:.3f}, margin={margin:.3f}, "
+            f"required_margin={required_margin:.3f}. "
+            f"{rerank.reason}"
+        ).strip(),
     )
 
 
-def _record_candidate_attempt(
-    state: dict[str, Any],
+def _best_combined_candidate(
+    candidates: list[IntentCandidate],
     *,
-    skill_id: str,
-    skill_name: str,
-    route_confidence: float,
-    decision: IntentDecision,
-    attempt: int,
-    source: str,
-) -> None:
-    state.setdefault("candidate_attempts", []).append(
-        {
-            "attempt": attempt,
-            "source": source,
-            "skill_id": skill_id,
-            "skill_name": skill_name,
-            "intent": decision.intent,
-            "code": decision.code,
-            "params": decision.params,
-            "confidence": min(route_confidence, decision.confidence),
-        },
-    )
-
-
-def _best_candidate_result(state: dict[str, Any]) -> RouteResult | None:
-    candidates = state.get("candidate_attempts") or []
-    if not candidates:
-        return None
-    best = max(
+    rerank: RerankDecision,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> IntentCandidate:
+    score_by_id = {score.candidate_id: score.score for score in rerank.ranking}
+    return max(
         candidates,
-        key=lambda item: (
-            float(item.get("confidence") or 0.0),
-            -int(item.get("attempt") or 0),
+        key=lambda candidate: _combined_score(
+            candidate,
+            evaluator_score=float(score_by_id.get(candidate.candidate_id, 0.0)),
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
         ),
     )
-    skill_id = best.get("skill_id")
-    skill_name = best.get("skill_name")
-    skill = SkillRef(id=skill_id, name=skill_name) if skill_id and skill_name else None
+
+
+def _combined_score(
+    candidate: IntentCandidate,
+    *,
+    evaluator_score: float,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> float:
+    cue_score = _cue_coverage_score(
+        candidate,
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
+    )
+    return (
+        0.45 * _clamp_confidence(candidate.confidence)
+        + 0.45 * _clamp_confidence(evaluator_score)
+        + 0.10 * cue_score
+        - _candidate_penalty(candidate, contextualized_request, current_user_query)
+    )
+
+
+def _candidate_penalty(
+    candidate: IntentCandidate,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> float:
+    penalty = 0.0
+    text = f"{current_user_query} {contextualized_request.resolved_query}".lower()
+    if candidate.code == ORDINARY_CODE and _has_strong_business_action(text):
+        penalty += 0.2
+    if candidate.skill_id == "function_skill" and any(
+        flag in candidate.risk_flags for flag in ("specific_tool_available", "generic_entry")
+    ):
+        penalty += 0.1
+    if "current_query_conflict" in candidate.risk_flags:
+        penalty += 0.3
+    if set(candidate.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS:
+        penalty += 0.2
+    if set(candidate.risk_flags) & NON_BLOCKING_RISK_PENALTY_FLAGS:
+        penalty += 0.05
+    return penalty
+
+
+def _has_strong_business_action(text: str) -> bool:
+    return any(action.lower() in text for action in STRONG_BUSINESS_ACTIONS)
+
+
+def _should_complete_search_for_single_entity(
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> bool:
+    frame = contextualized_request.semantic_frame
+    if frame.expected_result_type == "ordinary_answer":
+        return False
+
+    text = current_user_query.strip()
+    evidence = _semantic_evidence_text(contextualized_request, current_user_query)
+    if _has_strong_business_action(evidence):
+        return False
+    if any(cue in evidence for cue in ORDINARY_ANSWER_CUES):
+        return False
+    if any(mark in text for mark in "？?，,。；;！! "):
+        return False
+
+    compact = _compact_text(text)
+    if compact.endswith("呢"):
+        compact = compact[:-1]
+    return 2 <= len(compact) <= 20
+
+
+def _has_route_critical_query(
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> bool:
+    evidence = _semantic_evidence_text(contextualized_request, current_user_query)
+    return any(cue.lower() in evidence for cue in ROUTE_CRITICAL_CUES)
+
+
+def _has_route_critical_cue(
+    candidate: IntentCandidate,
+    *,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> bool:
+    evidence = _semantic_evidence_text(contextualized_request, current_user_query)
+    return any(cue and cue.lower() in evidence for cue in candidate.matched_cues)
+
+
+def _switch_margin_threshold(
+    *,
+    first_candidate: IntentCandidate,
+    selected_candidate: IntentCandidate,
+    rerank: RerankDecision,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> float:
+    if (
+        _has_route_critical_query(contextualized_request, current_user_query)
+        and _is_more_specific_business_route(selected_candidate, first_candidate)
+        and _reason_prefers_specific_business(rerank.reason)
+    ):
+        return 0.08
+    return 0.15
+
+
+def _is_more_specific_business_route(
+    selected_candidate: IntentCandidate,
+    first_candidate: IntentCandidate,
+) -> bool:
+    return (
+        selected_candidate.skill_id is not None
+        and not _is_generic_route(selected_candidate)
+        and _is_generic_route(first_candidate)
+    )
+
+
+def _is_generic_route(candidate: IntentCandidate) -> bool:
+    if candidate.skill_id is None or candidate.code == ORDINARY_CODE:
+        return True
+    if candidate.skill_id == SEARCH_SKILL_ID and candidate.intent == GENERIC_SEARCH_INTENT:
+        return True
+    return (
+        candidate.skill_id == FUNCTION_SKILL_ID
+        and candidate.intent == GENERIC_FUNCTION_INTENT
+    )
+
+
+def _reason_prefers_specific_business(reason: str) -> bool:
+    return any(cue in reason for cue in SPECIFIC_BUSINESS_REASON_CUES) and any(
+        cue in reason for cue in GENERIC_ROUTE_REASON_CUES
+    )
+
+
+def _cue_coverage_score(
+    candidate: IntentCandidate,
+    *,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> float:
+    cues = [cue for cue in candidate.matched_cues if cue]
+    if not cues:
+        return 0.0
+    evidence = _semantic_evidence_text(contextualized_request, current_user_query)
+    hits = sum(1 for cue in cues if cue.lower() in evidence)
+    return hits / len(cues)
+
+
+def _semantic_evidence_text(
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> str:
+    frame = contextualized_request.semantic_frame
+    parts = [
+        current_user_query,
+        contextualized_request.resolved_query,
+        frame.action or "",
+        frame.expected_result_type,
+        *frame.object_types,
+        *frame.subjects,
+        *frame.qualifiers,
+        *frame.explicit_overrides,
+    ]
+    return " ".join(parts).lower()
+
+
+def _specific_business_skill_for_query(
+    registry: SkillRegistry,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> str | None:
+    evidence = _compact_text(
+        _semantic_evidence_text(contextualized_request, current_user_query),
+    )
+    for card in registry.cards():
+        if card.id in {SEARCH_SKILL_ID, FUNCTION_SKILL_ID}:
+            continue
+        if _skill_card_matches_evidence(card, evidence):
+            return card.id
+    return None
+
+
+def _skill_card_matches_evidence(card: Any, evidence: str) -> bool:
+    terms = [
+        card.name,
+        card.name.replace("工具", ""),
+        card.name.replace("功能", ""),
+        card.description,
+        *card.intents,
+    ]
+    for term in terms:
+        compact_term = _compact_text(str(term))
+        if len(compact_term) >= 2 and compact_term in evidence:
+            return True
+    return False
+
+
+def _route_critical_matched_cues(
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> list[str]:
+    evidence = _semantic_evidence_text(contextualized_request, current_user_query)
+    return [
+        cue
+        for cue in ROUTE_CRITICAL_CUES
+        if cue.lower() in evidence
+    ]
+
+
+def _compact_text(text: str) -> str:
+    return "".join(text.lower().split())
+
+
+def _result_from_candidate(
+    candidate: IntentCandidate,
+    *,
+    resolved_query: str,
+    context_relation: str,
+    alternatives: list[IntentCandidate],
+    diagnostics: RouteDiagnostics,
+    visited_skills: list[str],
+    loop_count: int,
+    correction_scopes: list[str],
+) -> RouteResult:
+    skill = (
+        SkillRef(id=candidate.skill_id, name=candidate.skill_name or candidate.skill_id)
+        if candidate.skill_id
+        else None
+    )
     return RouteResult(
         status="matched",
         skill=skill,
-        intent=best.get("intent"),
-        code=best.get("code"),
-        params=best.get("params") or {},
-        confidence=float(best.get("confidence") or 0.0),
-        visited_skills=state.get("visited_skills", []),
-        resolved_query=state.get("resolved_query"),
-        context_relation=state.get("context_relation"),
+        intent=candidate.intent,
+        code=candidate.code,
+        params=candidate.params,
+        confidence=_clamp_confidence(candidate.confidence),
+        reason=candidate.reason,
+        visited_skills=visited_skills,
+        loop_count=loop_count,
+        correction_scopes=correction_scopes,
+        resolved_query=resolved_query,
+        context_relation=context_relation,
+        alternatives=[
+            alternative
+            for alternative in alternatives
+            if alternative.candidate_id != candidate.candidate_id
+        ],
+        diagnostics=diagnostics,
     )
-
-
-def _loop_exhausted_attempts(
-    trace: list[dict[str, Any]],
-    registry: SkillRegistry,
-) -> list[dict[str, Any]]:
-    attempts: dict[int, dict[str, Any]] = {}
-    for event in trace:
-        attempt = int(event.get("attempt") or 0)
-        if not attempt:
-            continue
-        item = attempts.setdefault(attempt, {"attempt": attempt})
-        event_name = event.get("event")
-
-        if event_name == "skill_route":
-            decision = event.get("decision") or {}
-            skill_id = decision.get("skill_id")
-            if skill_id:
-                item["skill_id"] = skill_id
-                item["skill_name"] = (
-                    registry.get(skill_id).name if registry.has(skill_id) else skill_id
-                )
-            item["skill_route_status"] = decision.get("status")
-            if decision.get("reason"):
-                item["skill_route_reason"] = decision.get("reason")
-
-        elif event_name == "locked_skill":
-            skill_id = event.get("skill_id")
-            if skill_id:
-                item["skill_id"] = skill_id
-                item["skill_name"] = (
-                    registry.get(skill_id).name if registry.has(skill_id) else skill_id
-                )
-
-        elif event_name == "intent_select":
-            decision = event.get("decision") or {}
-            item["intent_status"] = decision.get("status")
-            item["intent"] = decision.get("intent")
-            item["code"] = decision.get("code")
-            item["params"] = decision.get("params") or {}
-            if decision.get("reason"):
-                item["intent_reason"] = decision.get("reason")
-
-        elif event_name == "evaluation":
-            evaluation = event.get("evaluation") or {}
-            item["evaluator_verdict"] = evaluation.get("verdict")
-            item["reject_scope"] = evaluation.get("reject_scope")
-            if evaluation.get("reason"):
-                item["reject_reason"] = evaluation.get("reason")
-
-        elif event_name == "validation_error":
-            item["reject_scope"] = event.get("correction_scope")
-            item["reject_reason"] = event.get("reason")
-
-        elif event_name == "evaluation_invalid":
-            item["reject_scope"] = "invalid_evaluation"
-            item["reject_reason"] = event.get("reason")
-
-    return [attempts[key] for key in sorted(attempts)]
 
 
 def _normalize_dialogue_history(
@@ -1550,6 +1190,127 @@ def _normalize_dialogue_history(
     if isinstance(dialogue_history, DialogueHistory):
         return dialogue_history
     return DialogueHistory.model_validate(dialogue_history)
+
+
+def _dedupe_intent_candidates(
+    candidates: list[IntentCandidate],
+) -> list[IntentCandidate]:
+    deduped: list[IntentCandidate] = []
+    seen: dict[tuple[str | None, str, str], int] = {}
+    used_ids: set[str] = set()
+    for candidate in candidates:
+        key = _route_key(candidate)
+        if key in seen:
+            existing = deduped[seen[key]]
+            if candidate.confidence > existing.confidence:
+                deduped[seen[key]] = candidate
+            existing.alternatives = _dedupe_strings(
+                [*existing.alternatives, *candidate.alternatives],
+            )
+            continue
+        candidate.candidate_id = _unique_candidate_id(candidate.candidate_id, used_ids)
+        used_ids.add(candidate.candidate_id)
+        seen[key] = len(deduped)
+        deduped.append(candidate)
+    return deduped
+
+
+def _new_route_candidates(
+    existing: list[IntentCandidate],
+    candidates: list[IntentCandidate],
+) -> list[IntentCandidate]:
+    existing_keys = {_route_key(candidate) for candidate in existing}
+    return [
+        candidate
+        for candidate in candidates
+        if _route_key(candidate) not in existing_keys
+    ]
+
+
+def _new_skill_candidates(
+    existing: list[SkillCandidate],
+    candidates: list[SkillCandidate],
+) -> list[SkillCandidate]:
+    existing_keys = {candidate.skill_id for candidate in existing}
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.skill_id not in existing_keys
+    ]
+
+
+def _target_skill_ids_for_intent_expansion(
+    rerank: RerankDecision,
+    candidates: list[IntentCandidate],
+) -> list[str]:
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    ordered_ids = [score.candidate_id for score in rerank.ranking]
+    if rerank.selected_candidate_id:
+        ordered_ids.insert(0, rerank.selected_candidate_id)
+    skill_ids: list[str] = []
+    for candidate_id in ordered_ids:
+        candidate = candidate_by_id.get(candidate_id)
+        if not candidate or not candidate.skill_id:
+            continue
+        if candidate.skill_id not in skill_ids:
+            skill_ids.append(candidate.skill_id)
+    if skill_ids:
+        return skill_ids[:2]
+    return _dedupe_strings(
+        [candidate.skill_id for candidate in candidates if candidate.skill_id],
+    )[:2]
+
+
+def _route_key(candidate: IntentCandidate) -> tuple[str | None, str, str]:
+    return (candidate.skill_id, candidate.intent, candidate.code)
+
+
+def _canonical_candidate_id(candidate: IntentCandidate, index: int) -> str:
+    skill = candidate.skill_id or "ordinary_dialogue"
+    return f"{skill}:{candidate.intent}:{candidate.code}:{index + 1}"
+
+
+def _unique_candidate_id(candidate_id: str, used_ids: set[str]) -> str:
+    if candidate_id not in used_ids:
+        return candidate_id
+    index = 2
+    while f"{candidate_id}:{index}" in used_ids:
+        index += 1
+    return f"{candidate_id}:{index}"
+
+
+def _visited_skills(
+    skill_candidates: list[SkillCandidate],
+    intent_candidates: list[IntentCandidate],
+) -> list[str]:
+    return _dedupe_strings(
+        [
+            *[
+                candidate.skill_id
+                for candidate in skill_candidates
+                if candidate.skill_id is not None
+            ],
+            *[
+                candidate.skill_id
+                for candidate in intent_candidates
+                if candidate.skill_id is not None
+            ],
+        ],
+    )
+
+
+def _clamp_confidence(value: float | int | None) -> float:
+    if value is None:
+        return 0.0
+    return max(0.0, min(1.0, float(value)))
+
+
+def _dedupe_strings(values: list[str | None]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        if value and value not in deduped:
+            deduped.append(value)
+    return deduped
 
 
 def _trace(
@@ -1566,86 +1327,5 @@ def _traced_result(
     trace: list[dict[str, Any]] | None,
     result: RouteResult,
 ) -> RouteResult:
-    _attach_loop_stats(trace, result)
     _trace(trace, "result", result=result.model_dump(mode="json"))
     return result
-
-
-def _attach_loop_stats(
-    trace: list[dict[str, Any]] | None,
-    result: RouteResult,
-) -> None:
-    if trace is None:
-        return
-    attempts = [
-        int(event.get("attempt") or 0)
-        for event in trace
-        if event.get("event") == "attempt_start"
-    ]
-    result.loop_count = max(attempts, default=1)
-    result.correction_scopes = _correction_scopes(trace)
-
-
-def _correction_scopes(trace: list[dict[str, Any]]) -> list[str]:
-    scopes: list[str] = []
-    for event in trace:
-        scope = None
-        if event.get("event") == "retry":
-            scope = event.get("scope")
-        elif event.get("event") == "validation_error":
-            scope = event.get("correction_scope")
-        elif event.get("event") == "evaluation_invalid":
-            scope = "invalid_evaluation"
-        if scope and scope not in scopes:
-            scopes.append(scope)
-    return scopes
-
-
-def _apply_retry_scope(
-    state: dict[str, Any],
-    scope: str,
-    *,
-    skill_id: str,
-    route_confidence: float,
-) -> None:
-    if scope == "skill_mismatch":
-        state["locked_skill_id"] = None
-        state["locked_skill_confidence"] = None
-        state["locked_intent"] = None
-        state["locked_code"] = None
-        state["retry_scope"] = "reroute_skill"
-        return
-
-    if scope == "intent_mismatch":
-        state["locked_skill_id"] = skill_id
-        state["locked_skill_confidence"] = route_confidence
-        state["locked_intent"] = None
-        state["locked_code"] = None
-        state["retry_scope"] = "retry_intent"
-        return
-
-    raise ValueError(f"unsupported retry scope: {scope}")
-
-
-def _record_intent_rejection(
-    state: dict[str, Any],
-    skill_id: str,
-    intent: str | None,
-    reason: str,
-    *,
-    scope: str = "intent_mismatch",
-) -> None:
-    rejection = {
-        "scope": scope,
-        "skill_id": skill_id,
-        "intent": intent or "",
-        "reason": reason,
-    }
-    state.setdefault("rejections", []).append(rejection)
-    state.setdefault("rejected_intents", {}).setdefault(skill_id, []).append(
-        {
-            "intent": intent or "",
-            "reason": reason,
-            "scope": scope,
-        },
-    )

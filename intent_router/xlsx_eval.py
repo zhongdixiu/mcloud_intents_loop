@@ -17,6 +17,7 @@ from .types import (
     DialogueTurn,
     RouteResult,
     SkillDefinition,
+    SkillRef,
 )
 
 
@@ -27,6 +28,7 @@ FORMAT_CURRENT_QUERY_HEADER = "对话"
 FORMAT_EXPECTED_HEADERS = ("期望意图标签", "预期意图")
 SEARCH_SKILL_ID = "mcloud_search_skill"
 SEARCH_022_CODE = "022"
+GENERIC_MULTI_ACCEPT_CODES = {"016", "022"}
 ORDINARY_DIALOGUE_CODE = "000"
 LEGACY_999_EQUIVALENT_CODE = "018"
 LEGACY_CODE_EQUIVALENTS = {
@@ -35,6 +37,39 @@ LEGACY_CODE_EQUIVALENTS = {
     "032": "040003",
     "999": LEGACY_999_EQUIVALENT_CODE,
 }
+STRONG_BUSINESS_ACTIONS = (
+    "搜索",
+    "搜",
+    "查找",
+    "找",
+    "打开",
+    "进入",
+    "入口",
+    "工具",
+    "发送",
+    "整理",
+    "筛选",
+    "生成",
+    "创作",
+    "编辑",
+    "处理",
+    "翻译",
+    "总结",
+    "识别",
+)
+MULTI_INTENT_RESOURCE_TERMS = (
+    "文档",
+    "文件",
+    "图片",
+    "照片",
+    "视频",
+    "电影",
+    "音频",
+    "音乐",
+    "歌曲",
+    "文件夹",
+)
+MULTI_INTENT_JOINERS = ("和", "与", "及", "以及", "还有", "、", "，", ",", "/")
 
 
 @dataclass(frozen=True)
@@ -70,7 +105,6 @@ async def evaluate_xlsx_cases(
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
-        mode="code_eval",
     )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -102,7 +136,6 @@ async def evaluate_format_xlsx_cases(
     router = router or IntentRouter.from_config(
         skills_path=skills_path,
         dialogue_history_limit=dialogue_history_limit,
-        mode="code_eval",
     )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
@@ -147,9 +180,25 @@ async def _evaluate_loaded_cases(
     loop_only_passed = 0
     no_loop_only_passed = 0
     records: list[dict[str, Any]] = []
+    first_candidate_passed = 0
+    top_n_recall_passed = 0
+    full_route_passed = 0
+    evaluator_switch_count = 0
+    evaluator_switch_gain = 0
+    evaluator_switch_loss = 0
+    expansion_count = 0
+    expansion_gain = 0
+    ordinary_dialogue_count = 0
+    business_action_to_000_count = 0
+    strict_passed = 0
+    source_expected_passed = 0
+    multi_code_case_count = 0
+    multi_code_adjusted_count = 0
 
     for case in cases:
         total += 1
+        multi_code_case_count += int(_is_multi_code_case(case))
+        multi_code_adjusted_count += int(_is_multi_code_adjusted(case))
         case_started = time.perf_counter()
         try:
             evaluation = await _run_eval_case(
@@ -259,6 +308,42 @@ async def _evaluate_loaded_cases(
         )
         loop_matched = bool(match["matched"])
         passed += int(loop_matched)
+        strict_match = _result_matches_case_codes(
+            result,
+            case=case,
+            expected_codes=strict_expected_codes_for_matching(
+                _source_expected_codes(case),
+            ),
+            search_equivalent_codes=search_equivalent_codes,
+        )
+        source_expected_match = _result_matches_case_codes(
+            result,
+            case=case,
+            expected_codes=source_expected_codes_for_matching(
+                _source_expected_codes(case),
+            ),
+            search_equivalent_codes=search_equivalent_codes,
+        )
+        strict_passed += int(strict_match["matched"])
+        source_expected_passed += int(source_expected_match["matched"])
+        candidate_metrics = _candidate_metrics(
+            result,
+            case=case,
+            code_index=code_index,
+            search_equivalent_codes=search_equivalent_codes,
+        )
+        first_candidate_passed += int(candidate_metrics["first_candidate_matched"])
+        top_n_recall_passed += int(candidate_metrics["top_n_recalled"])
+        full_route_passed += int(candidate_metrics["full_route_matched"])
+        evaluator_switch_count += int(candidate_metrics["evaluator_switched"])
+        evaluator_switch_gain += int(candidate_metrics["evaluator_switch_gain"])
+        evaluator_switch_loss += int(candidate_metrics["evaluator_switch_loss"])
+        expansion_count += int(candidate_metrics["expanded"])
+        expansion_gain += int(candidate_metrics["expansion_gain"])
+        ordinary_dialogue_count += int(result.code == ORDINARY_DIALOGUE_CODE)
+        business_action_to_000_count += int(
+            result.code == ORDINARY_DIALOGUE_CODE and _has_strong_business_action(case.query),
+        )
 
         record = _build_record(
             case=case,
@@ -270,6 +355,11 @@ async def _evaluate_loaded_cases(
             eval_mode="end2end" if if_end2end else "gold_history",
             turn_results=evaluation["turn_results"],
             trace_summary=evaluation["trace_summary"],
+            candidate_metrics=candidate_metrics,
+            strict_matched=bool(strict_match["matched"]),
+            strict_match_reason=strict_match["reason"],
+            source_expected_matched=bool(source_expected_match["matched"]),
+            source_expected_match_reason=source_expected_match["reason"],
         )
         if trace_enabled:
             record["trace"] = evaluation["trace"]
@@ -345,6 +435,11 @@ async def _evaluate_loaded_cases(
         "passed": passed,
         "failed": failed,
         "accuracy": (passed / total) if total else 0.0,
+        "adjusted_code_accuracy": (passed / total) if total else 0.0,
+        "strict_accuracy": (strict_passed / total) if total else 0.0,
+        "source_expected_accuracy": (
+            source_expected_passed / total
+        ) if total else 0.0,
         "eval_mode": "end2end" if if_end2end else "gold_history",
         "avg_elapsed_ms": _average(elapsed_values),
         "avg_total_elapsed_ms": _average(total_elapsed_values),
@@ -354,7 +449,22 @@ async def _evaluate_loaded_cases(
         "no_match_count": status_counts.get("no_match", 0),
         "error_count": status_counts.get("error", 0),
         "output_path": str(output_path),
-        "router_mode": router.mode,
+        "first_candidate_passed": first_candidate_passed,
+        "first_candidate_accuracy": (first_candidate_passed / total) if total else 0.0,
+        "final_accuracy": (passed / total) if total else 0.0,
+        "top_n_recall": (top_n_recall_passed / total) if total else 0.0,
+        "full_route_passed": full_route_passed,
+        "full_route_accuracy": (full_route_passed / total) if total else 0.0,
+        "evaluator_switch_count": evaluator_switch_count,
+        "evaluator_switch_gain": evaluator_switch_gain,
+        "evaluator_switch_loss": evaluator_switch_loss,
+        "evaluator_switch_net_gain": evaluator_switch_gain - evaluator_switch_loss,
+        "expansion_count": expansion_count,
+        "expansion_gain": expansion_gain,
+        "ordinary_dialogue_count": ordinary_dialogue_count,
+        "business_action_to_000_count": business_action_to_000_count,
+        "multi_code_case_count": multi_code_case_count,
+        "multi_code_adjusted_count": multi_code_adjusted_count,
     }
     if compare_no_loop:
         no_loop_failed = total - no_loop_passed
@@ -689,6 +799,38 @@ def result_matches_expected_codes(
         if allow_022_search_equivalence is None
         else allow_022_search_equivalence
     )
+    return _result_matches_codes(
+        result,
+        accepted_codes=accepted_codes,
+        search_equivalent_codes=search_equivalent_codes,
+        allow_022_search_equivalence=allow_search_equivalence,
+    )
+
+
+def _result_matches_case_codes(
+    result: RouteResult,
+    *,
+    case: XlsxEvalCase,
+    expected_codes: list[str],
+    search_equivalent_codes: set[str],
+) -> dict[str, Any]:
+    return _result_matches_codes(
+        result,
+        accepted_codes=expected_codes,
+        search_equivalent_codes=search_equivalent_codes,
+        allow_022_search_equivalence=allows_022_search_equivalence(
+            _source_expected_codes(case),
+        ),
+    )
+
+
+def _result_matches_codes(
+    result: RouteResult,
+    *,
+    accepted_codes: list[str],
+    search_equivalent_codes: set[str],
+    allow_022_search_equivalence: bool,
+) -> dict[str, Any]:
     predicted_code = result.code
     predicted_skill_id = result.skill.id if result.skill else None
 
@@ -696,7 +838,7 @@ def result_matches_expected_codes(
         if predicted_code == accepted_code:
             return {"matched": True, "reason": "exact_code"}
     if (
-        allow_search_equivalence
+        allow_022_search_equivalence
         and predicted_skill_id == SEARCH_SKILL_ID
         and predicted_code in search_equivalent_codes
     ):
@@ -723,14 +865,53 @@ def history_code_for_codes(codes: list[str]) -> str | None:
 
 def expected_codes_for_matching(codes: list[str]) -> list[str]:
     deduped_codes = _dedupe_codes(codes)
+    if len(deduped_codes) > 1:
+        adjusted_codes = [
+            code for code in deduped_codes if code not in GENERIC_MULTI_ACCEPT_CODES
+        ]
+        if adjusted_codes:
+            return adjusted_codes
+    return deduped_codes
+
+
+def strict_expected_codes_for_matching(codes: list[str]) -> list[str]:
+    deduped_codes = _dedupe_codes(codes)
     if len(deduped_codes) > 1 and SEARCH_022_CODE in deduped_codes:
         code = min_code(deduped_codes)
         return [code] if code else []
     return deduped_codes
 
 
+def source_expected_codes_for_matching(codes: list[str]) -> list[str]:
+    return _dedupe_codes(codes)
+
+
 def allows_022_search_equivalence(codes: list[str]) -> bool:
     return _dedupe_codes(codes) == [SEARCH_022_CODE]
+
+
+def _source_expected_codes(case: XlsxEvalCase) -> list[str]:
+    return case.source_expected_codes or [case.expected_code, *case.alternate_codes]
+
+
+def _is_multi_code_case(case: XlsxEvalCase) -> bool:
+    return len(_dedupe_codes(_source_expected_codes(case))) > 1
+
+
+def _is_multi_code_adjusted(case: XlsxEvalCase) -> bool:
+    source_codes = _dedupe_codes(_source_expected_codes(case))
+    return source_codes != expected_codes_for_matching(source_codes)
+
+
+def possible_multi_intent(case: XlsxEvalCase) -> bool:
+    if not _is_multi_code_case(case):
+        return False
+    if not any(joiner in case.query for joiner in MULTI_INTENT_JOINERS):
+        return False
+    matched_terms = {
+        term for term in MULTI_INTENT_RESOURCE_TERMS if term in case.query
+    }
+    return len(matched_terms) > 1
 
 
 def min_code(codes: list[str]) -> str | None:
@@ -766,6 +947,11 @@ def write_xlsx_result(
         "predicted_code",
         "matched",
         "match_reason",
+        "strict_matched",
+        "strict_match_reason",
+        "source_expected_matched",
+        "source_expected_match_reason",
+        "possible_multi_intent",
         "elapsed_ms",
         "total_elapsed_ms",
         "loop_count",
@@ -782,6 +968,12 @@ def write_xlsx_result(
         "final_candidate_code",
         "evaluator_verdicts",
         "fallback_used",
+        "top_n_candidate_codes",
+        "first_candidate_matched",
+        "top_n_recalled",
+        "full_route_matched",
+        "evaluator_action",
+        "expansion_rounds",
         "trace",
         "no_loop_predicted_status",
         "no_loop_predicted_skill_id",
@@ -937,8 +1129,14 @@ def _build_record(
     eval_mode: str,
     turn_results: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    candidate_metrics: dict[str, Any] | None = None,
+    strict_matched: bool = False,
+    strict_match_reason: str | None = None,
+    source_expected_matched: bool = False,
+    source_expected_match_reason: str | None = None,
 ) -> dict[str, Any]:
     skill_id = result.skill.id if result.skill else None
+    candidate_metrics = candidate_metrics or {}
     history_turn_results = [
         turn_result for turn_result in turn_results if not turn_result.get("is_scored")
     ]
@@ -965,6 +1163,11 @@ def _build_record(
         "predicted_code": result.code,
         "matched": matched,
         "match_reason": match_reason,
+        "strict_matched": strict_matched,
+        "strict_match_reason": strict_match_reason,
+        "source_expected_matched": source_expected_matched,
+        "source_expected_match_reason": source_expected_match_reason,
+        "possible_multi_intent": possible_multi_intent(case),
         "elapsed_ms": round(elapsed_ms, 3),
         "total_elapsed_ms": round(total_elapsed_ms, 3),
         "loop_count": result.loop_count,
@@ -979,6 +1182,16 @@ def _build_record(
         "final_candidate_code": trace_summary.get("final_candidate_code"),
         "evaluator_verdicts": trace_summary.get("evaluator_verdicts", []),
         "fallback_used": trace_summary.get("fallback_used", False),
+        "top_n_candidate_codes": candidate_metrics.get("top_n_candidate_codes", []),
+        "first_candidate_matched": candidate_metrics.get("first_candidate_matched"),
+        "top_n_recalled": candidate_metrics.get("top_n_recalled"),
+        "full_route_matched": candidate_metrics.get("full_route_matched"),
+        "evaluator_action": (
+            result.diagnostics.evaluator_action if result.diagnostics else None
+        ),
+        "expansion_rounds": (
+            result.diagnostics.expansion_rounds if result.diagnostics else 0
+        ),
     }
 
 
@@ -1009,6 +1222,11 @@ def _build_error_record(
         "predicted_code": None,
         "matched": False,
         "match_reason": "exception",
+        "strict_matched": False,
+        "strict_match_reason": "exception",
+        "source_expected_matched": False,
+        "source_expected_match_reason": "exception",
+        "possible_multi_intent": possible_multi_intent(case),
         "elapsed_ms": round(elapsed_ms, 3),
         "total_elapsed_ms": round(total_elapsed_ms, 3),
         "loop_count": 0,
@@ -1101,46 +1319,210 @@ def _build_no_loop_error_fields(
     }
 
 
+def _candidate_metrics(
+    result: RouteResult,
+    *,
+    case: XlsxEvalCase,
+    code_index: dict[str, tuple[SkillDefinition, str]],
+    search_equivalent_codes: set[str],
+) -> dict[str, Any]:
+    candidates = _route_result_candidates(result)
+    first_candidate = _candidate_by_id(
+        candidates,
+        result.diagnostics.first_candidate_id if result.diagnostics else None,
+    )
+    first_candidate = first_candidate or (candidates[0] if candidates else None)
+    first_matched = _candidate_matches_expected_codes(
+        first_candidate,
+        case=case,
+        search_equivalent_codes=search_equivalent_codes,
+    )
+    top_n_recalled = any(
+        _candidate_matches_expected_codes(
+            candidate,
+            case=case,
+            search_equivalent_codes=search_equivalent_codes,
+        )
+        for candidate in candidates
+    )
+    final_matched = result_matches_expected_codes(
+        result,
+        expected_code=case.expected_code,
+        alternate_codes=case.alternate_codes,
+        search_equivalent_codes=search_equivalent_codes,
+        allow_022_search_equivalence=case.allow_022_search_equivalence,
+    )["matched"]
+    full_route_matched = _full_route_matches_expected(
+        result,
+        case=case,
+        code_index=code_index,
+        code_matched=bool(final_matched),
+    )
+    evaluator_action = result.diagnostics.evaluator_action if result.diagnostics else None
+    expanded = bool(result.diagnostics and result.diagnostics.expansion_rounds > 0)
+    return {
+        "top_n_candidate_codes": [candidate.get("code") for candidate in candidates],
+        "first_candidate_matched": first_matched,
+        "top_n_recalled": top_n_recalled,
+        "full_route_matched": full_route_matched,
+        "evaluator_switched": evaluator_action == "switch",
+        "evaluator_switch_gain": (
+            evaluator_action == "switch" and not first_matched and final_matched
+        ),
+        "evaluator_switch_loss": (
+            evaluator_action == "switch" and first_matched and not final_matched
+        ),
+        "expanded": expanded,
+        "expansion_gain": expanded and not first_matched and final_matched,
+    }
+
+
+def _route_result_candidates(result: RouteResult) -> list[dict[str, Any]]:
+    final_candidate = {
+        "candidate_id": result.diagnostics.final_candidate_id
+        if result.diagnostics
+        else None,
+        "skill_id": result.skill.id if result.skill else None,
+        "intent": result.intent,
+        "code": result.code,
+        "params": result.params,
+    }
+    alternatives = [
+        {
+            "candidate_id": candidate.candidate_id,
+            "skill_id": candidate.skill_id,
+            "intent": candidate.intent,
+            "code": candidate.code,
+            "params": candidate.params,
+        }
+        for candidate in result.alternatives
+    ]
+    candidates = [final_candidate, *alternatives]
+    if result.diagnostics and result.diagnostics.first_candidate_id:
+        first = _candidate_by_id(candidates, result.diagnostics.first_candidate_id)
+        if first is not None:
+            candidates = [first, *[
+                candidate
+                for candidate in candidates
+                if candidate.get("candidate_id") != first.get("candidate_id")
+            ]]
+    return candidates
+
+
+def _candidate_by_id(
+    candidates: list[dict[str, Any]],
+    candidate_id: str | None,
+) -> dict[str, Any] | None:
+    if not candidate_id:
+        return None
+    for candidate in candidates:
+        if candidate.get("candidate_id") == candidate_id:
+            return candidate
+    return None
+
+
+def _candidate_matches_expected_codes(
+    candidate: dict[str, Any] | None,
+    *,
+    case: XlsxEvalCase,
+    search_equivalent_codes: set[str],
+) -> bool:
+    if candidate is None:
+        return False
+    result = RouteResult(
+        status="matched",
+        skill=(
+            SkillRef(id=candidate["skill_id"], name=candidate["skill_id"])
+            if candidate.get("skill_id")
+            else None
+        ),
+        intent=candidate.get("intent"),
+        code=candidate.get("code"),
+        params=candidate.get("params") or {},
+    )
+    return bool(
+        result_matches_expected_codes(
+            result,
+            expected_code=case.expected_code,
+            alternate_codes=case.alternate_codes,
+            search_equivalent_codes=search_equivalent_codes,
+            allow_022_search_equivalence=case.allow_022_search_equivalence,
+        )["matched"],
+    )
+
+
+def _full_route_matches_expected(
+    result: RouteResult,
+    *,
+    case: XlsxEvalCase,
+    code_index: dict[str, tuple[SkillDefinition, str]],
+    code_matched: bool,
+) -> bool:
+    if not code_matched:
+        return False
+    accepted_codes = [case.expected_code, *case.alternate_codes]
+    predicted_skill_id = result.skill.id if result.skill else None
+    for code in accepted_codes:
+        if code == ORDINARY_DIALOGUE_CODE:
+            if predicted_skill_id is None and result.intent == "普通对话":
+                return True
+            continue
+        indexed = code_index.get(code)
+        if indexed is None:
+            continue
+        skill, intent_name = indexed
+        if (
+            predicted_skill_id == skill.id
+            and result.intent == intent_name
+            and result.code == code
+        ):
+            return True
+    return code_matched and not any(code in code_index for code in accepted_codes)
+
+
+def _has_strong_business_action(query: str) -> bool:
+    return any(action in query for action in STRONG_BUSINESS_ACTIONS)
+
+
 def _trace_summary(trace: list[dict[str, Any]]) -> dict[str, Any]:
     candidate_codes: list[str] = []
     evaluator_verdicts: list[dict[str, Any]] = []
     fallback_used = False
+    final_candidate_code: str | None = None
     for event in trace:
         event_name = event.get("event")
-        if event_name in {
-            "intent_select",
-            "intent_select_no_clarify",
-        }:
-            decision = event.get("decision") or {}
-            code = decision.get("code")
+        if event_name == "intent_candidates":
+            for candidate in event.get("candidates") or []:
+                code = candidate.get("code")
+                if code:
+                    candidate_codes.append(code)
+        elif event_name == "first_candidate":
+            candidate = event.get("candidate") or {}
+            code = candidate.get("code")
             if code:
                 candidate_codes.append(code)
-        elif event_name == "evaluation":
-            evaluation = event.get("evaluation") or {}
+        elif event_name == "rerank":
+            evaluation = event.get("decision") or {}
             evaluator_verdicts.append(
                 {
                     "verdict": evaluation.get("verdict"),
-                    "reject_scope": evaluation.get("reject_scope"),
-                    "preferred_code": evaluation.get("preferred_code"),
+                    "selected_candidate_id": evaluation.get("selected_candidate_id"),
+                    "expand_scope": evaluation.get("expand_scope"),
                     "confidence": evaluation.get("confidence"),
-                    "is_code_blocking": evaluation.get("is_code_blocking"),
                 },
             )
-        elif event_name == "accept_preferred_code":
-            code = event.get("preferred_code")
-            if code:
-                candidate_codes.append(code)
-        elif event_name in {
-            "loop_exhausted_best_candidate",
-            "route_no_match_fallback_best_candidate",
-            "invalid_evaluation_accept_best_candidate",
-            "loop_exhausted_fallback_dialogue",
-        }:
+        elif event_name == "switch_gate":
+            diagnostics = event.get("diagnostics") or {}
+            fallback_used = diagnostics.get("evaluator_action") == "fallback"
+        elif event_name == "result":
+            result = event.get("result") or {}
+            final_candidate_code = result.get("code")
+        elif event_name in {"fallback"}:
             fallback_used = True
 
     return {
         "first_candidate_code": candidate_codes[0] if candidate_codes else None,
-        "final_candidate_code": candidate_codes[-1] if candidate_codes else None,
+        "final_candidate_code": final_candidate_code,
         "evaluator_verdicts": evaluator_verdicts,
         "fallback_used": fallback_used,
     }

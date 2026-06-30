@@ -3,192 +3,146 @@ from pydantic import ValidationError as PydanticValidationError
 
 from intent_router.skills import SkillRegistry
 from intent_router.types import (
+    CandidateScore,
     ContextualizedRequest,
-    EvaluationDecision,
-    IntentDecision,
-    IntentDecisionNoClarify,
-    SkillRouteDecision,
-    SkillRouteDecisionNoClarify,
+    IntentCandidate,
+    IntentCandidateSet,
+    RerankDecision,
+    SkillCandidate,
+    SkillCandidateSet,
 )
 from intent_router.validation import (
     ValidationError,
-    validate_evaluation_decision,
-    validate_intent_decision,
+    validate_intent_candidate,
+    validate_rerank_decision,
 )
 
 
 def test_validate_rejects_unknown_intent() -> None:
     registry = SkillRegistry.from_path("skills")
-    skill = registry.get("mcloud_search_skill")
-    decision = IntentDecision(
-        status="matched",
+    candidate = IntentCandidate(
+        candidate_id="bad",
+        skill_id="mcloud_search_skill",
         intent="不存在",
         code="012",
-        params={},
     )
 
     with pytest.raises(ValidationError):
-        validate_intent_decision(skill, decision)
+        validate_intent_candidate(registry, candidate)
 
 
 def test_validate_rejects_wrong_code() -> None:
     registry = SkillRegistry.from_path("skills")
-    skill = registry.get("mcloud_search_skill")
-    decision = IntentDecision(
-        status="matched",
+    candidate = IntentCandidate(
+        candidate_id="bad",
+        skill_id="mcloud_search_skill",
         intent="搜图片",
         code="999",
-        params={},
     )
 
     with pytest.raises(ValidationError):
-        validate_intent_decision(skill, decision)
+        validate_intent_candidate(registry, candidate)
 
 
-def test_validate_ignores_unknown_param_for_code_evaluation() -> None:
+def test_validate_accepts_ordinary_dialogue_candidate() -> None:
     registry = SkillRegistry.from_path("skills")
-    skill = registry.get("mcloud_search_skill")
-    decision = IntentDecision(
-        status="matched",
-        intent="搜图片",
-        code="012",
-        params={"suffixList": ["jpg"]},
+    candidate = IntentCandidate(
+        candidate_id="ordinary",
+        skill_id=None,
+        intent="普通对话",
+        code="000",
     )
 
-    assert validate_intent_decision(skill, decision) is decision
+    assert validate_intent_candidate(registry, candidate) is candidate
 
 
-def test_validate_ignores_param_enum_for_code_evaluation() -> None:
-    registry = SkillRegistry.from_path("skills")
-    skill = registry.get("activity_search_skill")
-    decision = IntentDecision(
-        status="matched",
-        intent="搜活动",
-        code="020",
-        params={"metadataList": ["不存在的活动"]},
+def test_validate_rerank_rejects_candidate_outside_set() -> None:
+    decision = RerankDecision(
+        verdict="select",
+        selected_candidate_id="missing",
+        confidence=0.9,
+        ranking=[CandidateScore(candidate_id="known", score=0.8)],
     )
-
-    assert validate_intent_decision(skill, decision) is decision
-
-
-def test_validate_evaluation_rejects_missing_scope() -> None:
-    decision = EvaluationDecision(verdict="reject", skill_check="fail")
 
     with pytest.raises(ValidationError):
-        validate_evaluation_decision(decision)
+        validate_rerank_decision(decision, {"known"})
 
 
-def test_validate_evaluation_accepts_legacy_param_mismatch_shape() -> None:
-    decision = EvaluationDecision(
-        verdict="reject",
-        reject_scope="param_mismatch",
-        skill_check="pass",
-        intent_check="unclear",
-        params_check="fail",
+def test_validate_rerank_rejects_unknown_ranking_id() -> None:
+    decision = RerankDecision(
+        verdict="expand",
+        confidence=0.9,
+        ranking=[CandidateScore(candidate_id="missing", score=0.8)],
+        expand_scope="intent_recall_gap",
     )
 
-    assert validate_evaluation_decision(decision) is decision
+    with pytest.raises(ValidationError):
+        validate_rerank_decision(decision, {"known"})
 
 
-def test_validate_evaluation_accepts_layered_param_mismatch() -> None:
-    decision = EvaluationDecision(
-        verdict="reject",
-        reject_scope="param_mismatch",
-        skill_check="pass",
-        intent_check="pass",
-        params_check="fail",
-    )
-
-    assert validate_evaluation_decision(decision) is decision
-
-
-def test_contextualized_request_normalizes_status_relation_mixup() -> None:
-    request = ContextualizedRequest.model_validate(
-        {
-            "status": "new_request",
-            "resolved_query": "项目进展如何",
-        },
-    )
-
-    assert request.status == "resolved"
-    assert request.relation_to_history == "new_request"
-    assert request.resolved_query == "项目进展如何"
-
-
-def test_contextualized_request_normalizes_continuation_status() -> None:
+def test_contextualized_request_normalizes_legacy_status_and_history_turns() -> None:
     request = ContextualizedRequest.model_validate(
         {
             "status": "continuation",
             "resolved_query": "搜索AI助手测评报告PPT",
+            "used_history_turns": [1, 2],
         },
     )
 
-    assert request.status == "resolved"
     assert request.relation_to_history == "continuation"
-
-
-def test_contextualized_request_normalizes_ambiguous_status_to_resolved() -> None:
-    request = ContextualizedRequest.model_validate(
-        {
-            "status": "ambiguous",
-            "resolved_query": "蓝色",
-            "question": "您是要搜索蓝色图片还是蓝色文档？",
-            "options": [{"label": "图片", "value": "图片"}],
-        },
-    )
-
-    assert request.status == "resolved"
-    assert request.relation_to_history == "ambiguous"
-    assert request.question == "您是要搜索蓝色图片还是蓝色文档？"
-
-
-def test_contextualized_request_normalizes_clarify_to_resolved() -> None:
-    request = ContextualizedRequest.model_validate(
-        {
-            "status": "clarify",
-            "resolved_query": "找相关文档",
-            "relation_to_history": "continuation",
-            "question": "请问您想找什么主题？",
-            "clarify_scope": "missing_entity",
-        },
-    )
-
-    assert request.status == "resolved"
-    assert request.relation_to_history == "continuation"
-    assert request.resolved_query == "找相关文档"
-
-
-def test_no_clarify_route_and_intent_models_normalize_residual_clarify() -> None:
-    route = SkillRouteDecisionNoClarify.model_validate(
-        {
-            "status": "clarify",
-            "skill_id": "work_skill",
-            "question": "您想处理哪份文件？",
-            "clarify_scope": "missing_entity",
-        },
-    )
-    intent = IntentDecisionNoClarify.model_validate(
-        {
-            "status": "clarify",
-            "intent": "总结概括",
-            "code": "036011",
-            "question": "您想总结哪份文件？",
-            "clarify_scope": "missing_entity",
-        },
-    )
-
-    assert route.status == "route"
-    assert route.skill_id == "work_skill"
-    assert intent.status == "matched"
-    assert intent.code == "036011"
+    assert request.semantic_frame.inherited_turns == [1, 2]
 
 
 def test_structured_output_models_reject_unknown_fields() -> None:
     with pytest.raises(PydanticValidationError):
-        SkillRouteDecision.model_validate(
+        SkillCandidate.model_validate(
             {
-                "status": "route",
+                "candidate_id": "skill:mcloud_search_skill",
                 "skill_id": "mcloud_search_skill",
+                "intent_domain": "搜索",
                 "unexpected": "extra",
             },
         )
+
+
+def test_candidate_sets_accept_known_extra_fields_and_json_string_lists() -> None:
+    skill_set = SkillCandidateSet.model_validate(
+        {
+            "candidates": (
+                '[{"candidate_id":"skill:mcloud_search_skill",'
+                '"skill_id":"mcloud_search_skill",'
+                '"intent_domain":"搜索",'
+                '"risk_flags_detail":{"reason":"debug only"}}]'
+            ),
+            "analysis": "debug only",
+        },
+    )
+    intent_set = IntentCandidateSet.model_validate(
+        {
+            "candidates": (
+                '[{"candidate_id":"mcloud_search_skill:搜综合:018:1",'
+                '"skill_id":"mcloud_search_skill",'
+                '"intent":"搜综合",'
+                '"code":"018",'
+                '"risk_flags_detail":{"reason":"debug only"}}]'
+            ),
+            "notes": "debug only",
+        },
+    )
+
+    assert skill_set.candidates[0].skill_id == "mcloud_search_skill"
+    assert intent_set.candidates[0].code == "018"
+
+
+def test_rerank_decision_accepts_known_extra_fields_and_json_string_ranking() -> None:
+    decision = RerankDecision.model_validate(
+        {
+            "verdict": "select",
+            "selected_candidate_id": "known",
+            "confidence": 0.9,
+            "ranking": '[{"candidate_id":"known","score":0.8}]',
+            "risk_flags_detail": {"debug": True},
+        },
+    )
+
+    assert decision.ranking == [CandidateScore(candidate_id="known", score=0.8)]

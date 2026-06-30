@@ -6,8 +6,12 @@ from .types import (
     DialogueHistory,
     DialogueRouteSummary,
     DialogueTurn,
-    LoopExhaustedClarification,
+    IntentCandidate,
+    IntentCandidateSet,
+    RerankDecision,
     RouteResult,
+    SkillCandidate,
+    SkillCandidateSet,
 )
 
 __all__ = [
@@ -15,9 +19,13 @@ __all__ = [
     "DialogueHistory",
     "DialogueRouteSummary",
     "DialogueTurn",
+    "IntentCandidate",
+    "IntentCandidateSet",
     "IntentDialogueAgent",
     "IntentRouter",
-    "LoopExhaustedClarification",
+    "RerankDecision",
     "RouteResult",
+    "SkillCandidate",
+    "SkillCandidateSet",
     "SkillRegistry",
 ]

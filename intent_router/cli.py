@@ -52,7 +52,7 @@ def main() -> None:
         "--compare-no-loop",
         action="store_true",
         dest="compare_no_loop",
-        help="同时执行无 evaluator/无修正 loop 的一级+二级路由链路并写入对比结果",
+        help="同时执行 first-candidate 路径并写入对比结果",
     )
 
     eval_format_xlsx_parser = subparsers.add_parser("eval-format-xlsx")
@@ -75,7 +75,7 @@ def main() -> None:
         "--compare-no-loop",
         action="store_true",
         dest="compare_no_loop",
-        help="同时执行无 evaluator/无修正 loop 的一级+二级路由链路并写入对比结果",
+        help="同时执行 first-candidate 路径并写入对比结果",
     )
 
     args = parser.parse_args()
@@ -125,7 +125,6 @@ async def _route(
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
-        mode="production",
     )
     trace: list[dict] | None = [] if trace_enabled else None
     result = await router.route(query, trace=trace)
@@ -148,7 +147,6 @@ async def _chat(skills: str, trace_enabled: bool, history_limit: int = 5) -> Non
     agent = IntentDialogueAgent.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
-        mode="production",
     )
     _print_chat_help()
     while True:
@@ -252,7 +250,6 @@ async def _eval(
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
-        mode="code_eval",
     )
     total = 0
     passed = 0
@@ -318,7 +315,7 @@ async def _eval_xlsx(
     print("开始执行 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
     print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
-    print(f"无 loop 对比: {'on' if compare_no_loop else 'off'}")
+    print(f"first-candidate 对比: {'on' if compare_no_loop else 'off'}")
     summary = await evaluate_xlsx_cases(
         cases_path,
         skills_path=skills,
@@ -345,7 +342,7 @@ async def _eval_format_xlsx(
     print("开始执行重构格式 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
     print(f"评测模式: {'end2end' if if_end2end else 'gold_history'}")
-    print(f"无 loop 对比: {'on' if compare_no_loop else 'off'}")
+    print(f"first-candidate 对比: {'on' if compare_no_loop else 'off'}")
     summary = await evaluate_format_xlsx_cases(
         cases_path,
         skills_path=skills,
@@ -449,17 +446,17 @@ def _route_result_data(result: object) -> dict:
 
 def _first_candidate(trace: list[dict]) -> dict | None:
     for event in trace:
-        if event.get("event") != "intent_select":
+        if event.get("event") != "intent_candidates":
             continue
-        decision = event.get("decision") or {}
-        if decision.get("status") != "matched":
-            continue
-        return {
-            "skill_id": event.get("skill_id"),
-            "intent": decision.get("intent"),
-            "code": decision.get("code"),
-            "params": decision.get("params") or {},
-        }
+        candidates = event.get("candidates") or []
+        if candidates:
+            first = candidates[0]
+            return {
+                "skill_id": first.get("skill_id"),
+                "intent": first.get("intent"),
+                "code": first.get("code"),
+                "params": first.get("params") or {},
+            }
     return None
 
 
@@ -488,19 +485,20 @@ def _correction_scopes(trace: list[dict]) -> list[str]:
     scopes: list[str] = []
     for event in trace:
         scope = None
-        if event.get("event") == "retry":
-            scope = event.get("scope")
-        elif event.get("event") == "validation_error":
-            scope = event.get("correction_scope")
-        elif event.get("event") == "evaluation_invalid":
-            scope = "invalid_evaluation"
+        if event.get("event") == "expansion":
+            scope = event.get("expand_scope")
+        elif event.get("event") == "switch_gate":
+            diagnostics = event.get("diagnostics") or {}
+            action = diagnostics.get("evaluator_action")
+            if action in {"switch", "switch_blocked", "fallback"}:
+                scope = action
         if scope and scope not in scopes:
             scopes.append(scope)
     return scopes
 
 
 def _has_repeated_model_stage(trace: list[dict]) -> bool:
-    counted_events = {"skill_route", "intent_select"}
+    counted_events = {"skill_candidates", "intent_candidates", "rerank"}
     counts: dict[str, int] = {}
     for event in trace:
         event_name = event.get("event")
