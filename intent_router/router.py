@@ -46,6 +46,41 @@ SEARCH_SKILL_ID = "mcloud_search_skill"
 FUNCTION_SKILL_ID = "function_skill"
 GENERIC_SEARCH_INTENT = "搜综合"
 GENERIC_FUNCTION_INTENT = "AI超市"
+RESOURCE_ROUTE_CODES = {
+    "012",
+    "013",
+    "014",
+    "015",
+    "016",
+    "017",
+    "018",
+    "020",
+    "022",
+    "023",
+    "040001",
+}
+RESOURCE_SUFFIX_CODE_MAP = {
+    ".docx": "013",
+    ".doc": "013",
+    ".pdf": "013",
+    ".xlsx": "013",
+    ".xls": "013",
+    ".pptx": "013",
+    ".ppt": "013",
+    ".png": "012",
+    ".jpg": "012",
+    ".jpeg": "012",
+    ".gif": "012",
+    ".bmp": "012",
+    ".webp": "012",
+    ".mp4": "014",
+    ".mov": "014",
+    ".avi": "014",
+    ".mkv": "014",
+    ".mp3": "015",
+    ".wav": "015",
+    ".flac": "015",
+}
 BLOCKING_CONFLICT_RISK_FLAGS = {"label_conflict"}
 NON_BLOCKING_RISK_PENALTY_FLAGS = {
     "answer_vs_resource",
@@ -111,7 +146,6 @@ STRONG_BUSINESS_ACTIONS = (
     "总结",
     "识别",
 )
-SWITCH_SCORE_MARGIN = 0.05
 
 
 class IntentRouter:
@@ -969,16 +1003,17 @@ def _apply_switch_gate(
             rerank_reason=rerank.reason,
         )
 
-    scored_candidate = _best_combined_candidate(
+    selected = selected or _best_combined_candidate(
         candidates,
         rerank=rerank,
         contextualized_request=contextualized_request,
         current_user_query=current_user_query,
     )
-    selected = selected or scored_candidate
-    if (
-        selected.candidate_id != first_candidate.candidate_id
-        and set(selected.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS
+    if _should_block_selected_switch(
+        first_candidate=first_candidate,
+        selected_candidate=selected,
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
     ):
         risk_flags = _dedupe_strings([*first_candidate.risk_flags, *selected.risk_flags])
         return first_candidate, RouteDiagnostics(
@@ -993,7 +1028,13 @@ def _apply_switch_gate(
                 f"{rerank.reason}"
             ).strip(),
         )
-    final_candidate = scored_candidate
+
+    final_candidate = _exact_resource_rescue(
+        selected,
+        candidates=candidates,
+        contextualized_request=contextualized_request,
+        current_user_query=current_user_query,
+    )
     if final_candidate.candidate_id == first_candidate.candidate_id:
         return final_candidate, RouteDiagnostics(
             first_candidate_id=first_candidate.candidate_id,
@@ -1020,7 +1061,14 @@ def _apply_switch_gate(
     risk_flags = _dedupe_strings([*first_candidate.risk_flags, *final_candidate.risk_flags])
 
     switch_allowed = (
-        margin >= SWITCH_SCORE_MARGIN
+        final_candidate.candidate_id == selected.candidate_id
+        or margin >= _switch_margin_threshold(
+            first_candidate=first_candidate,
+            selected_candidate=final_candidate,
+            rerank=rerank,
+            contextualized_request=contextualized_request,
+            current_user_query=current_user_query,
+        )
         and not (set(final_candidate.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)
     )
     if switch_allowed:
@@ -1034,6 +1082,7 @@ def _apply_switch_gate(
                 f"{rerank.reason} final_score={final_score:.3f}, "
                 f"first_score={first_score:.3f}, evaluator_selected="
                 f"{selected.candidate_id}"
+                f"{'; resource_rescue' if final_candidate.candidate_id != selected.candidate_id else ''}"
             ).strip(),
         )
 
@@ -1046,10 +1095,106 @@ def _apply_switch_gate(
         rerank_reason=(
             f"blocked score switch to {final_candidate.candidate_id}; "
             f"final_score={final_score:.3f}, first_score={first_score:.3f}, "
-            f"margin={margin:.3f}, required_margin={SWITCH_SCORE_MARGIN:.3f}, "
+            f"margin={margin:.3f}, "
             f"evaluator_selected={selected.candidate_id}. {rerank.reason}"
         ).strip(),
     )
+
+
+def _should_block_selected_switch(
+    *,
+    first_candidate: IntentCandidate,
+    selected_candidate: IntentCandidate,
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> bool:
+    if selected_candidate.candidate_id == first_candidate.candidate_id:
+        return False
+    if set(selected_candidate.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS:
+        return True
+
+    expected = contextualized_request.semantic_frame.expected_result_type
+    first_confidence = _clamp_confidence(first_candidate.confidence)
+    selected_confidence = _clamp_confidence(selected_candidate.confidence)
+    confidence_gap = first_confidence - selected_confidence
+    selected_risks = set(selected_candidate.risk_flags)
+
+    if (
+        expected == "ordinary_answer"
+        and first_candidate.code == ORDINARY_CODE
+        and selected_candidate.code != ORDINARY_CODE
+    ):
+        return True
+
+    if selected_risks & NON_BLOCKING_RISK_PENALTY_FLAGS and confidence_gap >= 0.15:
+        return True
+
+    if (
+        expected == "resource"
+        and _is_resource_route(first_candidate)
+        and not _is_resource_route(selected_candidate)
+        and confidence_gap >= 0.08
+    ):
+        return True
+
+    if (
+        expected == "resource"
+        and _is_resource_route(first_candidate)
+        and _is_resource_route(selected_candidate)
+        and selected_risks
+        and confidence_gap >= 0.12
+    ):
+        return True
+
+    text = _semantic_evidence_text(contextualized_request, current_user_query)
+    if (
+        expected == "resource"
+        and _explicit_resource_code(text) == first_candidate.code
+        and not _is_resource_route(selected_candidate)
+    ):
+        return True
+
+    return False
+
+
+def _exact_resource_rescue(
+    anchor_candidate: IntentCandidate,
+    *,
+    candidates: list[IntentCandidate],
+    contextualized_request: ContextualizedRequest,
+    current_user_query: str,
+) -> IntentCandidate:
+    if contextualized_request.semantic_frame.expected_result_type != "resource":
+        return anchor_candidate
+
+    text = _semantic_evidence_text(contextualized_request, current_user_query)
+    target_code = _explicit_resource_code(text)
+    if not target_code or anchor_candidate.code == target_code:
+        return anchor_candidate
+
+    if _is_resource_route(anchor_candidate) and not _is_generic_route(anchor_candidate):
+        return anchor_candidate
+
+    rescue_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.skill_id == SEARCH_SKILL_ID
+        and candidate.code == target_code
+        and not (set(candidate.risk_flags) & BLOCKING_CONFLICT_RISK_FLAGS)
+    ]
+    if not rescue_candidates:
+        return anchor_candidate
+
+    return max(rescue_candidates, key=lambda candidate: candidate.confidence)
+
+
+def _explicit_resource_code(text: str) -> str | None:
+    compact_text = _compact_text(text)
+    lower_text = text.lower()
+    for suffix, code in RESOURCE_SUFFIX_CODE_MAP.items():
+        if suffix in lower_text or suffix.strip(".") + "格式" in compact_text:
+            return code
+    return None
 
 
 def _best_combined_candidate(
@@ -1101,7 +1246,9 @@ def _type_alignment_score(
     if expected == "ordinary_answer":
         return 1.0 if candidate.code == ORDINARY_CODE else 0.0
     if expected == "resource":
-        if candidate.skill_id == SEARCH_SKILL_ID:
+        if _is_resource_route(candidate):
+            if _is_generic_route(candidate):
+                return 0.85
             return 1.0
         return 0.35 if candidate.code == ORDINARY_CODE else 0.1
     if expected == "function_entry":
@@ -1150,7 +1297,7 @@ def _candidate_penalty(
         penalty += 0.2
     if expected == "ordinary_answer" and candidate.code != ORDINARY_CODE:
         penalty += 0.45
-    if expected == "resource" and candidate.skill_id not in {SEARCH_SKILL_ID, None}:
+    if expected == "resource" and not _is_resource_route(candidate) and candidate.code != ORDINARY_CODE:
         penalty += 0.25
     if expected == "function_entry" and candidate.skill_id == SEARCH_SKILL_ID:
         penalty += 0.25
@@ -1249,6 +1396,10 @@ def _is_generic_route(candidate: IntentCandidate) -> bool:
         candidate.skill_id == FUNCTION_SKILL_ID
         and candidate.intent == GENERIC_FUNCTION_INTENT
     )
+
+
+def _is_resource_route(candidate: IntentCandidate) -> bool:
+    return candidate.code in RESOURCE_ROUTE_CODES
 
 
 def _reason_prefers_specific_business(reason: str) -> bool:

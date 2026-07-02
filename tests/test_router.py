@@ -48,6 +48,7 @@ def _intent_candidate(
     code: str,
     confidence: float = 0.8,
     cues: list[str] | None = None,
+    risk_flags: list[str] | None = None,
 ) -> IntentCandidate:
     return IntentCandidate(
         candidate_id=f"{skill_id}:{intent}",
@@ -58,7 +59,7 @@ def _intent_candidate(
         params={},
         confidence=confidence,
         matched_cues=cues or [],
-        risk_flags=[],
+        risk_flags=risk_flags or [],
         reason="matched intent",
     )
 
@@ -535,7 +536,262 @@ async def test_ordinary_answer_type_blocks_business_switch() -> None:
     assert result.skill is None
     assert result.code == "000"
     assert result.diagnostics is not None
+    assert result.diagnostics.evaluator_action == "switch_blocked"
+
+
+async def test_final_selection_keeps_evaluator_selected_specialized_resource() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                resolved_query="搜索小云果园活动",
+                relation_to_history="revision",
+                semantic_frame=SemanticFrame(
+                    action="搜索",
+                    expected_result_type="resource",
+                    object_types=["活动"],
+                    subjects=["小云果园"],
+                ),
+                reason="继承历史活动搜索语境",
+            ),
+            SkillCandidateSet(
+                candidates=[
+                    _skill_candidate("activity_search_skill", confidence=0.95),
+                    _skill_candidate("mcloud_search_skill", confidence=0.6),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="activity_search_skill",
+                        intent="搜活动",
+                        code="020",
+                        confidence=0.95,
+                        cues=["小云果园"],
+                    ),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="mcloud_search_skill",
+                        intent="搜综合",
+                        code="018",
+                        confidence=0.6,
+                        cues=["小云果园"],
+                        risk_flags=["answer_vs_resource"],
+                    ),
+                ],
+            ),
+            RerankDecision(
+                verdict="select",
+                selected_candidate_id="activity_search_skill:搜活动:020:1",
+                confidence=0.95,
+                ranking=[
+                    CandidateScore(
+                        candidate_id="activity_search_skill:搜活动:020:1",
+                        score=0.95,
+                    ),
+                    CandidateScore(
+                        candidate_id="mcloud_search_skill:搜综合:018:1",
+                        score=0.7,
+                    ),
+                ],
+                reason="活动搜索候选直接命中小云果园",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="搜种树活动",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="activity_search_skill",
+                    intent="搜活动",
+                    code="020",
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("对了叫小云果园", dialogue_history=history)
+
+    assert result.skill is not None
+    assert result.skill.id == "activity_search_skill"
+    assert result.code == "020"
+    assert result.diagnostics is not None
     assert result.diagnostics.evaluator_action == "select_top"
+
+
+async def test_final_selection_blocks_low_confidence_risky_selected_candidate() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                resolved_query="搜索126邮箱文件夹",
+                relation_to_history="revision",
+                semantic_frame=SemanticFrame(
+                    action="搜索",
+                    expected_result_type="resource",
+                    object_types=["文件夹"],
+                    subjects=["126邮箱"],
+                ),
+                reason="修正文件夹主体",
+            ),
+            SkillCandidateSet(
+                candidates=[
+                    _skill_candidate("mcloud_search_skill", confidence=0.92),
+                    _skill_candidate("mail_skill", confidence=0.45),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="mcloud_search_skill",
+                        intent="搜文件夹",
+                        code="016",
+                        confidence=0.92,
+                        cues=["文件夹"],
+                    ),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="mail_skill",
+                        intent="搜邮件",
+                        code="040001",
+                        confidence=0.45,
+                        cues=["126邮箱"],
+                        risk_flags=["answer_vs_resource"],
+                    ),
+                ],
+            ),
+            RerankDecision(
+                verdict="select",
+                selected_candidate_id="mail_skill:搜邮件:040001:1",
+                confidence=0.9,
+                ranking=[
+                    CandidateScore(
+                        candidate_id="mail_skill:搜邮件:040001:1",
+                        score=0.95,
+                    ),
+                    CandidateScore(
+                        candidate_id="mcloud_search_skill:搜文件夹:016:1",
+                        score=0.7,
+                    ),
+                ],
+                reason="126邮箱也可理解为邮件域",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="找到139邮箱文件夹",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="mcloud_search_skill",
+                    intent="搜文件夹",
+                    code="016",
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route("搞错了，我是想要126邮箱的", dialogue_history=history)
+
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.code == "016"
+    assert result.diagnostics is not None
+    assert result.diagnostics.evaluator_action == "switch_blocked"
+
+
+async def test_final_selection_rescues_explicit_document_suffix_resource() -> None:
+    model = FakeStructuredClient(
+        [
+            ContextualizedRequest(
+                resolved_query="打开12月市场调研报告.docx文档",
+                relation_to_history="continuation",
+                semantic_frame=SemanticFrame(
+                    action="打开文档",
+                    expected_result_type="resource",
+                    object_types=["文档"],
+                    subjects=["12月市场调研报告.docx"],
+                ),
+                reason="明确打开文档资源",
+            ),
+            SkillCandidateSet(
+                candidates=[
+                    _skill_candidate("file_skill", confidence=0.92),
+                    _skill_candidate("mcloud_search_skill", confidence=0.75),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="file_skill",
+                        intent="文档",
+                        code="021",
+                        confidence=0.92,
+                        cues=["文档"],
+                    ),
+                ],
+            ),
+            IntentCandidateSet(
+                candidates=[
+                    _intent_candidate(
+                        skill_id="mcloud_search_skill",
+                        intent="搜文档",
+                        code="013",
+                        confidence=0.75,
+                        cues=["docx", "文档"],
+                    ),
+                ],
+            ),
+            IntentCandidateSet(candidates=[]),
+            RerankDecision(
+                verdict="select",
+                selected_candidate_id="file_skill:文档:021:1",
+                confidence=0.9,
+                ranking=[
+                    CandidateScore(candidate_id="file_skill:文档:021:1", score=0.95),
+                    CandidateScore(
+                        candidate_id="mcloud_search_skill:搜文档:013:1",
+                        score=0.75,
+                    ),
+                ],
+                reason="文件管理候选可打开文档",
+            ),
+        ],
+    )
+    router = IntentRouter.from_config("skills", model_client=model)
+    history = DialogueHistory(
+        turns=[
+            DialogueTurn(
+                user_query="打开这个文件夹",
+                result=DialogueRouteSummary(
+                    status="matched",
+                    skill_id="file_skill",
+                    intent="文件",
+                    code="021",
+                ),
+            ),
+        ],
+    )
+
+    result = await router.route(
+        "帮我打开这个里面的12月市场调研报告.docx文档",
+        dialogue_history=history,
+    )
+
+    assert result.skill is not None
+    assert result.skill.id == "mcloud_search_skill"
+    assert result.code == "013"
+    assert result.diagnostics is not None
+    assert result.diagnostics.evaluator_action == "switch"
 
 
 async def test_expansion_adds_missing_skill_candidates_before_rerank() -> None:
