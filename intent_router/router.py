@@ -504,7 +504,10 @@ class IntentRouter:
             key = candidate.skill_id or ORDINARY_CODE
             if key in seen:
                 continue
-            if candidate.skill_id is not None and not self.registry.has(candidate.skill_id):
+            if candidate.skill_id is not None and not self.registry.has(
+                candidate.skill_id,
+                active_only=True,
+            ):
                 continue
             seen.add(key)
             normalized.append(candidate)
@@ -532,7 +535,7 @@ class IntentRouter:
                 contextualized_request,
                 current_user_query,
             )
-            and self.registry.has(SEARCH_SKILL_ID)
+            and self.registry.has(SEARCH_SKILL_ID, active_only=True)
             and SEARCH_SKILL_ID not in seen
         ):
             completed.append(
@@ -580,7 +583,10 @@ class IntentRouter:
             )
             seen.add(specific_skill_id)
 
-        if self.registry.has(FUNCTION_SKILL_ID) and FUNCTION_SKILL_ID not in seen:
+        if (
+            self.registry.has(FUNCTION_SKILL_ID, active_only=True)
+            and FUNCTION_SKILL_ID not in seen
+        ):
             completed.append(
                 _synthetic_skill_candidate(
                     FUNCTION_SKILL_ID,
@@ -640,6 +646,7 @@ class IntentRouter:
                         existing_candidates=intent_candidates,
                         expansion_scope=expansion_scope,
                         expansion_hint=expansion_hint,
+                        routing_context=self.registry.routing_context(skill.id),
                     ),
                     response_model=IntentCandidateSet,
                 )
@@ -682,7 +689,7 @@ class IntentRouter:
         used_ids: set[str],
     ) -> IntentCandidate | None:
         skill_id = skill_candidate.skill_id
-        if skill_id is None or not self.registry.has(skill_id):
+        if skill_id is None or not self.registry.has(skill_id, active_only=True):
             return None
         skill = self.registry.get(skill_id)
         candidate.skill_id = skill_id
@@ -1462,7 +1469,8 @@ def _skill_card_matches_evidence(card: Any, evidence: str) -> bool:
         card.name.replace("工具", ""),
         card.name.replace("功能", ""),
         card.description,
-        *card.intents,
+        *card.aliases,
+        *card.scope,
     ]
     for term in terms:
         compact_term = _compact_text(str(term))

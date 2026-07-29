@@ -103,6 +103,15 @@ def test_candidate_prompts_do_not_inject_dialogue_history_after_contextualizer()
         "猫",
     ]
     assert intent_prompt["skill_id"] == "mcloud_search_skill"
+    assert "intent_routing_context" in intent_prompt
+    assert "skill_markdown" not in intent_prompt
+    assert "execution_instructions" not in json.dumps(
+        intent_prompt["intent_routing_context"],
+        ensure_ascii=False,
+    )
+    assert "搜图片" in intent_prompt["intent_routing_context"]["intents"]
+    assert "intents" not in router_prompt["available_skills"][0]
+    assert "tools_schema_text" not in router_prompt["available_skills"][0]
     assert evaluator_prompt["candidate_ids"] == [
         "mcloud_search_skill:搜图片:012:1",
     ]

@@ -1062,7 +1062,7 @@ def _summary_for_expected_code(
             code=ORDINARY_DIALOGUE_CODE,
         )
 
-    if code == SEARCH_022_CODE and registry.has(SEARCH_SKILL_ID):
+    if code == SEARCH_022_CODE and registry.has(SEARCH_SKILL_ID, active_only=True):
         skill = registry.get(SEARCH_SKILL_ID)
         return DialogueRouteSummary(
             status="matched",
@@ -1094,27 +1094,31 @@ def _build_code_index(
     registry: SkillRegistry,
 ) -> dict[str, tuple[SkillDefinition, str]]:
     code_index: dict[str, tuple[SkillDefinition, str]] = {}
-    if registry.has(SEARCH_SKILL_ID):
+    if registry.has(SEARCH_SKILL_ID, active_only=True):
         search_skill = registry.get(SEARCH_SKILL_ID)
         for intent_name, intent_schema in search_skill.intents.items():
-            if re.fullmatch(r"01\d", intent_schema.code):
+            if (
+                intent_schema.status == "active"
+                and re.fullmatch(r"01\d", intent_schema.code)
+            ):
                 code_index.setdefault(intent_schema.code, (search_skill, intent_name))
 
     for card in registry.cards():
         skill = registry.get(card.id)
         for intent_name, intent_schema in skill.intents.items():
-            code_index.setdefault(intent_schema.code, (skill, intent_name))
+            if intent_schema.status == "active":
+                code_index.setdefault(intent_schema.code, (skill, intent_name))
     return code_index
 
 
 def _search_022_equivalent_codes(registry: SkillRegistry) -> set[str]:
-    if not registry.has(SEARCH_SKILL_ID):
+    if not registry.has(SEARCH_SKILL_ID, active_only=True):
         return set()
     search_skill = registry.get(SEARCH_SKILL_ID)
     return {
         intent_schema.code
         for intent_schema in search_skill.intents.values()
-        if re.fullmatch(r"01\d", intent_schema.code)
+        if intent_schema.status == "active" and re.fullmatch(r"01\d", intent_schema.code)
     }
 
 

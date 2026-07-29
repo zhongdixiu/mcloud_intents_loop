@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
+from .skills import SkillRegistry
 from .types import RouteResult
 from .xlsx_eval import evaluate_format_xlsx_cases, evaluate_xlsx_cases
 
@@ -25,6 +26,12 @@ def main() -> None:
     chat_parser.add_argument("--skills", default="skills")
     chat_parser.add_argument("--trace", action="store_true")
     chat_parser.add_argument("--history-limit", type=int, default=5)
+
+    validate_skills_parser = subparsers.add_parser(
+        "validate-skills",
+        help="静态校验 Skill Frontmatter、章节和 Tools Schema",
+    )
+    validate_skills_parser.add_argument("--skills", default="skills")
 
     eval_parser = subparsers.add_parser("eval")
     eval_parser.add_argument("--cases", required=True)
@@ -86,6 +93,22 @@ def main() -> None:
             parser.error(str(exc))
     elif args.command == "chat":
         asyncio.run(_chat(args.skills, args.trace, args.history_limit))
+    elif args.command == "validate-skills":
+        try:
+            registry = SkillRegistry.from_path(args.skills)
+        except ValueError as exc:
+            parser.error(str(exc))
+        intent_count = sum(
+            sum(
+                intent.status == "active"
+                for intent in registry.get(card.id).intents.values()
+            )
+            for card in registry.cards()
+        )
+        print(
+            f"Skill validation passed: {len(registry)} skills, "
+            f"{intent_count} active intents",
+        )
     elif args.command == "eval":
         asyncio.run(_eval(Path(args.cases), args.skills, args.trace, args.history_limit))
     elif args.command == "eval-xlsx":

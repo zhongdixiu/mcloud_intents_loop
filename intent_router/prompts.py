@@ -10,6 +10,7 @@ from .types import (
     DialogueHistory,
     IntentCandidate,
     IntentCandidateSet,
+    IntentRoutingContext,
     RerankDecision,
     SkillCandidate,
     SkillCandidateSet,
@@ -183,12 +184,12 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级候选�
 
 
 INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级 intent 候选召回节点。
-你会收到一个 Skill.md，请在该 skill 内输出 Top-M intent candidates。
+你会收到一个 Skill 的结构化路由上下文，请在该 skill 内输出 Top-M intent candidates。
 {output_contract}
  
 必须遵守：
 1. candidates 按最贴近语义到较弱排序，默认给出 Top 2。
-2. intent 必须存在于该 Skill.md 的 Tools Schema 中，code 必须与该 intent 在 Schema 中定义的 code 完全一致。
+2. intent 必须存在于 intent_routing_context 的 intents 中，code 必须与该 intent 在 Schema 中定义的 code 完全一致。
 3. candidate_id 必须稳定且唯一，建议格式为 `{{skill_id}}:{{intent}}:{{rank}}`。
 4. params 只抽取确定信息，缺参数、缺实体、缺句柄、缺唯一对象选择都不影响候选生成（不因此减少候选数量或降低候选置信度）。
 5. 当同一个 code 对应多个 intent 名称时（即该 code 在 Schema 中有多个同义 intent），只保留语义最贴近当前请求的一个作为候选，其余同 code 的 intent 名称写入该候选的 alternatives 字段；这是同一 skill 内部的去重，与跨 skill 的同 code 场景无关。
@@ -307,7 +308,24 @@ def build_intent_prompt(
     existing_candidates: list[IntentCandidate] | None = None,
     expansion_scope: str | None = None,
     expansion_hint: str | None = None,
+    routing_context: IntentRoutingContext | None = None,
 ) -> str:
+    if routing_context is None:
+        routing_context = IntentRoutingContext(
+            skill_id=skill.id,
+            skill_name=skill.name,
+            skill_scope=skill.skill_scope,
+            routing_principles=skill.routing_principles,
+            contrast_rules=skill.contrast_rules,
+            intents={
+                name: intent
+                for name, intent in skill.intents.items()
+                if intent.status == "active"
+            },
+            intent_specific_rules=skill.intent_specific_rules,
+            positive_examples=skill.positive_examples,
+            negative_examples=skill.negative_examples,
+        )
     return json.dumps(
         {
             "resolved_query": resolved_query,
@@ -319,7 +337,11 @@ def build_intent_prompt(
                 skill_candidate.model_dump(mode="json") if skill_candidate else None
             ),
             "skill_id": skill.id,
-            "skill_markdown": skill.raw_markdown,
+            "intent_routing_context": routing_context.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude_defaults=True,
+            ),
             "top_m": top_m,
             "existing_candidates": [
                 candidate.model_dump(mode="json")

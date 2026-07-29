@@ -1,10 +1,26 @@
 from __future__ import annotations
 
 import builtins
+import sys
 from pathlib import Path
 
 from intent_router import cli
 from intent_router.types import RouteResult, SkillRef
+
+
+def test_validate_skills_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["intent_router", "validate-skills", "--skills", "skills"],
+    )
+
+    cli.main()
+
+    assert (
+        "Skill validation passed: 15 skills, 120 active intents"
+        in capsys.readouterr().out
+    )
 
 
 async def test_chat_ignores_blank_input(monkeypatch, capsys) -> None:

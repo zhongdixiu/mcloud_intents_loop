@@ -7,28 +7,53 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+ParamType = Literal["string", "integer", "number", "boolean", "array", "object"]
+SkillStatus = Literal["active", "deprecated", "disabled"]
+
+
+class ParamItemsSchema(BaseModel):
+    type: Literal["string", "integer", "number", "boolean", "object"]
+
+
 class ParamSchema(BaseModel):
     name: str
-    type: str | None = None
-    desc: str = ""
-    allowed_values: list[str] = Field(default_factory=list)
+    type: ParamType
+    required: bool
+    desc: str
+    allowed_values: list[Any] = Field(default_factory=list)
+    items: ParamItemsSchema | None = None
+    default: Any | None = None
+    normalization: str = ""
 
 
 class IntentSchema(BaseModel):
     name: str
     code: str
-    desc: str = ""
+    desc: str
     params: dict[str, ParamSchema] = Field(default_factory=dict)
+    status: SkillStatus = "active"
 
 
 class SkillDefinition(BaseModel):
     id: str
     name: str
     description: str
+    version: str
+    scope: list[str]
+    out_of_scope: list[str]
+    aliases: list[str] = Field(default_factory=list)
+    owner: str | None = None
+    status: SkillStatus = "active"
     path: Path
-    special_rules: str = ""
 
+    skill_scope: str
+    routing_principles: str
+    contrast_rules: str
     tools_schema_text: str = ""
+    intent_specific_rules: str
+    positive_examples: str
+    negative_examples: str
+    execution_instructions: str
     raw_markdown: str
     intents: dict[str, IntentSchema]
 
@@ -37,7 +62,28 @@ class SkillCard(BaseModel):
     id: str
     name: str
     description: str
-    intents: list[str]
+    version: str
+    scope: list[str]
+    out_of_scope: list[str]
+    aliases: list[str] = Field(default_factory=list)
+
+
+class IntentRoutingContext(BaseModel):
+    skill_id: str
+    skill_name: str
+    skill_scope: str
+    routing_principles: str
+    contrast_rules: str
+    intents: dict[str, IntentSchema]
+    intent_specific_rules: str
+    positive_examples: str
+    negative_examples: str
+
+
+class ExecutionContext(BaseModel):
+    skill_id: str
+    skill_name: str
+    execution_instructions: str
 
 
 class StrictOutputModel(BaseModel):

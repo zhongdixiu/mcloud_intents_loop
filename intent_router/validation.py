@@ -17,7 +17,7 @@ def validate_intent_candidate(
             raise ValidationError("ordinary dialogue candidate must use intent='普通对话' and code='000'")
         return candidate
 
-    if not registry.has(candidate.skill_id):
+    if not registry.has(candidate.skill_id, active_only=True):
         raise ValidationError(f"skill {candidate.skill_id!r} is not defined")
 
     skill = registry.get(candidate.skill_id)
@@ -27,6 +27,10 @@ def validate_intent_candidate(
         )
 
     schema = skill.intents[candidate.intent]
+    if schema.status != "active":
+        raise ValidationError(
+            f"intent {candidate.intent!r} in skill {skill.id!r} is not active",
+        )
     if candidate.code != schema.code:
         raise ValidationError(
             f"intent {candidate.intent!r} code must be {schema.code!r}, got {candidate.code!r}",

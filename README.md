@@ -109,6 +109,19 @@ Interactive multi-turn routing:
 python -m intent_router chat --skills skills
 ```
 
+Validate all Skill definitions without calling a model:
+
+```bash
+python -m intent_router validate-skills --skills skills
+```
+
+Each Skill uses required YAML frontmatter plus the standard `Skill Scope`,
+`Intent Routing Principles`, `Intent Contrast Rules`, `Tools Schema`,
+`Intent-Specific Rules`, positive/negative examples, and execution sections.
+The first-level router receives only the lightweight Skill card. The
+second-level router receives the parsed routing context and never the raw
+Markdown or execution instructions.
+
 The `chat` command keeps dialogue history in the terminal process. The router
 first injects the latest 5 turns into a contextualizer prompt: user query plus
 the final route result. The contextualizer produces `resolved_query` and a

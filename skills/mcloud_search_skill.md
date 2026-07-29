@@ -1,9 +1,47 @@
 ---
+id: mcloud_search_skill
 name: 云盘搜索
-description: 当用户意图是查找、定位、获取资源载体本身时，选择本技能。在移动云盘产品语境下，用户使用搜索、查找、帮我找、找一下等检索表达，且对象是文件、文件夹、图片、文档、视频、电影、音频、歌曲、笔记、书籍、试卷、知识库文档等资源载体时，默认理解为云盘资源检索，不要求用户显式说明“云盘里”。若用户关注的是语言答案、推荐建议、时事资讯、百科解释、内容摘要、分析结论或联网问答，而不是获取资源载体本身，则不属于云盘搜索。
+description: 承接云盘中图片、文档、视频、音频、文件夹及其他已有资源的查找与定位；不承接分类入口、内容生成处理或答案型咨询。
+version: '1.0'
+scope:
+- 搜索云盘图片、文档、视频、音频和文件夹
+- 综合资源搜索
+- 搜索笔记、圈子、书籍、影视、试卷和知识库
+out_of_scope:
+- 打开文件分类入口
+- 生成或编辑内容
+- 普通知识问答
+aliases:
+- 资源搜索
+- 云盘查找
+status: active
 ---
 
-### Special Rules
+# 云盘搜索 Skill
+
+## Skill Scope
+
+本 Skill 负责：
+
+- 搜索云盘图片、文档、视频、音频和文件夹；
+- 综合资源搜索；
+- 搜索笔记、圈子、书籍、影视、试卷和知识库；
+
+本 Skill 不负责：
+
+- 打开文件分类入口；
+- 生成或编辑内容；
+- 普通知识问答；
+
+## Intent Routing Principles
+
+1. 根据用户当前主动作选择 Intent，参数缺失不影响 Route 判断。
+2. 专用 Intent 优先于通用入口；同 code 的不同 Intent 仍按完整 Route Key 区分。
+3. 当前 Skill 不支持请求时允许返回空候选，不强制选择相近 Intent。
+4. 二级阶段保留现有参数输出兼容，但不得因参数不全降低正确 Route 的优先级。
+
+现有业务规则：
+
 1. 资源目标 vs 答案目标：
     - 资源目标：用户要搜索、查找、定位或获取可保存、可播放、可浏览的资源载体本身，应使用本技能。
     - 答案目标：用户要普通闲聊、开放问答、推荐清单、事实解释、时事资讯、政策行情、热点查询、内容总结或分析结论，不应使用本技能。
@@ -72,21 +110,421 @@ description: 当用户意图是查找、定位、获取资源载体本身时，�
 | 搜最近的电影资源 | 搜视频（014） | 未出现 `mp4/mkv` 等字面量，`suffixList` 为空 |
 | 帮我找mp3格式的周杰伦歌曲 | 搜音频（015） | 出现明确后缀字面量 `mp3`，可提取到 `suffixList` |
 
+## Intent Contrast Rules
 
-### Tools Schema
+### 分类搜索 vs 搜综合
+
+- 用户明确图片、文档、视频、音频、文件夹等对象类型时选择相应分类搜索。
+- 未指定资源类型或类型不在专用 Intent 中时选择“搜综合”。
+
+### 搜索资源 vs 文件入口（跨 Skill）
+
+- 用户要定位已有内容时选择搜索；仅打开分类浏览入口时进入文件管理。
+
+### 搜知识库 vs 搜文档
+
+- 明确限定知识库范围时选择“搜知识库”；否则按普通文档选择“搜文档”。
+
+## Tools Schema
+
+```json
 {
-    "搜图片": {"code": "012", "desc": "搜索图片", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"1月\"、\"上个月\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的内容/人物描述，如[\"猫\"、\"宝宝\"、\"广州塔\"]"}, "placeList": {"type": "list[str]", "desc": "提取的地点信息，如[\"北京\"、\"海边\"]"}}},
-    "搜文档": {"code": "013", "desc": "搜索文档", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"上周\"、\"最近\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词/类型，如[\"简历\"、\"会议纪要\"、\"Excel表格\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xls\"]"}}},
-    "搜视频": {"code": "014", "desc": "搜索视频", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"上一年\"、\"上个月\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的内容/人物描述，如[\"猫\"、\"宝宝\"]"}, "placeList": {"type": "list[str]", "desc": "提取的地点信息，如[\"北京\"、\"海边\"]"}}},
-    "搜音频": {"code": "015", "desc": "搜索音频", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"去年\"、\"上个月\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词/歌手/格式，如[\"周杰伦\"、\"录音\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件后缀，如[\"wav\"、\"mp3\"、\"flac\"、\"wma\"、\"midi\"], 仅在用户query中明确出现时才提取"}}},
-    "搜文件夹": {"code": "016", "desc": "搜索文件夹", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"最近三天\"、\"上个月\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的内容描述，如[\"合同\"、\"资料\"]"}}},
-    "搜笔记": {"code": "017", "desc": "搜索笔记", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"近期\"、\"上周\"、\"2023年\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词/内容，如[\"会议记录\"、\"购物清单\"、\"待办事项\"]"}, "titleList": {"type": "list[str]", "desc": "提取的标题，如[\"项目计划\"、\"周报\"]"}}},
-    "搜综合": {"code": "018", "desc": "非特定类型或泛资源的综合搜索", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"2022年\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词，如[\"压缩包\"、\"张三\"、\"项目管理\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件后缀/类型，如[\"zip\"、\"xmind\"、\"exe\"], 仅在用户query中明确出现时才提取"}}},
-    "搜索圈子": {"code": "023", "desc": "搜索云盘圈子或圈子中的动态", "params": {"metadataList": {"type": "list[str]", "desc": "提取的圈子名称/成员/关键词，如[\"家庭圈\"、\"滑雪群\"、\"小明\"、\"旅游\"]"}}},
-    "搜书籍": {"code": "013", "desc": "搜索书籍", "params": {"authorList": {"type": "list[str]", "desc": "提取的作者信息，如[\"刘慈欣\"、\"余华\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的书名，如[\"三体\"、\"百年孤独\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件格式，如[\"PDF\"、\"EPUB\"]"}, "typeList": {"type": "list[str]", "desc": "提取的类型/题材，如[\"科幻小说\"、\"技术文档\"]"}}},
-    "搜影视": {"code": "014", "desc": "搜索影视", "params": {"timeList": {"type": "list[str]", "desc": "提取的年份/时间，如[\"2023年\"、\"最近一个月\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的片名/演员/类型，如[\"泰坦尼克号\"、\"成龙\"、\"科幻片\"]"}, "placeList": {"type": "list[str]", "desc": "地点信息（通常为空）"}}},
-    "搜短剧": {"code": "014", "desc": "搜索短剧", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"2021年\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的内容/题材/角色，如[\"霸总\"、\"古装\"、\"逆袭\"、\"龙王\"]"}}},
-    "搜试卷": {"code": "013", "desc": "搜索试卷", "params": {"timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"近3年\"、\"2023年\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的年级/学科/类型，如[\"一年级\"、\"数学\"、\"期末试卷\"]"}}},
-    "搜知识库": {"code": "038", "desc": "搜索知识库", "params": {"typeList": {"type": "list[str]", "desc": "搜索目标类型，可为[\"知识库\"]、[\"知识库文档\"]或二者并存。若为“知识库中的xx文档/方案”等，取[\"知识库文档\"]；若为“搜xx的知识库和文档”，取[\"知识库\", \"知识库文档\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词，如知识库名称[\"产品设计\"]、文档标题[\"会议记录\"]"}, "timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"最近\"、\"去年\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xlsx\"], 仅在用户query中明确出现时才提取"}}},
-    "找合照": { "code": "036025", "desc": "找合照工具入口，无法执行具体搜索操作", "params": {} }
+  "搜图片": {
+    "code": "012",
+    "desc": "搜索图片",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"1月\"、\"上个月\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的内容/人物描述，如[\"猫\"、\"宝宝\"、\"广州塔\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "placeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的地点信息，如[\"北京\"、\"海边\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜文档": {
+    "code": "013",
+    "desc": "搜索文档",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"上周\"、\"最近\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词/类型，如[\"简历\"、\"会议纪要\"、\"Excel表格\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xls\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜视频": {
+    "code": "014",
+    "desc": "搜索视频",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"上一年\"、\"上个月\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的内容/人物描述，如[\"猫\"、\"宝宝\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "placeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的地点信息，如[\"北京\"、\"海边\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜音频": {
+    "code": "015",
+    "desc": "搜索音频",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"去年\"、\"上个月\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词/歌手/格式，如[\"周杰伦\"、\"录音\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件后缀，如[\"wav\"、\"mp3\"、\"flac\"、\"wma\"、\"midi\"], 仅在用户query中明确出现时才提取",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜文件夹": {
+    "code": "016",
+    "desc": "搜索文件夹",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"最近三天\"、\"上个月\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的内容描述，如[\"合同\"、\"资料\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜笔记": {
+    "code": "017",
+    "desc": "搜索笔记",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"近期\"、\"上周\"、\"2023年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词/内容，如[\"会议记录\"、\"购物清单\"、\"待办事项\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "titleList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的标题，如[\"项目计划\"、\"周报\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜综合": {
+    "code": "018",
+    "desc": "非特定类型或泛资源的综合搜索",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"2022年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词，如[\"压缩包\"、\"张三\"、\"项目管理\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件后缀/类型，如[\"zip\"、\"xmind\"、\"exe\"], 仅在用户query中明确出现时才提取",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜索圈子": {
+    "code": "023",
+    "desc": "搜索云盘圈子或圈子中的动态",
+    "params": {
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的圈子名称/成员/关键词，如[\"家庭圈\"、\"滑雪群\"、\"小明\"、\"旅游\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜书籍": {
+    "code": "013",
+    "desc": "搜索书籍",
+    "params": {
+      "authorList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的作者信息，如[\"刘慈欣\"、\"余华\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的书名，如[\"三体\"、\"百年孤独\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件格式，如[\"PDF\"、\"EPUB\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "typeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的类型/题材，如[\"科幻小说\"、\"技术文档\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜影视": {
+    "code": "014",
+    "desc": "搜索影视",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的年份/时间，如[\"2023年\"、\"最近一个月\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的片名/演员/类型，如[\"泰坦尼克号\"、\"成龙\"、\"科幻片\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "placeList": {
+        "type": "array",
+        "required": false,
+        "desc": "地点信息（通常为空）",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜短剧": {
+    "code": "014",
+    "desc": "搜索短剧",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"2021年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的内容/题材/角色，如[\"霸总\"、\"古装\"、\"逆袭\"、\"龙王\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜试卷": {
+    "code": "013",
+    "desc": "搜索试卷",
+    "params": {
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"近3年\"、\"2023年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的年级/学科/类型，如[\"一年级\"、\"数学\"、\"期末试卷\"]",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "搜知识库": {
+    "code": "038",
+    "desc": "搜索知识库",
+    "params": {
+      "typeList": {
+        "type": "array",
+        "required": false,
+        "desc": "搜索目标类型，可为[\"知识库\"]、[\"知识库文档\"]或二者并存。若为“知识库中的xx文档/方案”等，取[\"知识库文档\"]；若为“搜xx的知识库和文档”，取[\"知识库\", \"知识库文档\"]",
+        "items": {
+          "type": "string"
+        },
+        "allowed_values": [
+          "知识库",
+          "知识库文档"
+        ]
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词，如知识库名称[\"产品设计\"]、文档标题[\"会议记录\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"最近\"、\"去年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xlsx\"], 仅在用户query中明确出现时才提取",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "找合照": {
+    "code": "036025",
+    "desc": "找合照工具入口，无法执行具体搜索操作",
+    "params": {}
+  }
 }
+```
+
+## Intent-Specific Rules
+
+- 每个 Intent 的适用范围以 Tools Schema 的 `desc` 和上述对比规则为准。
+- 只抽取用户当前输入或上下文中明确存在的参数，不猜测实体或真实资源句柄。
+- 参数缺失不改变已经确定的 Intent；同 code Intent 必须根据名称语义区分。
+
+## Positive Examples
+
+- “找上个月拍的猫照片” → 搜图片
+- “搜项目资料” → 搜综合
+
+## Negative Examples
+
+- “打开图片入口” → 文件管理
+- “画一张猫的图片” → 图像与视觉工具
+
+## Execution Instructions
+
+- 最终 Route 确定后，按照该 Intent 的参数 Schema 做类型、数组元素和枚举校验。
+- 未明确提供的可选参数不阻塞路由；不得伪造文件、图片、邮件等业务句柄。
+- 涉及删除、覆盖、外发或权限变更时，由执行阶段完成对象确认和风险确认。

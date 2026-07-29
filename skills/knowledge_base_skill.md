@@ -1,9 +1,47 @@
 ---
+id: knowledge_base_skill
 name: 知识库工具
-description: 知识库功能入口访问。
+description: 承接知识库入口和知识库范围内的内容检索；不承接普通云盘文档搜索、笔记搜索或知识咨询。
+version: '1.0'
+scope:
+- 知识库创建
+- 知识库搜索
+- 知识库文档检索
+out_of_scope:
+- 普通文档搜索
+- 普通文件知识问答
+- 笔记搜索
+aliases:
+- 云盘知识库
+- 知识库
+status: active
 ---
 
-### Special Rules
+# 知识库工具 Skill
+
+## Skill Scope
+
+本 Skill 负责：
+
+- 知识库创建；
+- 知识库搜索；
+- 知识库文档检索；
+
+本 Skill 不负责：
+
+- 普通文档搜索；
+- 普通文件知识问答；
+- 笔记搜索；
+
+## Intent Routing Principles
+
+1. 根据用户当前主动作选择 Intent，参数缺失不影响 Route 判断。
+2. 专用 Intent 优先于通用入口；同 code 的不同 Intent 仍按完整 Route Key 区分。
+3. 当前 Skill 不支持请求时允许返回空候选，不强制选择相近 Intent。
+4. 二级阶段保留现有参数输出兼容，但不得因参数不全降低正确 Route 的优先级。
+
+现有业务规则：
+
 1. "搜知识库" vs "知识库入口"
     - 明确说明**在知识库中****查找/筛选**具体内容 → 搜知识库
     - 搜索**某个知识库** → 搜知识库
@@ -19,8 +57,89 @@ description: 知识库功能入口访问。
     - 仅提取用户query中**明确出现**的信息，禁止基于常识、习惯或语义联想补全参数。
     - `timeList` 遇到连续时间范围时必须合并为一个完整片段，不得拆分为多个时间点；如“今年9月至10月”应提取为["今年9月至10月"]，“2024年3月-5月”应提取为["2024年3月-5月"]，“去年元旦”应提取为["去年元旦"]。
 
-### Tools Schema
+## Intent Contrast Rules
+
+### 搜知识库 vs 创建知识库
+
+- 查找已有知识库或其中的文档时选择“搜知识库”。
+- 明确新建知识库时选择“创建知识库”。
+
+### 知识库搜索 vs 普通文档搜索（跨 Skill）
+
+- 明确知识库范围时由本 Skill 承接；普通云盘文档查找进入云盘搜索。
+
+## Tools Schema
+
+```json
 {
-    "搜知识库": {"code": "038", "desc": "搜索知识库中的文件", "params": {"typeList": {"type": "list[str]", "desc": "搜索目标类型，可为[\"知识库\"]、[\"知识库文档\"]或二者并存。若为“知识库中的xx文档/方案”等，取[\"知识库文档\"]；若为“搜xx的知识库和文档”，取[\"知识库\", \"知识库文档\"]"}, "metadataList": {"type": "list[str]", "desc": "提取的关键词，如知识库名称[\"产品设计\"]、文档标题[\"会议记录\"]"}, "timeList": {"type": "list[str]", "desc": "提取的时间信息，如[\"最近\"、\"去年\"]"}, "suffixList": {"type": "list[str]", "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xlsx\"], 仅在用户query中明确出现时才提取"}}},
-    "知识库入口": { "code": "035", "desc": "提供移动云盘AI助手中知识库功能入口", "params": {} }
+  "搜知识库": {
+    "code": "038",
+    "desc": "搜索知识库中的文件",
+    "params": {
+      "typeList": {
+        "type": "array",
+        "required": false,
+        "desc": "搜索目标类型，可为[\"知识库\"]、[\"知识库文档\"]或二者并存。若为“知识库中的xx文档/方案”等，取[\"知识库文档\"]；若为“搜xx的知识库和文档”，取[\"知识库\", \"知识库文档\"]",
+        "items": {
+          "type": "string"
+        },
+        "allowed_values": [
+          "知识库",
+          "知识库文档"
+        ]
+      },
+      "metadataList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的关键词，如知识库名称[\"产品设计\"]、文档标题[\"会议记录\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "timeList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的时间信息，如[\"最近\"、\"去年\"]",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suffixList": {
+        "type": "array",
+        "required": false,
+        "desc": "提取的文件后缀，如[\"pdf\"、\"doc\"、\"xlsx\"], 仅在用户query中明确出现时才提取",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "知识库入口": {
+    "code": "035",
+    "desc": "提供移动云盘AI助手中知识库功能入口",
+    "params": {}
+  }
 }
+```
+
+## Intent-Specific Rules
+
+- 每个 Intent 的适用范围以 Tools Schema 的 `desc` 和上述对比规则为准。
+- 只抽取用户当前输入或上下文中明确存在的参数，不猜测实体或真实资源句柄。
+- 参数缺失不改变已经确定的 Intent；同 code Intent 必须根据名称语义区分。
+
+## Positive Examples
+
+- “新建产品知识库” → 创建知识库
+- “搜产品知识库里的会议文档” → 搜知识库
+
+## Negative Examples
+
+- “搜普通合同文档” → 云盘搜索
+- “知识库是什么” → 普通问答
+
+## Execution Instructions
+
+- 最终 Route 确定后，按照该 Intent 的参数 Schema 做类型、数组元素和枚举校验。
+- 未明确提供的可选参数不阻塞路由；不得伪造文件、图片、邮件等业务句柄。
+- 涉及删除、覆盖、外发或权限变更时，由执行阶段完成对象确认和风险确认。
