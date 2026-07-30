@@ -147,3 +147,24 @@ def test_rerank_decision_accepts_known_extra_fields_and_json_string_ranking() ->
     )
 
     assert decision.ranking == [CandidateScore(candidate_id="known", score=0.8)]
+
+
+def test_validate_rerank_accepts_abstain_without_selected_candidate() -> None:
+    decision = RerankDecision(
+        verdict="abstain",
+        confidence=0.7,
+        reason="evidence is insufficient",
+    )
+
+    assert validate_rerank_decision(decision, {"known"}) is decision
+
+
+def test_validate_rerank_rejects_selected_candidate_for_unsupported() -> None:
+    decision = RerankDecision(
+        verdict="unsupported",
+        selected_candidate_id="known",
+        confidence=0.9,
+    )
+
+    with pytest.raises(ValidationError):
+        validate_rerank_decision(decision, {"known"})

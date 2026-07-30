@@ -11,6 +11,7 @@ from .types import (
     IntentCandidate,
     IntentCandidateSet,
     IntentRoutingContext,
+    ParameterExtractionResult,
     RerankDecision,
     SkillCandidate,
     SkillCandidateSet,
@@ -117,6 +118,7 @@ CONTEXTUALIZER_OUTPUT_CONTRACT = build_output_contract(ContextualizedRequest)
 ROUTER_OUTPUT_CONTRACT = build_output_contract(SkillCandidateSet)
 INTENT_OUTPUT_CONTRACT = build_output_contract(IntentCandidateSet)
 EVALUATOR_OUTPUT_CONTRACT = build_output_contract(RerankDecision)
+PARAMETER_OUTPUT_CONTRACT = build_output_contract(ParameterExtractionResult)
 
 
 CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下文语义归一节点。
@@ -134,7 +136,7 @@ CONTEXTUALIZER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的上下
    - 无法判断属于继承还是替换时（没有追加词也没有修正词，单纯一个短语），默认采用继承式追加，并在 uncertainty_notes 中说明"采用默认继承策略"。
 4. 替换只作用于当前轮明确提到的维度：只提主体（人名/作品名等）就只替换 subjects；只提格式/时间/后缀等限定词就只替换 qualifiers；当前轮未提及 object_types 时，默认保持继承，不主动替换。
 5. 生成、创作、编辑、处理、配文、识别、翻译、总结、问答等"处理型"主动作与"搜索/查找"主动作语义不同；不要因为历史是搜索类请求，就把当前轮的处理型请求污染为搜索语义（也不要反过来污染）。
-6. semantic_frame.expected_result_type 是下游 Evaluator 的权威诉求类型，必须谨慎裁决并在 reason/uncertainty_notes 中写明关键证据。不要把同一轮同时标成互相冲突的语义；若确有冲突，在 uncertainty_notes 说明。
+6. semantic_frame.expected_result_type 是强语义特征，但不是下游不可推翻的事实。必须谨慎裁决并在 reason/uncertainty_notes 中写明关键证据；若当前动作、对象和结果类型互相冲突，在 conflict_flags 中记录。
 7. 问答/咨询诉求不能只靠短词表判断，要结合三类证据：
    - 强问答形态：是什么、为什么、怎么、如何、吗、有没有、有哪些、区别、参数、介绍、推荐、评价、展开说说、讲讲等。
    - 语义结构：主体 + 属性/观点/解释诉求，如"手机参数""人物介绍""这部剧立意""两者区别"。
@@ -171,12 +173,12 @@ ROUTER_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的一级候选�
  
 必须遵守：
 1. 输出 candidates，按最可能到最不可能排序，默认给出 Top 3，按真实置信度排列，不要为了凑数而强行拉低质量候选的排名。
-2. 普通对话候选用 skill_id=null、intent_domain="普通对话"；它是候选集中的一个正常成员，不是兜底的 terminal no_match。
+2. 普通对话候选用 skill_id=null、intent_domain="普通对话"；它是候选集中的一个正常成员，不是无条件兜底状态。
 3. 强业务动作（搜索、查找、打开、入口、工具、发送、整理、筛选、生成、编辑、处理等）下，必须确保候选集中至少包含一个业务 skill 候选，但不需要为此牺牲候选集的置信度排序——业务候选可以排在第二或第三位，只要它存在于候选集中。
 4. 工具入口类请求（参见 routing_semantic_rules 的入口类判断指引）需要确保具体业务 skill、function_skill 通用入口、普通对话三者中至少两类有机会进入候选集，但同样按真实置信度排序，不强制三者都必须出现在 Top-N 中。
 5. 答案型问句（是什么、哪里、为什么、怎么看、介绍下、推荐下、如何理解等）可以把普通对话排在第一位。
 6. 不要输出 available_skills 之外未提供的 skill_id。
-7. matched_cues 只写当前 query 或 semantic_frame 中真实出现的证据词，不要编造；risk_flags 可记录 label_conflict（候选标签存在矛盾证据）、search_vs_tool_entry（搜索语义与工具入口语义混淆风险）、answer_vs_resource（问答语义与资源语义混淆风险）、context_unclear（上下文关系不确定）等风险，多个风险可同时标注。
+7. matched_evidence 只写当前 query 或 semantic_frame 中真实出现的证据词，不要编造；risk_flags 可记录 label_conflict（候选标签存在矛盾证据）、search_vs_tool_entry（搜索语义与工具入口语义混淆风险）、answer_vs_resource（问答语义与资源语义混淆风险）、context_unclear（上下文关系不确定）等风险，多个风险可同时标注。
 8. 若 expansion_scope=skill_recall_gap，围绕 expansion_hint 补充上一轮未覆盖的能力方向，不要重复已有 route key（skill_id 维度）。
 9. 遵守以下语义判断规则。
 {contextualized_request_rules}
@@ -191,7 +193,7 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级 intent 
 1. candidates 按最贴近语义到较弱排序，默认给出 Top 2。
 2. intent 必须存在于 intent_routing_context 的 intents 中，code 必须与该 intent 在 Schema 中定义的 code 完全一致。
 3. candidate_id 必须稳定且唯一，建议格式为 `{{skill_id}}:{{intent}}:{{rank}}`。
-4. params 只抽取确定信息，缺参数、缺实体、缺句柄、缺唯一对象选择都不影响候选生成（不因此减少候选数量或降低候选置信度）。
+4. 只判断 Route，不输出或抽取 params。缺参数、缺实体、缺句柄、缺唯一对象选择都不影响候选生成。
 5. 当同一个 code 对应多个 intent 名称时（即该 code 在 Schema 中有多个同义 intent），只保留语义最贴近当前请求的一个作为候选，其余同 code 的 intent 名称写入该候选的 alternatives 字段；这是同一 skill 内部的去重，与跨 skill 的同 code 场景无关。
 6. 专用 intent 优先于通用兜底 intent；入口类 intent（打开、进入、使用、工具、功能、入口等明确表达）优先于普通业务 intent；具体判断参考 routing_semantic_rules 中"入口类请求的判断指引"，尤其注意"搜索类动作词+功能性名词"的组合表达。
 7. 若该 skill 确实不支持用户请求，可以输出空 candidates 列表；不要因此输出澄清问题。
@@ -202,31 +204,41 @@ INTENT_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的二级 intent 
 
 # ==================== Evaluator专用语义规则（不重新做语义判断，仅辅助排序）====================
  
-EVALUATOR_SEMANTIC_RULES = """语义辅助规则（用于 Evaluator 排序，不用于重新判断语义）：
-1. semantic_frame.expected_result_type 是本轮诉求类型的权威裁决。你不允许推翻它，也不需要重新判断"这个 query 到底是问答、资源搜索还是工具入口"；只能判断候选与该诉求类型是否一致。
+EVALUATOR_SEMANTIC_RULES = """语义辅助规则（用于 Evaluator 排序）：
+1. semantic_frame.expected_result_type 是强语义特征而非不可推翻的事实。current_user_query 的显式动作优先；若与 semantic frame 冲突，可以修正路由方向并添加 semantic_frame_conflict。
 2. 你的任务是比较候选集内已有的 candidate 之间谁更贴近语义，而不是评估某个 candidate 的参数是否完整——参数缺失、实体缺失、主体对象缺失、文件/图片/邮件句柄缺失、唯一对象选择缺失，都不能成为你降低某个 candidate 排名或拒绝整个候选集的理由。
 3. 比较或去重候选时，如果发现不同 skill_id 但 code 数值相同的情况（跨 skill 的 code 碰撞），必须按完整 route key（skill_id + intent + code）区分，不能仅凭 code 数值判断为同一候选。
 """
 
 
 EVALUATOR_SYSTEM_PROMPT = """你是移动云盘意图路由 Agent 的候选集 reranker。
-你只能在给定 candidate_id 中选择，或要求定向扩充候选集；不能自由生成新的 skill、intent 或 code。
+你只能在给定 candidate_id 中选择、要求定向扩充、拒绝判定或判断未支持；不能自由生成新的 skill、intent 或 code。
 {output_contract}
  
 必须遵守：
 1. 只评估候选集中各 candidate 的 skill/intent/code 是否匹配用户语义，不评估参数是否完整。
 2. 不因为缺参数、缺实体、缺主体对象、缺文件句柄、缺图片句柄、缺邮件句柄、缺唯一对象选择而降低某个 candidate 的排名，也不因此整体拒绝候选集。
 3. ranking 中的每个元素必须是候选集内已存在的 candidate_id；selected_candidate_id 也必须来自候选集，不能引用不存在的 ID。
-4. verdict 的判断顺序如下（按此顺序依次检查，命中即停止）：
-   a. 候选集内是否存在一个语义明确匹配的 candidate？如果存在，verdict=select，选择该 candidate 作为 selected_candidate_id，即使它带有风险标志（label_conflict 等）也应优先 select 并在 reason 中说明风险已被纳入考虑。
-   b. 如果候选集内所有 candidate 都明显不匹配用户语义（即没有一个是合理答案），才输出 verdict=expand，并指明 expand_scope。
-   c. risk_flags（label_conflict / search_vs_tool_entry / answer_vs_resource / context_unclear）始终只作为排序参考和 reason 中的风险说明，不单独触发 expand，也不单独阻止 select——只有"候选集内没有语义匹配的候选"才能触发 expand。
-5. expand_scope=skill_recall_gap 表示一级 skill 方向存在明显漏召回（候选集中所有 skill 候选都不对）；expand_scope=intent_recall_gap 表示某个 skill 方向是对的，但该 skill 下的 intent 候选都不够贴切；expand_scope=context_unclear 仅用于在 reason/diagnostics 中记录上下文关系不确定，不能单独作为触发 expand 的理由（必须同时满足条件4b）。
-6. 不允许输出候选结构之外的任何字段，也不允许输出候选集之外的 code。
-7. 普通对话候选与业务候选冲突时，必须优先按 semantic_frame.expected_result_type 排序：ordinary_answer 下普通对话优先；resource 下搜索候选优先；function_entry/content_processing 下业务候选优先。
-8. 工具入口类请求中，如果 expected_result_type=function_entry 且候选集内同时存在具体业务工具 intent 和通用入口/普通对话/通用搜索 intent，优先选择具体业务工具 intent。不要在 ordinary_answer 下仅因存在工具候选就选择工具。
-9. 遵守以下语义辅助规则。
+4. verdict=select 时必须选择已有候选；可能漏召回时用 expand；多个合理候选且证据不足时用 abstain；系统能力明确不支持时用 unsupported。
+5. label_conflict、search_vs_tool_entry、answer_vs_resource、context_unclear 和 semantic_frame_conflict 必须写入 risk_flags 并参与判断。
+6. expand_scope=skill_recall_gap 表示一级 skill 方向存在明显漏召回（候选集中所有 skill 候选都不对）；expand_scope=intent_recall_gap 表示某个 skill 方向是对的，但该 skill 下的 intent 候选都不够贴切；expand_scope=context_unclear 仅用于记录上下文不确定。
+7. 不允许输出候选结构之外的任何字段，也不允许输出候选集之外的 code。
+8. 普通对话候选与业务候选冲突时，综合 current_user_query 与 semantic_frame 判断；发生冲突必须记录，不能把 semantic frame 当作不可推翻事实。
+9. 工具入口类请求中，如果候选集内同时存在具体业务工具 intent 和通用入口/普通对话/通用搜索 intent，优先考虑具体业务工具 intent。
+10. 遵守以下语义辅助规则。
 {contextualized_request_rules}
+"""
+
+
+PARAMETER_EXTRACTOR_SYSTEM_PROMPT = """你是移动云盘路由系统的参数抽取节点。
+Route 已经确定，你只能按给定 parameter_schema 抽取参数，不能修改 skill、intent 或 code。
+{output_contract}
+
+必须遵守：
+1. 只输出 parameter_schema 中存在的字段，不猜测缺失值。
+2. 每个抽取字段必须在 evidence 中给出 current_user_query 或 resolved_query 里的原文片段。
+3. file_id、image_id、mail_id 等不透明句柄只能来自 trusted_params，不得自行生成。
+4. missing_required 和 uncertain_fields 仅提供模型判断；本地 Validator 会按 Schema 重新计算。
 """
 
 
@@ -244,6 +256,9 @@ INTENT_SYSTEM_PROMPT = INTENT_SYSTEM_PROMPT.format(
 EVALUATOR_SYSTEM_PROMPT = EVALUATOR_SYSTEM_PROMPT.format(
     output_contract=EVALUATOR_OUTPUT_CONTRACT,
     contextualized_request_rules=EVALUATOR_SEMANTIC_RULES,
+)
+PARAMETER_EXTRACTOR_SYSTEM_PROMPT = PARAMETER_EXTRACTOR_SYSTEM_PROMPT.format(
+    output_contract=PARAMETER_OUTPUT_CONTRACT,
 )
 
 
@@ -376,6 +391,34 @@ def build_evaluator_prompt(
             ],
             "candidate_ids": [candidate.candidate_id for candidate in candidates],
             "expansion_round": expansion_round,
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_parameter_prompt(
+    *,
+    current_user_query: str,
+    resolved_query: str,
+    skill_id: str,
+    intent: str,
+    code: str,
+    parameter_schema: dict[str, Any],
+    execution_instructions: str,
+    trusted_params: dict[str, Any],
+) -> str:
+    return json.dumps(
+        {
+            "current_user_query": current_user_query,
+            "resolved_query": resolved_query,
+            "route": {
+                "skill_id": skill_id,
+                "intent": intent,
+                "code": code,
+            },
+            "parameter_schema": parameter_schema,
+            "execution_instructions": execution_instructions,
+            "trusted_params": trusted_params,
         },
         ensure_ascii=False,
     )

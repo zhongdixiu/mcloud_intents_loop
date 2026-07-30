@@ -64,8 +64,18 @@ def validate_rerank_decision(
             )
         return decision
 
-    if not decision.expand_scope:
+    if decision.verdict == "expand" and not decision.expand_scope:
         raise ValidationError("expand verdict must include expand_scope")
+    if decision.verdict in {"abstain", "unsupported"}:
+        if decision.selected_candidate_id is not None:
+            raise ValidationError(
+                f"{decision.verdict} verdict must not select a candidate",
+            )
+        if decision.expand_scope is not None:
+            raise ValidationError(
+                f"{decision.verdict} verdict must not include expand_scope",
+            )
+        return decision
     if decision.selected_candidate_id and decision.selected_candidate_id not in candidate_ids:
         raise ValidationError(
             f"selected_candidate_id {decision.selected_candidate_id!r} is not in candidate set",

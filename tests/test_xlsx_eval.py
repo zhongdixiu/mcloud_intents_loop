@@ -23,6 +23,42 @@ from intent_router.xlsx_eval import (
 from intent_router.xlsx_eval import _build_code_index
 
 
+def test_load_xlsx_cases_accepts_explicit_route_and_params_columns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "explicit.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "当前对话",
+            "expected_code",
+            "expected_skill_id",
+            "expected_intent",
+            "expected_params",
+            "alternate_routes",
+        ],
+    )
+    sheet.append(
+        [
+            "找猫照片",
+            "012",
+            "mcloud_search_skill",
+            "搜图片",
+            '{"metadataList":["猫"]}',
+            '[{"skill_id":"mcloud_search_skill","intent":"搜综合","code":"018"}]',
+        ],
+    )
+    workbook.save(path)
+
+    cases = load_xlsx_cases(path)
+
+    assert cases[0].expected_skill_id == "mcloud_search_skill"
+    assert cases[0].expected_intent == "搜图片"
+    assert cases[0].expected_params == {"metadataList": ["猫"]}
+    assert cases[0].alternate_routes[0]["code"] == "018"
+
+
 def test_normalize_and_split_codes() -> None:
     assert normalize_code(0) == "000"
     assert normalize_code("0000") == "000"

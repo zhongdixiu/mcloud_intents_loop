@@ -59,22 +59,49 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The router has a single routing philosophy for SDK, CLI, and Excel evaluation:
-predict the most likely `skill / intent / code`. Missing entities, resource
-handles, operation objects, and parameters do not trigger clarification or block
-intent-code prediction.
+The router first predicts `skill / intent / code`, then extracts parameters only
+for the selected business route. Missing parameters never change the selected
+route. Missing required parameters produce `clarify`; invalid optional values are
+discarded and recorded in diagnostics.
 
 The main chain is:
 
 ```text
 Contextualizer -> Top-N skill candidates -> Top-M intent candidates
--> candidate-set evaluator rerank -> optional targeted expansion -> switch gate
+-> parallel intent generation -> candidate validation -> decision gate
+-> conditional evaluator / optional targeted expansion -> route gate
+-> parameter extractor -> parameter validator
 ```
 
-The evaluator can only select an existing `candidate_id` or request one targeted
-candidate expansion round. It cannot invent a new code. The controller applies a
-switch gate before replacing the selector's first candidate, so weak evaluator
-signals are recorded in diagnostics instead of overriding strong candidates.
+High-confidence, low-risk routes skip the evaluator. The evaluator can select an
+existing `candidate_id`, request one targeted expansion round, abstain, or report
+an unsupported request. A switch requires both evaluator confidence and score
+margin thresholds, and cannot bypass blocking risks.
+
+Final statuses are:
+
+- `matched`: route and validated parameters are ready
+- `clarify`: route is fixed but required parameters are missing
+- `abstain`: available evidence cannot safely distinguish candidates
+- `unsupported`: the registered capabilities do not support the request
+- `error`: a required routing stage failed
+
+Router behavior is configured with `RouterConfig`:
+
+```python
+from intent_router import IntentRouter, RouterConfig
+
+config = RouterConfig()
+config.decision.evaluator_mode = "conditional"
+config.concurrency.intent_generation_per_request = 3
+config.timeouts.route_deadline_ms = 8000
+
+router = IntentRouter.from_config("skills", config=config)
+```
+
+Model calls use stage-specific timeouts, retry transient failures with
+exponential backoff, respect a route deadline, and expose call records in
+`RouteDiagnostics`.
 
 Multi-turn dialogue routing:
 
@@ -103,6 +130,13 @@ Single-turn routing:
 python -m intent_router route "帮我找上个月北京拍的猫照片" --skills skills
 ```
 
+Evaluator mode can be selected for routing and evaluation:
+
+```bash
+python -m intent_router route "搜索合同" --evaluator-mode conditional
+python -m intent_router eval-xlsx --cases cases.xlsx --evaluator-mode disabled
+```
+
 Interactive multi-turn routing:
 
 ```bash
@@ -122,7 +156,11 @@ The first-level router receives only the lightweight Skill card. The
 second-level router receives the parsed routing context and never the raw
 Markdown or execution instructions.
 
-The `chat` command keeps dialogue history in the terminal process. The router
+The `chat` command keeps dialogue history in the terminal process. SDK callers
+can use `SessionStore` with a `SessionKey(tenant_id, user_id, session_id)`;
+`InMemorySessionStore` is included, while Redis/database implementations remain
+deployment concerns. Persisted dialogue summaries omit extracted parameters.
+The router
 first injects the latest 5 turns into a contextualizer prompt: user query plus
 the final route result. The contextualizer produces `resolved_query` and a
 structured `semantic_frame`; skill candidate generation, intent candidate
@@ -148,3 +186,9 @@ The test suite uses a fake structured model client, so it does not require a rea
 ```bash
 python -m pytest
 ```
+
+Excel evaluation supports legacy intent-code columns and optional explicit
+`expected_skill_id`, `expected_intent`, `expected_code`, `expected_params`, and
+`alternate_routes` columns. It reports full Route Key accuracy, Skill/Intent
+recall, evaluator gain/loss and call rate, expansion waste, parameter exact
+match, model-call counts, retries/timeouts, and latency percentiles.

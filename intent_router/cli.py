@@ -5,11 +5,27 @@ import asyncio
 import json
 from pathlib import Path
 
+from .config import RouterConfig
 from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
 from .skills import SkillRegistry
 from .types import RouteResult
 from .xlsx_eval import evaluate_format_xlsx_cases, evaluate_xlsx_cases
+
+
+def _add_evaluator_mode(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--evaluator-mode",
+        choices=("always", "conditional", "disabled"),
+        default="conditional",
+        help="Evaluator 调用策略，默认 conditional",
+    )
+
+
+def _router_config(evaluator_mode: str) -> RouterConfig:
+    config = RouterConfig()
+    config.decision.evaluator_mode = evaluator_mode
+    return config
 
 
 def main() -> None:
@@ -21,11 +37,13 @@ def main() -> None:
     route_parser.add_argument("--skills", default="skills")
     route_parser.add_argument("--trace", action="store_true")
     route_parser.add_argument("--history-limit", type=int, default=5)
+    _add_evaluator_mode(route_parser)
 
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("--skills", default="skills")
     chat_parser.add_argument("--trace", action="store_true")
     chat_parser.add_argument("--history-limit", type=int, default=5)
+    _add_evaluator_mode(chat_parser)
 
     validate_skills_parser = subparsers.add_parser(
         "validate-skills",
@@ -38,6 +56,7 @@ def main() -> None:
     eval_parser.add_argument("--skills", default="skills")
     eval_parser.add_argument("--trace", action="store_true")
     eval_parser.add_argument("--history-limit", type=int, default=5)
+    _add_evaluator_mode(eval_parser)
 
     eval_xlsx_parser = subparsers.add_parser("eval-xlsx")
     eval_xlsx_parser.add_argument("--cases", required=True)
@@ -48,6 +67,7 @@ def main() -> None:
     )
     eval_xlsx_parser.add_argument("--trace", action="store_true")
     eval_xlsx_parser.add_argument("--history-limit", type=int, default=5)
+    _add_evaluator_mode(eval_xlsx_parser)
     eval_xlsx_parser.add_argument(
         "--if-end2end",
         "--if_end2end",
@@ -71,6 +91,7 @@ def main() -> None:
     )
     eval_format_xlsx_parser.add_argument("--trace", action="store_true")
     eval_format_xlsx_parser.add_argument("--history-limit", type=int, default=5)
+    _add_evaluator_mode(eval_format_xlsx_parser)
     eval_format_xlsx_parser.add_argument(
         "--if-end2end",
         "--if_end2end",
@@ -88,11 +109,26 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "route":
         try:
-            asyncio.run(_route(args.query, args.skills, args.trace, args.history_limit))
+            asyncio.run(
+                _route(
+                    args.query,
+                    args.skills,
+                    args.trace,
+                    args.history_limit,
+                    args.evaluator_mode,
+                ),
+            )
         except ValueError as exc:
             parser.error(str(exc))
     elif args.command == "chat":
-        asyncio.run(_chat(args.skills, args.trace, args.history_limit))
+        asyncio.run(
+            _chat(
+                args.skills,
+                args.trace,
+                args.history_limit,
+                args.evaluator_mode,
+            ),
+        )
     elif args.command == "validate-skills":
         try:
             registry = SkillRegistry.from_path(args.skills)
@@ -110,7 +146,15 @@ def main() -> None:
             f"{intent_count} active intents",
         )
     elif args.command == "eval":
-        asyncio.run(_eval(Path(args.cases), args.skills, args.trace, args.history_limit))
+        asyncio.run(
+            _eval(
+                Path(args.cases),
+                args.skills,
+                args.trace,
+                args.history_limit,
+                args.evaluator_mode,
+            ),
+        )
     elif args.command == "eval-xlsx":
         output = Path(args.output) if args.output else None
         asyncio.run(
@@ -122,6 +166,7 @@ def main() -> None:
                 args.history_limit,
                 args.if_end2end,
                 args.compare_no_loop,
+                args.evaluator_mode,
             ),
         )
     elif args.command == "eval-format-xlsx":
@@ -135,6 +180,7 @@ def main() -> None:
                 args.history_limit,
                 args.if_end2end,
                 args.compare_no_loop,
+                args.evaluator_mode,
             ),
         )
 
@@ -144,10 +190,12 @@ async def _route(
     skills: str,
     trace_enabled: bool,
     history_limit: int = 5,
+    evaluator_mode: str = "conditional",
 ) -> None:
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        config=_router_config(evaluator_mode),
     )
     trace: list[dict] | None = [] if trace_enabled else None
     result = await router.route(query, trace=trace)
@@ -166,10 +214,16 @@ async def _route(
     print(result.model_dump_json(ensure_ascii=False, indent=2))
 
 
-async def _chat(skills: str, trace_enabled: bool, history_limit: int = 5) -> None:
+async def _chat(
+    skills: str,
+    trace_enabled: bool,
+    history_limit: int = 5,
+    evaluator_mode: str = "conditional",
+) -> None:
     agent = IntentDialogueAgent.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        config=_router_config(evaluator_mode),
     )
     _print_chat_help()
     while True:
@@ -269,10 +323,12 @@ async def _eval(
     skills: str,
     trace_enabled: bool,
     history_limit: int = 5,
+    evaluator_mode: str = "conditional",
 ) -> None:
     router = IntentRouter.from_config(
         skills_path=skills,
         dialogue_history_limit=history_limit,
+        config=_router_config(evaluator_mode),
     )
     total = 0
     passed = 0
@@ -334,6 +390,7 @@ async def _eval_xlsx(
     history_limit: int = 5,
     if_end2end: bool = False,
     compare_no_loop: bool = False,
+    evaluator_mode: str = "conditional",
 ) -> None:
     print("开始执行 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
@@ -347,6 +404,7 @@ async def _eval_xlsx(
         dialogue_history_limit=history_limit,
         if_end2end=if_end2end,
         compare_no_loop=compare_no_loop,
+        evaluator_mode=evaluator_mode,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")
@@ -361,6 +419,7 @@ async def _eval_format_xlsx(
     history_limit: int = 5,
     if_end2end: bool = False,
     compare_no_loop: bool = False,
+    evaluator_mode: str = "conditional",
 ) -> None:
     print("开始执行重构格式 Excel 多轮意图评测...")
     print(f"用例文件: {cases_path}")
@@ -374,6 +433,7 @@ async def _eval_format_xlsx(
         dialogue_history_limit=history_limit,
         if_end2end=if_end2end,
         compare_no_loop=compare_no_loop,
+        evaluator_mode=evaluator_mode,
         progress_callback=_print_eval_xlsx_progress,
     )
     print(f"结果文件: {summary.get('output_path')}")

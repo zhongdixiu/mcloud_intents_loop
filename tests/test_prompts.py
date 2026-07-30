@@ -4,10 +4,12 @@ from intent_router.prompts import (
     CONTEXTUALIZER_SYSTEM_PROMPT,
     EVALUATOR_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
+    PARAMETER_EXTRACTOR_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     build_contextualizer_prompt,
     build_evaluator_prompt,
     build_intent_prompt,
+    build_parameter_prompt,
     build_router_prompt,
 )
 from intent_router.skills import SkillRegistry
@@ -27,6 +29,7 @@ def test_all_structured_prompts_include_new_output_contracts() -> None:
         "SkillCandidateSet": ROUTER_SYSTEM_PROMPT,
         "IntentCandidateSet": INTENT_SYSTEM_PROMPT,
         "RerankDecision": EVALUATOR_SYSTEM_PROMPT,
+        "ParameterExtractionResult": PARAMETER_EXTRACTOR_SYSTEM_PROMPT,
     }
 
     for prompt in prompts.values():
@@ -49,6 +52,7 @@ def test_all_structured_prompts_include_new_output_contracts() -> None:
     assert "具体业务 skill" in ROUTER_SYSTEM_PROMPT
     assert "label_conflict" in EVALUATOR_SYSTEM_PROMPT
     assert "search_vs_tool_entry" in EVALUATOR_SYSTEM_PROMPT
+    assert "只判断 Route，不输出或抽取 params" in INTENT_SYSTEM_PROMPT
 
 
 def test_candidate_prompts_do_not_inject_dialogue_history_after_contextualizer() -> None:
@@ -70,7 +74,7 @@ def test_candidate_prompts_do_not_inject_dialogue_history_after_contextualizer()
         skill_name="云盘搜索",
         intent="搜图片",
         code="012",
-        matched_cues=["猫", "图片"],
+        matched_evidence=["猫", "图片"],
     )
 
     router_prompt = json.loads(
@@ -165,3 +169,26 @@ def test_contextualizer_history_payload_splits_semantic_state() -> None:
     assert "resolved_query" not in first["assistant_result"]
     assert "context_relation" not in first["assistant_result"]
     assert "metadata" not in first
+
+
+def test_parameter_prompt_is_scoped_to_final_route() -> None:
+    prompt = json.loads(
+        build_parameter_prompt(
+            current_user_query="找猫照片",
+            resolved_query="搜索猫照片",
+            skill_id="mcloud_search_skill",
+            intent="搜图片",
+            code="012",
+            parameter_schema={"metadataList": {"type": "array"}},
+            execution_instructions="只抽取明确参数",
+            trusted_params={},
+        ),
+    )
+
+    assert prompt["route"] == {
+        "skill_id": "mcloud_search_skill",
+        "intent": "搜图片",
+        "code": "012",
+    }
+    assert "available_skills" not in prompt
+    assert "candidates" not in prompt

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from typing import Any, Callable
 
 from openpyxl import Workbook, load_workbook
 
+from .config import RouterConfig
 from .dialogue import IntentDialogueAgent
 from .router import IntentRouter
 from .skills import SkillRegistry
@@ -26,6 +28,11 @@ CURRENT_EXPECTED_HEADER = "当前预期意图"
 CURRENT_ALTERNATE_HEADER = "备注意图"
 FORMAT_CURRENT_QUERY_HEADER = "对话"
 FORMAT_EXPECTED_HEADERS = ("期望意图标签", "预期意图")
+EXPECTED_SKILL_HEADERS = ("expected_skill_id", "预期Skill ID")
+EXPECTED_INTENT_HEADERS = ("expected_intent", "预期Intent")
+EXPECTED_CODE_HEADERS = ("expected_code", "预期Code")
+EXPECTED_PARAMS_HEADERS = ("expected_params", "预期参数")
+ALTERNATE_ROUTES_HEADERS = ("alternate_routes", "备选Route")
 SEARCH_SKILL_ID = "mcloud_search_skill"
 SEARCH_022_CODE = "022"
 GENERIC_MULTI_ACCEPT_CODES = {"016", "022"}
@@ -87,6 +94,10 @@ class XlsxEvalCase:
     history_turns: list[HistoryCaseTurn]
     source_expected_codes: list[str] = field(default_factory=list)
     allow_022_search_equivalence: bool = False
+    expected_skill_id: str | None = None
+    expected_intent: str | None = None
+    expected_params: dict[str, Any] | None = None
+    alternate_routes: list[dict[str, str]] = field(default_factory=list)
 
 
 async def evaluate_xlsx_cases(
@@ -99,13 +110,19 @@ async def evaluate_xlsx_cases(
     dialogue_history_limit: int | None = 5,
     if_end2end: bool = False,
     compare_no_loop: bool = False,
+    evaluator_mode: str = "conditional",
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
-    router = router or IntentRouter.from_config(
-        skills_path=skills_path,
-        dialogue_history_limit=dialogue_history_limit,
-    )
+    if router is None:
+        config = RouterConfig.model_validate(
+            {"decision": {"evaluator_mode": evaluator_mode}},
+        )
+        router = IntentRouter.from_config(
+            skills_path=skills_path,
+            dialogue_history_limit=dialogue_history_limit,
+            config=config,
+        )
     cases = load_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
     return await _evaluate_loaded_cases(
@@ -130,13 +147,19 @@ async def evaluate_format_xlsx_cases(
     dialogue_history_limit: int | None = 5,
     if_end2end: bool = False,
     compare_no_loop: bool = False,
+    evaluator_mode: str = "conditional",
     progress_callback: Callable[[int, int, dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
     registry = SkillRegistry.from_path(skills_path)
-    router = router or IntentRouter.from_config(
-        skills_path=skills_path,
-        dialogue_history_limit=dialogue_history_limit,
-    )
+    if router is None:
+        config = RouterConfig.model_validate(
+            {"decision": {"evaluator_mode": evaluator_mode}},
+        )
+        router = IntentRouter.from_config(
+            skills_path=skills_path,
+            dialogue_history_limit=dialogue_history_limit,
+            config=config,
+        )
     cases = load_format_xlsx_cases(cases_path)
     output_path = normalize_output_path(output_path or default_output_path(cases_path))
     return await _evaluate_loaded_cases(
@@ -188,6 +211,19 @@ async def _evaluate_loaded_cases(
     evaluator_switch_loss = 0
     expansion_count = 0
     expansion_gain = 0
+    expansion_waste = 0
+    evaluator_call_count = 0
+    unnecessary_evaluator_call_count = 0
+    model_call_counts: list[int] = []
+    retry_count = 0
+    timeout_count = 0
+    parameter_labeled_count = 0
+    parameter_exact_match_count = 0
+    skill_recall_at_1 = 0
+    skill_recall_at_3 = 0
+    skill_recall_at_5 = 0
+    intent_recall_at_1 = 0
+    intent_recall_at_2 = 0
     ordinary_dialogue_count = 0
     business_action_to_000_count = 0
     strict_passed = 0
@@ -264,7 +300,7 @@ async def _evaluate_loaded_cases(
                     no_loop_match = result_matches_expected_codes(
                         no_loop_result,
                         expected_code=case.expected_code,
-                        alternate_codes=case.alternate_codes,
+                        alternate_codes=_case_alternate_codes(case),
                         search_equivalent_codes=search_equivalent_codes,
                         allow_022_search_equivalence=case.allow_022_search_equivalence,
                     )
@@ -302,7 +338,7 @@ async def _evaluate_loaded_cases(
         match = result_matches_expected_codes(
             result,
             expected_code=case.expected_code,
-            alternate_codes=case.alternate_codes,
+            alternate_codes=_case_alternate_codes(case),
             search_equivalent_codes=search_equivalent_codes,
             allow_022_search_equivalence=case.allow_022_search_equivalence,
         )
@@ -335,11 +371,32 @@ async def _evaluate_loaded_cases(
         first_candidate_passed += int(candidate_metrics["first_candidate_matched"])
         top_n_recall_passed += int(candidate_metrics["top_n_recalled"])
         full_route_passed += int(candidate_metrics["full_route_matched"])
+        skill_recall_at_1 += int(candidate_metrics["skill_recall_at_1"])
+        skill_recall_at_3 += int(candidate_metrics["skill_recall_at_3"])
+        skill_recall_at_5 += int(candidate_metrics["skill_recall_at_5"])
+        intent_recall_at_1 += int(candidate_metrics["intent_recall_at_1"])
+        intent_recall_at_2 += int(candidate_metrics["intent_recall_at_2"])
         evaluator_switch_count += int(candidate_metrics["evaluator_switched"])
         evaluator_switch_gain += int(candidate_metrics["evaluator_switch_gain"])
         evaluator_switch_loss += int(candidate_metrics["evaluator_switch_loss"])
         expansion_count += int(candidate_metrics["expanded"])
         expansion_gain += int(candidate_metrics["expansion_gain"])
+        expansion_waste += int(candidate_metrics["expansion_waste"])
+        evaluator_call_count += int(candidate_metrics["evaluator_called"])
+        unnecessary_evaluator_call_count += int(
+            candidate_metrics["unnecessary_evaluator_call"],
+        )
+        model_calls = (
+            result.diagnostics.model_calls
+            if result.diagnostics is not None
+            else []
+        )
+        model_call_counts.append(len(model_calls))
+        retry_count += sum(max(0, call.attempts - 1) for call in model_calls)
+        timeout_count += sum(call.status == "timeout" for call in model_calls)
+        if case.expected_params is not None:
+            parameter_labeled_count += 1
+            parameter_exact_match_count += int(result.params == case.expected_params)
         ordinary_dialogue_count += int(result.code == ORDINARY_DIALOGUE_CODE)
         business_action_to_000_count += int(
             result.code == ORDINARY_DIALOGUE_CODE and _has_strong_business_action(case.query),
@@ -402,7 +459,7 @@ async def _evaluate_loaded_cases(
                 no_loop_match = result_matches_expected_codes(
                     no_loop_result,
                     expected_code=case.expected_code,
-                    alternate_codes=case.alternate_codes,
+                    alternate_codes=_case_alternate_codes(case),
                     search_equivalent_codes=search_equivalent_codes,
                     allow_022_search_equivalence=case.allow_022_search_equivalence,
                 )
@@ -442,11 +499,15 @@ async def _evaluate_loaded_cases(
         ) if total else 0.0,
         "eval_mode": "end2end" if if_end2end else "gold_history",
         "avg_elapsed_ms": _average(elapsed_values),
+        "p50_elapsed_ms": _percentile(elapsed_values, 50),
+        "p95_elapsed_ms": _percentile(elapsed_values, 95),
+        "p99_elapsed_ms": _percentile(elapsed_values, 99),
         "avg_total_elapsed_ms": _average(total_elapsed_values),
         "avg_loop_count": _average(loop_counts),
         "matched_count": status_counts.get("matched", 0),
         "clarify_count": status_counts.get("clarify", 0),
-        "no_match_count": status_counts.get("no_match", 0),
+        "abstain_count": status_counts.get("abstain", 0),
+        "unsupported_count": status_counts.get("unsupported", 0),
         "error_count": status_counts.get("error", 0),
         "output_path": str(output_path),
         "first_candidate_passed": first_candidate_passed,
@@ -455,12 +516,46 @@ async def _evaluate_loaded_cases(
         "top_n_recall": (top_n_recall_passed / total) if total else 0.0,
         "full_route_passed": full_route_passed,
         "full_route_accuracy": (full_route_passed / total) if total else 0.0,
+        "skill_recall_at_1": skill_recall_at_1 / total if total else 0.0,
+        "skill_recall_at_3": skill_recall_at_3 / total if total else 0.0,
+        "skill_recall_at_5": skill_recall_at_5 / total if total else 0.0,
+        "intent_recall_at_1": intent_recall_at_1 / total if total else 0.0,
+        "intent_recall_at_2": intent_recall_at_2 / total if total else 0.0,
         "evaluator_switch_count": evaluator_switch_count,
         "evaluator_switch_gain": evaluator_switch_gain,
         "evaluator_switch_loss": evaluator_switch_loss,
         "evaluator_switch_net_gain": evaluator_switch_gain - evaluator_switch_loss,
+        "wrong_switch_rate": (
+            evaluator_switch_loss / evaluator_switch_count
+            if evaluator_switch_count
+            else 0.0
+        ),
+        "evaluator_call_count": evaluator_call_count,
+        "evaluator_call_rate": (
+            evaluator_call_count / total if total else 0.0
+        ),
+        "unnecessary_evaluator_call_count": unnecessary_evaluator_call_count,
+        "unnecessary_evaluator_call_rate": (
+            unnecessary_evaluator_call_count / evaluator_call_count
+            if evaluator_call_count
+            else 0.0
+        ),
         "expansion_count": expansion_count,
         "expansion_gain": expansion_gain,
+        "expansion_waste": expansion_waste,
+        "expansion_waste_rate": (
+            expansion_waste / expansion_count if expansion_count else 0.0
+        ),
+        "avg_model_calls": _average(model_call_counts),
+        "retry_count": retry_count,
+        "timeout_count": timeout_count,
+        "parameter_labeled_count": parameter_labeled_count,
+        "parameter_exact_match_count": parameter_exact_match_count,
+        "parameter_exact_match": (
+            parameter_exact_match_count / parameter_labeled_count
+            if parameter_labeled_count
+            else None
+        ),
         "ordinary_dialogue_count": ordinary_dialogue_count,
         "business_action_to_000_count": business_action_to_000_count,
         "multi_code_case_count": multi_code_case_count,
@@ -480,7 +575,11 @@ async def _evaluate_loaded_cases(
                 ),
                 "no_loop_matched_count": no_loop_status_counts.get("matched", 0),
                 "no_loop_clarify_count": no_loop_status_counts.get("clarify", 0),
-                "no_loop_no_match_count": no_loop_status_counts.get("no_match", 0),
+                "no_loop_abstain_count": no_loop_status_counts.get("abstain", 0),
+                "no_loop_unsupported_count": no_loop_status_counts.get(
+                    "unsupported",
+                    0,
+                ),
                 "no_loop_error_count": no_loop_status_counts.get("error", 0),
                 "both_passed": both_passed,
                 "both_failed": both_failed,
@@ -656,8 +755,18 @@ def load_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
         if header
     }
     current_query_index = _require_header(header_to_index, CURRENT_QUERY_HEADER)
-    current_expected_index = _require_header(header_to_index, CURRENT_EXPECTED_HEADER)
+    current_expected_index = _require_any_header(
+        header_to_index,
+        (CURRENT_EXPECTED_HEADER, *EXPECTED_CODE_HEADERS),
+    )
     current_alternate_index = header_to_index.get(CURRENT_ALTERNATE_HEADER)
+    expected_skill_index = _first_header_index(header_to_index, EXPECTED_SKILL_HEADERS)
+    expected_intent_index = _first_header_index(header_to_index, EXPECTED_INTENT_HEADERS)
+    expected_params_index = _first_header_index(header_to_index, EXPECTED_PARAMS_HEADERS)
+    alternate_routes_index = _first_header_index(
+        header_to_index,
+        ALTERNATE_ROUTES_HEADERS,
+    )
     history_pairs = _history_column_pairs(headers, header_to_index)
 
     cases: list[XlsxEvalCase] = []
@@ -697,6 +806,18 @@ def load_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
                 allow_022_search_equivalence=allows_022_search_equivalence(
                     expected_codes,
                 ),
+                expected_skill_id=_optional_cell(row, expected_skill_index),
+                expected_intent=_optional_cell(row, expected_intent_index),
+                expected_params=_parse_expected_params(
+                    _row_value(row, expected_params_index)
+                    if expected_params_index is not None
+                    else None,
+                ),
+                alternate_routes=_parse_alternate_routes(
+                    _row_value(row, alternate_routes_index)
+                    if alternate_routes_index is not None
+                    else None,
+                ),
             ),
         )
     return cases
@@ -720,7 +841,14 @@ def load_format_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
     current_query_index = _require_header(header_to_index, FORMAT_CURRENT_QUERY_HEADER)
     current_expected_index = _require_any_header(
         header_to_index,
-        FORMAT_EXPECTED_HEADERS,
+        (*FORMAT_EXPECTED_HEADERS, *EXPECTED_CODE_HEADERS),
+    )
+    expected_skill_index = _first_header_index(header_to_index, EXPECTED_SKILL_HEADERS)
+    expected_intent_index = _first_header_index(header_to_index, EXPECTED_INTENT_HEADERS)
+    expected_params_index = _first_header_index(header_to_index, EXPECTED_PARAMS_HEADERS)
+    alternate_routes_index = _first_header_index(
+        header_to_index,
+        ALTERNATE_ROUTES_HEADERS,
     )
     history_pairs = _format_history_column_pairs(headers, header_to_index)
 
@@ -756,6 +884,18 @@ def load_format_xlsx_cases(cases_path: Path) -> list[XlsxEvalCase]:
                 source_expected_codes=expected_codes,
                 allow_022_search_equivalence=allows_022_search_equivalence(
                     expected_codes,
+                ),
+                expected_skill_id=_optional_cell(row, expected_skill_index),
+                expected_intent=_optional_cell(row, expected_intent_index),
+                expected_params=_parse_expected_params(
+                    _row_value(row, expected_params_index)
+                    if expected_params_index is not None
+                    else None,
+                ),
+                alternate_routes=_parse_alternate_routes(
+                    _row_value(row, alternate_routes_index)
+                    if alternate_routes_index is not None
+                    else None,
                 ),
             ),
         )
@@ -892,6 +1032,18 @@ def allows_022_search_equivalence(codes: list[str]) -> bool:
 
 def _source_expected_codes(case: XlsxEvalCase) -> list[str]:
     return case.source_expected_codes or [case.expected_code, *case.alternate_codes]
+
+
+def _case_alternate_codes(case: XlsxEvalCase) -> list[str]:
+    return _dedupe_codes(
+        [
+            *case.alternate_codes,
+            *[
+                normalize_code(route.get("code"))
+                for route in case.alternate_routes
+            ],
+        ],
+    )
 
 
 def _is_multi_code_case(case: XlsxEvalCase) -> bool:
@@ -1150,6 +1302,10 @@ def _build_record(
         "history_turn_count": len(case.history_turns),
         "query": case.query,
         "expected_code": case.expected_code,
+        "expected_skill_id": case.expected_skill_id,
+        "expected_intent": case.expected_intent,
+        "expected_params": case.expected_params,
+        "alternate_routes": case.alternate_routes,
         "alternate_codes": case.alternate_codes,
         "expected_codes": case.source_expected_codes
         or [case.expected_code, *case.alternate_codes],
@@ -1165,6 +1321,12 @@ def _build_record(
         "predicted_skill_id": skill_id,
         "predicted_intent": result.intent,
         "predicted_code": result.code,
+        "predicted_params": result.params,
+        "parameter_exact_matched": (
+            result.params == case.expected_params
+            if case.expected_params is not None
+            else None
+        ),
         "matched": matched,
         "match_reason": match_reason,
         "strict_matched": strict_matched,
@@ -1213,6 +1375,10 @@ def _build_error_record(
         "history_turn_count": len(case.history_turns),
         "query": case.query,
         "expected_code": case.expected_code,
+        "expected_skill_id": case.expected_skill_id,
+        "expected_intent": case.expected_intent,
+        "expected_params": case.expected_params,
+        "alternate_routes": case.alternate_routes,
         "alternate_codes": case.alternate_codes,
         "expected_codes": case.source_expected_codes
         or [case.expected_code, *case.alternate_codes],
@@ -1352,7 +1518,7 @@ def _candidate_metrics(
     final_matched = result_matches_expected_codes(
         result,
         expected_code=case.expected_code,
-        alternate_codes=case.alternate_codes,
+        alternate_codes=_case_alternate_codes(case),
         search_equivalent_codes=search_equivalent_codes,
         allow_022_search_equivalence=case.allow_022_search_equivalence,
     )["matched"]
@@ -1363,7 +1529,22 @@ def _candidate_metrics(
         code_matched=bool(final_matched),
     )
     evaluator_action = result.diagnostics.evaluator_action if result.diagnostics else None
+    evaluator_called = bool(
+        result.diagnostics and result.diagnostics.evaluator_called
+    )
     expanded = bool(result.diagnostics and result.diagnostics.expansion_rounds > 0)
+    expected_route = _expected_route(case, code_index)
+    expected_skill_id = expected_route.get("skill_id") if expected_route else None
+    expected_intent = expected_route.get("intent") if expected_route else None
+    skill_hits = [
+        candidate.get("skill_id") == expected_skill_id
+        for candidate in candidates
+    ] if expected_skill_id is not None else [False for _ in candidates]
+    intent_hits = [
+        candidate.get("skill_id") == expected_skill_id
+        and candidate.get("intent") == expected_intent
+        for candidate in candidates
+    ] if expected_intent is not None else [False for _ in candidates]
     return {
         "top_n_candidate_codes": [candidate.get("code") for candidate in candidates],
         "first_candidate_matched": first_matched,
@@ -1378,7 +1559,36 @@ def _candidate_metrics(
         ),
         "expanded": expanded,
         "expansion_gain": expanded and not first_matched and final_matched,
+        "expansion_waste": expanded and not (not first_matched and final_matched),
+        "evaluator_called": evaluator_called,
+        "unnecessary_evaluator_call": (
+            evaluator_called
+            and evaluator_action == "select_top"
+            and bool(first_matched)
+        ),
+        "skill_recall_at_1": any(skill_hits[:1]),
+        "skill_recall_at_3": any(skill_hits[:3]),
+        "skill_recall_at_5": any(skill_hits[:5]),
+        "intent_recall_at_1": any(intent_hits[:1]),
+        "intent_recall_at_2": any(intent_hits[:2]),
     }
+
+
+def _expected_route(
+    case: XlsxEvalCase,
+    code_index: dict[str, tuple[SkillDefinition, str]],
+) -> dict[str, str] | None:
+    if case.expected_skill_id and case.expected_intent:
+        return {
+            "skill_id": case.expected_skill_id,
+            "intent": case.expected_intent,
+            "code": case.expected_code,
+        }
+    indexed = code_index.get(case.expected_code)
+    if indexed is None:
+        return None
+    skill, intent = indexed
+    return {"skill_id": skill.id, "intent": intent, "code": case.expected_code}
 
 
 def _route_result_candidates(result: RouteResult) -> list[dict[str, Any]]:
@@ -1448,7 +1658,7 @@ def _candidate_matches_expected_codes(
         result_matches_expected_codes(
             result,
             expected_code=case.expected_code,
-            alternate_codes=case.alternate_codes,
+            alternate_codes=_case_alternate_codes(case),
             search_equivalent_codes=search_equivalent_codes,
             allow_022_search_equivalence=case.allow_022_search_equivalence,
         )["matched"],
@@ -1462,6 +1672,27 @@ def _full_route_matches_expected(
     code_index: dict[str, tuple[SkillDefinition, str]],
     code_matched: bool,
 ) -> bool:
+    explicit_routes = [
+        {
+            "skill_id": case.expected_skill_id,
+            "intent": case.expected_intent,
+            "code": case.expected_code,
+        },
+        *case.alternate_routes,
+    ]
+    explicit_routes = [
+        route
+        for route in explicit_routes
+        if route.get("skill_id") and route.get("intent") and route.get("code")
+    ]
+    if explicit_routes:
+        predicted_skill_id = result.skill.id if result.skill else None
+        return any(
+            predicted_skill_id == route["skill_id"]
+            and result.intent == route["intent"]
+            and result.code == route["code"]
+            for route in explicit_routes
+        )
     if not code_matched:
         return False
     accepted_codes = [case.expected_code, *case.alternate_codes]
@@ -1617,6 +1848,62 @@ def _require_any_header(
     raise ValueError(f"Excel 缺少必需表头之一: {', '.join(headers)}")
 
 
+def _first_header_index(
+    header_to_index: dict[str, int],
+    headers: tuple[str, ...],
+) -> int | None:
+    return next(
+        (
+            header_to_index[header]
+            for header in headers
+            if header in header_to_index
+        ),
+        None,
+    )
+
+
+def _optional_cell(row: tuple[Any, ...], index: int | None) -> str | None:
+    if index is None:
+        return None
+    value = _cell_text(_row_value(row, index))
+    return value or None
+
+
+def _parse_expected_params(value: Any) -> dict[str, Any] | None:
+    text = _cell_text(value)
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"expected_params 必须是 JSON object: {text}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("expected_params 必须是 JSON object")
+    return parsed
+
+
+def _parse_alternate_routes(value: Any) -> list[dict[str, str]]:
+    text = _cell_text(value)
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"alternate_routes 必须是 JSON array: {text}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
+        raise ValueError("alternate_routes 必须是 JSON object array")
+    routes: list[dict[str, str]] = []
+    for item in parsed:
+        route = {
+            key: str(item[key])
+            for key in ("skill_id", "intent", "code")
+            if item.get(key) is not None
+        }
+        if {"skill_id", "intent", "code"} <= route.keys():
+            routes.append(route)
+    return routes
+
+
 def _row_value(row: tuple[Any, ...], index: int) -> Any:
     return row[index] if index < len(row) else None
 
@@ -1631,6 +1918,17 @@ def _average(values: list[float] | list[int]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def _percentile(values: list[float], percentile: int) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 def _dedupe_codes(codes: list[str | None]) -> list[str]:

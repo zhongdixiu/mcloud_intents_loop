@@ -163,6 +163,8 @@ class ContextualizedRequest(StrictOutputModel):
         "ambiguous",
     ] = "new_request"
     semantic_frame: SemanticFrame = Field(default_factory=SemanticFrame)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    conflict_flags: list[str] = Field(default_factory=list)
     reason: str = ""
 
     @model_validator(mode="before")
@@ -197,15 +199,18 @@ class SkillCandidate(StrictOutputModel):
     candidate_id: str
     skill_id: str | None = None
     intent_domain: str
-    confidence: float = 0.0
-    matched_cues: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    matched_evidence: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
     reason: str = ""
 
     @model_validator(mode="before")
     @classmethod
     def normalize_model_output(cls, data: Any) -> Any:
-        return _normalize_structured_dict(data)
+        normalized = _normalize_structured_dict(data)
+        if isinstance(normalized, dict) and "matched_evidence" not in normalized:
+            normalized["matched_evidence"] = normalized.pop("matched_cues", [])
+        return normalized
 
 
 class SkillCandidateSet(StrictOutputModel):
@@ -223,17 +228,22 @@ class IntentCandidate(StrictOutputModel):
     skill_name: str | None = None
     intent: str
     code: str
-    params: dict[str, Any] = Field(default_factory=dict)
-    confidence: float = 0.0
-    matched_cues: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    matched_evidence: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
     reason: str = ""
     alternatives: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_model_output(cls, data: Any) -> Any:
-        return _normalize_structured_dict(data)
+        normalized = _normalize_structured_dict(data)
+        if isinstance(normalized, dict):
+            normalized.pop("params", None)
+            if "matched_evidence" not in normalized:
+                normalized["matched_evidence"] = normalized.pop("matched_cues", [])
+        return normalized
 
 
 class IntentCandidateSet(StrictOutputModel):
@@ -247,7 +257,7 @@ class IntentCandidateSet(StrictOutputModel):
 
 class CandidateScore(StrictOutputModel):
     candidate_id: str
-    score: float = 0.0
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = ""
 
     @model_validator(mode="before")
@@ -257,9 +267,9 @@ class CandidateScore(StrictOutputModel):
 
 
 class RerankDecision(StrictOutputModel):
-    verdict: Literal["select", "expand"]
+    verdict: Literal["select", "expand", "abstain", "unsupported"]
     selected_candidate_id: str | None = None
-    confidence: float = 0.0
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     ranking: list[CandidateScore] = Field(default_factory=list)
     reason: str = ""
     expand_scope: Literal[
@@ -268,6 +278,7 @@ class RerankDecision(StrictOutputModel):
         "context_unclear",
     ] | None = None
     expansion_hint: str | None = None
+    risk_flags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -275,20 +286,60 @@ class RerankDecision(StrictOutputModel):
         return _normalize_structured_dict(data, json_list_fields=("ranking",))
 
 
+class ModelCallRecord(BaseModel):
+    stage: str
+    duration_ms: float = 0.0
+    attempts: int = 1
+    status: Literal["ok", "timeout", "error", "skipped"] = "ok"
+    error: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+class ParameterExtractionResult(StrictOutputModel):
+    params: dict[str, Any] = Field(default_factory=dict)
+    missing_required: list[str] = Field(default_factory=list)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    evidence: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ParameterValidationResult(BaseModel):
+    params: dict[str, Any] = Field(default_factory=dict)
+    missing_required: list[str] = Field(default_factory=list)
+    uncertain_fields: list[str] = Field(default_factory=list)
+    rejected_fields: dict[str, str] = Field(default_factory=dict)
+
+
+class DecisionGateResult(BaseModel):
+    action: Literal["direct", "evaluate", "abstain", "error"]
+    selected_candidate_id: str | None = None
+    reason: str = ""
+    top1_score: float = 0.0
+    top2_score: float = 0.0
+    margin: float = 0.0
+    risk_flags: list[str] = Field(default_factory=list)
+
+
 class RouteDiagnostics(BaseModel):
     first_candidate_id: str | None = None
-    final_candidate_id: str
-    evaluator_action: Literal[
-        "select_top",
-        "switch",
-        "switch_blocked",
-        "expand",
-        "fallback",
-    ]
+    final_candidate_id: str | None = None
+    evaluator_action: str = "not_called"
+    evaluator_called: bool = False
     expansion_rounds: int = 0
     risk_flags: list[str] = Field(default_factory=list)
     rerank_reason: str = ""
     fallback_reason: str | None = None
+    gate_reason: str = ""
+    gate_margin: float = 0.0
+    selector_score: float = 0.0
+    evaluator_score: float | None = None
+    evaluator_margin: float | None = None
+    final_confidence_features: dict[str, float] = Field(default_factory=dict)
+    failed_skills: dict[str, str] = Field(default_factory=dict)
+    expansion_scopes: list[str] = Field(default_factory=list)
+    discarded_candidates: list[dict[str, str]] = Field(default_factory=list)
+    parameter_validation: ParameterValidationResult | None = None
+    model_calls: list[ModelCallRecord] = Field(default_factory=list)
 
 
 class SkillRef(BaseModel):
@@ -297,7 +348,7 @@ class SkillRef(BaseModel):
 
 
 class DialogueRouteSummary(BaseModel):
-    status: Literal["matched", "clarify", "no_match"]
+    status: Literal["matched", "clarify", "abstain", "unsupported", "error"]
     skill_id: str | None = None
     skill_name: str | None = None
     intent: str | None = None
@@ -322,7 +373,7 @@ class DialogueHistory(BaseModel):
 
 
 class RouteResult(BaseModel):
-    status: Literal["matched", "clarify", "no_match"] = "matched"
+    status: Literal["matched", "clarify", "abstain", "unsupported", "error"] = "matched"
     skill: SkillRef | None = None
     intent: str | None = None
     code: str | None = None
